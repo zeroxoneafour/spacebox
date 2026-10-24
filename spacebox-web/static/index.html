@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Spacebox</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <header id="topbar">
+    <span class="brand">spacebox</span>
+    <nav id="crumbs"></nav>
+    <span class="spacer"></span>
+    <span id="day">day 0</span>
+    <button id="play" title="Play / pause (space)">▶</button>
+    <button id="step" title="Advance one step">Step</button>
+    <label>step
+      <select id="speed">
+        <option value="1">1 day</option>
+        <option value="5">5 days</option>
+        <option value="10" selected>10 days</option>
+        <option value="30">30 days</option>
+        <option value="90">90 days</option>
+      </select>
+    </label>
+    <span id="net" title="Size of the last state update"></span>
+    <button id="world-btn">World…</button>
+  </header>
+
+  <aside id="left">
+    <div class="panel-head">
+      <h2>Empires</h2>
+      <button id="new-empire" class="small">+ New</button>
+    </div>
+    <div id="empires"></div>
+  </aside>
+
+  <main id="view">
+    <div id="tooltip" hidden></div>
+    <div id="hint"></div>
+  </main>
+
+  <aside id="right">
+    <div id="inspector"></div>
+  </aside>
+
+  <footer id="log"></footer>
+
+  <div id="modal" hidden>
+    <div class="modal-box">
+      <div id="modal-body"></div>
+    </div>
+  </div>
+  <div id="toasts"></div>
+
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>

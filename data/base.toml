@@ -1,0 +1,10 @@
+# Index of the base game assets. Tools such as `spacebox generate` load this file to pull in
+# every asset table; saves import the individual files they reference.
+
+[import]
+resources = "resources.toml"
+jobs = "jobs.toml"
+buildings = "buildings.toml"
+technologies = "technologies.toml"
+ships = "ships.toml"
+rules = "rules.toml"

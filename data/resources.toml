@@ -1,0 +1,80 @@
+# Resources. All amounts in the game are daily unless noted otherwise.
+#
+# Optional fields:
+#   base_value  - reference price on the galactic market, in energy (default 1)
+#   tradeable   - can be bought/sold on the galactic market (default true)
+#   stockpile   - surpluses accumulate in empire storage (default true)
+#   storage_cap - maximum an empire can store
+#   on_demand   - only produced while something needs it (buildings producing it sit idle
+#                 otherwise); see shipbuilding
+
+# --- basic resources -------------------------------------------------------------------------
+
+[resource.energy]
+display_name = "Energy"
+description = "Power for every building in the empire. Also the currency of the galactic market."
+base_value = 1.0
+
+[resource.minerals]
+display_name = "Minerals"
+description = "Raw ores and regolith. The foundation of all construction."
+base_value = 1.0
+
+[resource.food]
+display_name = "Food"
+description = "Keeps pops alive. Running out causes famine."
+base_value = 1.0
+
+# --- advanced resources ----------------------------------------------------------------------
+
+[resource.alloy]
+display_name = "Alloy"
+description = "Advanced metal alloy"
+base_value = 4.0
+
+[resource.consumer-goods]
+display_name = "Consumer Goods"
+description = "Everyday comforts. Shortages make pops unhappy."
+base_value = 2.0
+
+[resource.research]
+display_name = "Research"
+description = "Scientific progress. Fed directly into the current technology."
+stockpile = false
+tradeable = false
+
+# --- strategic resources ---------------------------------------------------------------------
+
+[resource.volatile-motes]
+display_name = "Volatile Motes"
+description = "Unstable particles used in high-energy metallurgy."
+base_value = 10.0
+storage_cap = 5000
+
+[resource.exotic-gases]
+display_name = "Exotic Gases"
+description = "Rare atmospheric compounds harvested from gas giant moons."
+base_value = 10.0
+storage_cap = 5000
+
+[resource.rare-crystals]
+display_name = "Rare Crystals"
+description = "Lattice crystals prized in nanofabrication and luxury architecture."
+base_value = 10.0
+storage_cap = 5000
+
+# --- empire resources ------------------------------------------------------------------------
+
+[resource.influence]
+display_name = "Influence"
+description = "Political capital. Every empire gains 5 per day; spent to claim new systems."
+base_value = 5.0
+tradeable = false
+storage_cap = 1000
+
+[resource.shipbuilding]
+display_name = "Shipbuilding"
+description = "Shipyard labour. Generated on demand while ships are queued and consumed by them."
+stockpile = false
+tradeable = false
+on_demand = true

@@ -21,12 +21,21 @@ If the planet is barren, you may only build structures that are marked as being 
 You can unlock technology to first terraform big planets, and eventually terraform small ones too.
 
 On average, a system may have around 0-2 habitable planets, 1-3 barren large planets, and 2-4 small planets/gas giant moons.
+Habitable planets should have around ~1/3rd of their surface covered by blockers, while barren planets should have only 0-2 tiles not covered.
+Habitable planets additionally have around ~1/3rd of their surface covered by water, which some buildings can be placed on.
 
 ### buildings
 
 Buildings form the core resource harvesting/production capabilities for planets.
 Buildings employ up to a set amount of pops, and their production scales with the amount they employ.
 Buildings can also have adjacency bonuses, where if two buildings (ex. a mine and an alloy factory) are adjacent, they get benefits.
+
+Special types of buildings include - 
+- barren - Can be built on barren planets
+- blocker - Naturally generates (and by convention has a remove cost). Combine with "barren" to generate on barren worlds, "water" to generate on water, etc.
+- space - Can be built on orbital megastructures (not implemented yet)
+- land - Must be built over land tiles (without water on them).
+- water - Must be built over tiles with water on them.
 
 ### population
 
@@ -35,6 +44,25 @@ Population can be manually moved in between jobs/planets/systems. These ingress/
 They also naturally immigrate to find jobs and opportunities. Pops will try to find jobs on their planet that have better "appeal".
 If they can't, then they will work on their planet until there are no more job opportunities at all.
 Then they will start looking up to the system, and eventually the galaxy.
+
+### expansion
+
+Empires have a resource called influence, and can expend this resource to expand their borders.
+Empires automatically get 5 influence per day, and have a cap of 1000.
+
+Building on a planet in an unowned system costs 100 * 2^n influence, where n is 1 - the amount of jumps away the system is from the current empire borders.
+(ex. for an adjacent system, n = 0).
+You cannot build in a system you do not own. Finishing a building automatically claims the system.
+It takes 30 * 2^(n/2) additional days to build a building in an unowned system.
+Successfully finishing a building automatically cancels all other empire's claims/building sites in the system and refunds their materials.
+
+Empires can also build fleets and target buildings with their fleets.
+This will cause destruction, lower amenities, and disable/eventually destroy those buildings.
+At some point (factoring in planet stability, etc) the planet will surrender to the invaders. Barren/autonomous planets surrender immediately.
+Empire fleets will always prioritize fighting enemy fleets over targeting buildings, so if you are being invaded, fly in your fleet for defense.
+
+Fleets should hyper jump in a set amount of time (given by a game rule, and modifiable per-ship by hyper jump multipliers), and should wait for the entire fleet to be ready to hyper jump before jumping to an adjacent system.
+Fleet combat may run on a sub-tick basis. The calculation for fleet combat should be run once per tick (divided into subticks as necessar) before the calculations for planet economy (and thus before the calculations for any economy).
 
 ## file structures
 
@@ -89,8 +117,8 @@ job = "jobs.metallurgist"
 building_class = [ "forge" ] # buildings that can be built on barren planets must have 0 max workers and "barren" in their building class
 
 # all of these are daily
-maintainence_resources = [
-    { resource = "resources.electricity", count = 10 }
+upkeep_resources = [
+    { resource = "resources.energy", count = 10 }
 ]
 
 # inputs and outputs are daily and scale linearly with workers/max_workers
@@ -111,8 +139,8 @@ adjacency_bonus = [
 display_name = "Basic Housing"
 housing = 500
 building_class = [ "housing" ]
-maintainence_resources = [
-    { resource = "resources.electricity", count = 1 }
+upkeep_resources = [
+    { resource = "resources.energy", count = 1 }
 ]
 ```
 
@@ -125,12 +153,64 @@ apply_to = [ "alloy-forge" ] # can be building classes or buildings. Note that t
 #needs_upgrades = [ "fast-forge" ]
 
 # these scale all resources. Scaling is applied after all resources from all upgrades/adjacency bonuses are summed together.
-maintainence_mult = 1.1
+upkeep_mult = 1.1
 input_mult = 1.25
 output_mult = 1.25
 
 # this isnt used for this upgrade but heres an example of what adding another input/output looks like.
 #output_resources = [ { resource = "resources.poop", count = 1 } ]
+```
+
+Buildings can also have build/remove costs.
+Natural blockers are defined as buildings.
+
+```
+[building.wetlands]
+building_class = [ "blocker" ]
+remove_cost = [
+    { resource = "resources.energy", count = 1000 }
+]
+```
+
+### ships
+
+```
+[ship.fighter]
+build_cost = [
+    { resource = "resources.alloy", count = 50 }, # shipbuilding sites only turn labor into shipbuilding as the resource cost is accounted for here
+    { resource = "resources.shipbuilding", count = 100 } # this is a special resource generated by shipbuilding buildings on-demand
+]
+upkeep_cost = [
+    { resource = "resources.energy", count = 1 }
+]
+hull = 500
+shield = 350
+# system internal units per day
+base_speed = 10
+shield_regen = 10
+weapons = [ "laser", "laser" ]
+outfits = [ "shield-booster", "afterburner" ]
+```
+
+```
+[ship-weapon.laser]
+build_cost = [
+    { resource = "resources.alloy", count = 10 }
+]
+shield_damage = 20
+hull_damage = 50
+# can fire once every 0.5 days. fire rate mult divides rather than adding
+fire_rate = 0.5
+range = 10
+```
+
+```
+[ship-outfit.shield-booster]
+build_cost = [
+    { resource = "resources.alloy", count = 25 }
+]
+shield = 50
+shield_regen_mult = 1.5
 ```
 
 ### save file stuff
@@ -144,7 +224,8 @@ The stuff below is more likely to be used in a save file than in raw asset data.
 display_name = "Sol"
 star_type = "yellow-small"
 star_count = 1
-owned_by = "empire-1"
+coordinates = { x = 10, y = 10 } # give systems coordinates relative to the galaxy center. When generating, by default, keep this under 100 radially
+owned_by = "empire-1" # this only changes if all planets in the system are either unowned or owned by a different empire
 linked_systems = ["alpha-centauri"] # optional if not linked (but this is rare)
 ```
 
@@ -154,6 +235,9 @@ linked_systems = ["alpha-centauri"] # optional if not linked (but this is rare)
 [system.sol.planets.sol-1]
 display_name = "Earth"
 total_pop = 200
+# planets should stay fixed in place and not orbit their star
+coordinates = { x = 10, y = 10 } # give planets coordinates relative to the center star. Keep this under 100 radially by default
+owned_by = "empire-1" # this changes if the planet is successfully invaded.
 
 # figure out some way of deterministically mapping each tile number to a spot on the map of the polyhedron
 [system.sol.planets.sol-1.tiles.0]
@@ -161,11 +245,11 @@ resource_multipliers = [
     { resource = "resources.alloy", mult = 1.1 },
     { resource = "resources.food", mult = 0.75 }
 ] # optional if no resource multiplier on tile
-building = {
-    name = "buildings.alloy-forge",
-    upgrades = [ "faster-forge" ],
-    workers = 100,
-}
+
+[system.sol.planets.sol-1.tiles.0.building]
+type = "buildings.alloy-forge"
+upgrades = [ "buildings.faster-forge" ]
+workers = 100
 
 [system.sol.planets.sol-1.tiles.1]
 building = "buildings.housing" # some buildings are passive and provide housing/amenities, etc, but do not need workers or currently have upgrades
@@ -183,6 +267,21 @@ resource_stores = [
 ]
 ```
 
+```
+[empire.empire-1.ai] # presence of this table means the empire is ai
+militant = 0.9 # scale 0 to 1 for all these parameters
+expansionist = 0.5
+scientific = 0.4
+```
+
+```
+[empire.empire-1.fleets.fleet-1]
+display_name = "Great fleet of poo"
+ships = [
+    { ship = "ships.fighter", hull = 500, shield = 350 }
+]
+```
+
 ## optimization
 
 Spacebox is written from the ground up for ultra-high multithreaded performance. The order of command for each tick of the game engine should be -
@@ -191,3 +290,5 @@ Spacebox is written from the ground up for ultra-high multithreaded performance.
 2. Update system economies/populations. Same with planets, should be parallelizable. Use the ingress/egress of resources and population, try to balance resources/pop as best as possible given the outputs/inputs of planets within the system, and then store the remaining surplus/deficit values for later use.
 3. Update empire economies/populations. Follows same pattern as above.
 4. Update galactic economy. After updating galactic economy, go back to each empire and check for remaining surplus/deficits. If they still exist, then put those in the empire's storage (or if it is a deficit, start an empire crisis).
+
+Space fights should be simulated per-system.

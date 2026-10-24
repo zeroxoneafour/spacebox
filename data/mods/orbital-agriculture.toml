@@ -1,0 +1,37 @@
+# Example mod: adds an automated orbital farm for barren worlds and an upgrade for the base
+# game's farms. Mods are ordinary asset files; a save opts in by importing them.
+
+[import]
+resources = "../resources.toml"
+base = "../buildings.toml"
+technologies = "../technologies.toml"
+
+[building.orbital-farm]
+display_name = "Orbital Farm"
+description = "Spin-gravity greenhouses parked in low orbit."
+building_class = ["barren", "agriculture"]
+build_cost = [
+    { resource = "resources.minerals", count = 250 },
+    { resource = "resources.alloy", count = 40 },
+]
+build_days = 120
+upkeep_resources = [
+    { resource = "resources.energy", count = 3 }
+]
+output_resources = [
+    { resource = "resources.food", count = 6 }
+]
+adjacency_bonus = [
+    { building = "base.solar-array", upkeep_mult = 0.5 },
+]
+
+# Upgrades can target buildings from other files through an import alias.
+[building-upgrade.vertical-farming]
+display_name = "Vertical Farming"
+apply_to = [ "base.farm" ]
+needs_upgrades = [ "base.irrigation-network" ]
+requires_tech = ["technologies.hydroponics"]
+cost = [{ resource = "resources.minerals", count = 200 }]
+build_days = 90
+output_mult = 1.2
+upkeep_resources = [ { resource = "resources.energy", count = 1 } ]

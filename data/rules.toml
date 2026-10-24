@@ -1,0 +1,90 @@
+# Global simulation constants. Saves pick one with `[game] ruleset = "rules.default"`.
+# Every numeric field is optional and falls back to the engine default shown here.
+
+[import]
+resources = "resources.toml"
+technologies = "technologies.toml"
+
+[ruleset.default]
+# Daily needs of every pop.
+pop_upkeep = [
+    { resource = "resources.food", count = 0.1 },
+    { resource = "resources.consumer-goods", count = 0.02 },
+]
+starvation_resource = "resources.food"            # shortage kills pops
+comfort_resource = "resources.consumer-goods"     # shortage lowers stability
+research_resource = "resources.research"          # income goes into technologies
+currency = "resources.energy"                     # settles galactic market trades
+
+# Population.
+pop_growth_rate = 0.003       # logistic growth per pop per day
+min_pop_growth = 0.05         # minimum growth per day on a planet with pops and free housing
+starvation_rate = 0.01        # fraction of pops lost per day at a total food shortage
+migration_rate = 0.05         # fraction of unemployed/homeless pops that move per day
+base_housing_large = 200      # housing on a habitable large planet with no buildings
+base_housing_small = 80
+
+# Amenities and stability (0..100, 50 is neutral).
+base_amenities = 10
+amenities_per_pop = 0.1
+base_stability = 50
+stability_output_factor = 0.004          # output x(1 + (stability - 50) * factor)
+unemployment_stability_penalty = 15      # at 100% unemployment
+homelessness_stability_penalty = 20      # at 100% homelessness
+comfort_stability_penalty = 20           # at a total consumer goods shortage
+crisis_stability_penalty = 25            # per unit of crisis severity, empire-wide
+
+# Economy.
+logistics_loss = 0.05         # share of surplus lost shipping out of a non-capital system
+market_fee = 0.1              # galactic market buyer fee
+market_reserve = 1000         # empires only sell stock above this
+scarcity_appeal = 40          # max appeal bonus for jobs producing a scarce resource
+scarcity_target_days = 60     # a resource is scarce below this many days of demand in stock
+
+ai_interval_days = 30
+
+# Expansion. Every empire receives this each day (influence is capped at 1000 by its
+# storage_cap). Building in an unowned system costs expansion_base_cost * 2^n influence and
+# takes expansion_base_days * 2^(n/2) extra days, where n = jumps from the borders - 1.
+empire_income = [
+    { resource = "resources.influence", count = 5 },
+]
+expansion_resource = "resources.influence"
+expansion_base_cost = 100
+expansion_base_days = 30
+
+# Fleets.
+hyperjump_days = 3            # charge time before a jump (x each ship's hyperjump_mult)
+combat_subticks = 8           # combat steps per day
+arrival_radius = 90           # distance from the star where fleets arrive
+ship_repair_rate = 0.05       # fraction of hull repaired per day in friendly, quiet systems
+
+# Bombardment and invasion.
+building_hp = 1000                    # damage a building absorbs (unless it sets `hp`)
+building_disable_damage = 0.5         # buildings stop working past this much damage
+building_repair_rate = 0.02           # damage repaired per day when not bombarded
+bombardment_amenities_penalty = 40    # amenities lost while being bombarded
+surrender_resistance = 4000           # x (1 + pops/500) x (0.5 + stability/100)
+siege_decay = 0.02                    # siege progress lost per day without bombardment
+
+# Diplomacy.
+truce_days = 360              # after peace, AI empires won't renew the war for this long
+
+[ruleset.default.terraforming.large]
+requires_tech = "technologies.atmospheric-engineering"
+days = 360
+cost = [
+    { resource = "resources.minerals", count = 2000 },
+    { resource = "resources.alloy", count = 500 },
+    { resource = "resources.exotic-gases", count = 100 },
+]
+
+[ruleset.default.terraforming.small]
+requires_tech = "technologies.planetary-reconstruction"
+days = 540
+cost = [
+    { resource = "resources.minerals", count = 3000 },
+    { resource = "resources.alloy", count = 1000 },
+    { resource = "resources.exotic-gases", count = 200 },
+    { resource = "resources.rare-crystals", count = 200 },
+]

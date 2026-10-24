@@ -1,0 +1,97 @@
+# spacebox-web
+
+An Axum server that runs the Spacebox engine (`../spacebox-core`), plus a three.js admin
+client. Anyone who can reach the server has full game-master control over the simulation.
+
+```sh
+cargo run --release              # http://127.0.0.1:3000, starts with data/scenarios/sol.toml
+cargo run --release -- --port 8080 --load saves/sol-day-360.toml
+```
+
+Options: `--port N`, `--data DIR` (default `../data`), `--load FILE` (relative to `--data`),
+`--static DIR` (client files, default `./static`). The server binds to 127.0.0.1 only.
+
+The client loads three.js from the jsDelivr CDN, so the browser needs internet access.
+
+## Client
+
+- **Galaxy view.** Systems are coloured by owner, hyperlanes are tinted inside empires, and
+  capitals have a ring. Fleets are cones beside their system, with dashed lines to their
+  destination and a red ring while fighting. Click a system to inspect it; double-click to
+  enter it.
+- **System view.** The star(s), planets at their fixed coordinates (with owner bands and a red
+  band while under siege), the hyperjump arrival rim, and fleets showing jump charge and order
+  lines. Double-click a planet to land on it.
+- **Fleet orders.** Select a fleet, then right-click. On a system in the galaxy view it moves
+  there. On a point in the system view it moves to that point. On an enemy (or unowned)
+  planet or tile it bombards it. The fleet panel has the same orders, plus merge, split,
+  rename, and admin repair, transfer, teleport and disband.
+- **Planet view.** The 12- or 32-face solid, with the tile numbering from the engine. A column
+  marks each building and its height shows how staffed it is. Water tiles are blue, and
+  natural blockers are dark outcrops that must be cleared (at their removal cost) before
+  building. Wireframes mark construction, and dots mark tiles with resource multipliers.
+  Click a tile to build, upgrade, demolish, cap jobs, pin workers or disable it.
+- **Side panels.** Empires (create, rename, recolour, toggle AI and tune its militant/
+  expansionist/scientific sliders, migration and market access,
+  set stockpiles, choose research, grant or revoke technologies, declare war or make peace,
+  cancel ship orders, spawn fleets); systems (owner, capital, hyperlanes, planets with owners,
+  fleets present, add planets, delete); planets (owner, siege progress, shipyard orders, add,
+  remove, set or move pops, terraform, toggle habitability, delete).
+- **Expansion.** On an empty tile in an unowned system, choose which empire builds. The panel
+  shows the extra influence and days for the claim.
+- **Top bar.** Play/pause (space), step size, and the size of the last update. **World…**
+  regenerates a galaxy, loads a scenario or save, or saves to `data/saves/`.
+
+Most tile actions come in two flavours. *Order* goes through the normal game rules: costs,
+technology and the barren-planet rule. *Admin* acts instantly and ignores the rules.
+
+## REST API
+
+All bodies are JSON. Ids are indices into the corresponding arrays of the state.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/defs` | Static catalog: resources, jobs, buildings, upgrades, technologies, terraforming, planet geometry |
+| GET | `/api/state` | Full state: `{ epoch, version, event_seq, state, events }` |
+| POST | `/api/tick` | `{ days, since, epoch, since_event }`: advance time, then return a diff |
+| POST | `/api/sync` | Same as tick, but does not advance time (use after admin edits) |
+| POST | `/api/command` | Engine command with normal rules, e.g. `{ "type": "build", "planet": 3, "tile": 7, "building": 5 }` |
+| POST | `/api/empires` | Create an empire: `{ display_name, ai, color, capital, starting_resources }`; `ai` is `{ militant, expansionist, scientific }` (0–1) or null for a player empire |
+| PATCH | `/api/empires/{id}` | `display_name`, `ai` (personality object, or `null` to hand control to the player), `color`, `accepts_migrants`, `market_access` |
+| POST | `/api/empires/{id}/techs` | Grant or revoke a technology: `{ tech, known }` |
+| POST | `/api/empires/{id}/storage` | Set a stockpile: `{ resource, count }` |
+| POST | `/api/systems` | Add a system: `{ display_name, coordinates, owner, links, link_nearest, random_planets }` |
+| PATCH / DELETE | `/api/systems/{id}` | Edit (`display_name`, `star_type`, `star_count`, `coordinates`) or delete |
+| POST | `/api/systems/{id}/planets` | Add a planet: `{ display_name, size, habitable, pop, moon_of, coordinates, terrain }` (`terrain` generates seas and blockers, default true) |
+| PATCH / DELETE | `/api/planets/{id}` | `pop`, `add_pops`, `habitable`, `display_name`, `moon_of`, `coordinates`, `terraform_days_left`, `repair` (clears siege and damage); or delete |
+| PUT | `/api/planets/{id}/tiles/{tile}` | Admin tile edit: `{ building: id or null, upgrades, cancel_construction, multipliers, water }` |
+| POST | `/api/fleets` | Spawn a fleet instantly: `{ empire, system, display_name, coordinates, ships: [{ ship, count }] }` |
+| PATCH / DELETE | `/api/fleets/{id}` | `display_name`, `owner`, `system` (teleport), `coordinates`, `repair`; or delete |
+| POST | `/api/world/regenerate` | `{ systems, empires, seed, ai }` |
+| POST | `/api/world/load` | `{ path }`, relative to the data directory |
+| POST | `/api/world/save` | `{ name }`, written to `data/saves/{name}.toml` |
+| GET | `/api/world/files` | Loadable scenarios and saves |
+
+`/api/command` accepts these `type`s: `move_pops`, `assign_workers`, `set_job_cap`,
+`set_enabled`, `build` (with an optional `empire`, required for expansion claims),
+`demolish`, `upgrade`, `terraform`, `set_research`, `set_owner`, `set_planet_owner`,
+`set_capital`, `link`, `unlink`, `grant_resources`, `build_ship`, `cancel_ship_order`,
+`move_fleet`, `bombard`, `stop_fleet`, `merge_fleets`, `split_fleet`, `rename_fleet`,
+`disband_fleet`, `declare_war`, `make_peace`. The fields match `spacebox_core::Command`;
+fleet ids are the stable `id` of each entry in `state.fleets`.
+
+### Diffs
+
+Each time state is requested, the server takes a JSON snapshot. If it differs from the latest
+one, it gets a new `version`, and the last 32 versions are kept. A client that sends
+`since: <version>` and the current `epoch` gets back `ops`: a list of path-based edits
+(`{p, v}` set, `{p, d}` delete, `{p, n}` resize array). If that version has been evicted, or
+the world has been replaced (new `epoch`), the client gets the full `state` instead.
+
+`since_event` works the same way for the event log.
+
+On a 120-system galaxy, a 10-day step sends about 10 KB of ops instead of the 320 KB full
+state.
+
+Removing systems or planets shifts the ids that come after them. The diff handles this, but
+any queued engine commands are dropped.

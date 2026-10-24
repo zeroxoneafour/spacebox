@@ -1,0 +1,176 @@
+# Technologies. Research points (the ruleset's research resource) flow into one technology at a
+# time; empires without an explicit choice research the cheapest available technology.
+#
+# Technologies unlock buildings and upgrades (via their `requires_tech`), terraforming (via the
+# ruleset), and may grant empire-wide modifiers:
+#
+#   modifiers = [{ building_class = "agriculture", output_mult = 1.15 }]
+#
+# Modifier entries accept the same fields as upgrades and adjacency bonuses.
+
+[import]
+buildings = "buildings.toml"
+resources = "resources.toml"
+
+# --- tier 1 ----------------------------------------------------------------------------------
+
+[technology.hydroponics]
+display_name = "Hydroponics"
+description = "Soil-free agriculture under artificial light."
+category = "society"
+cost = 400
+
+[technology.improved-mining]
+display_name = "Improved Mining Techniques"
+category = "engineering"
+cost = 450
+
+[technology.grid-optimization]
+display_name = "Grid Optimization"
+category = "physics"
+cost = 500
+modifiers = [{ building_class = "power", output_mult = 1.1 }]
+
+[technology.holographic-entertainment]
+display_name = "Holographic Entertainment"
+category = "society"
+cost = 600
+
+[technology.administrative-ai]
+display_name = "Administrative AI"
+category = "physics"
+cost = 700
+modifiers = [{ building_class = "administration", amenities_mult = 1.2, upkeep_mult = 0.8 }]
+
+# --- tier 2 ----------------------------------------------------------------------------------
+
+[technology.automated-mining]
+display_name = "Automated Mining"
+category = "engineering"
+cost = 800
+prerequisites = ["improved-mining"]
+
+[technology.gene-tailored-crops]
+display_name = "Gene-Tailored Crops"
+category = "society"
+cost = 900
+prerequisites = ["hydroponics"]
+modifiers = [{ building_class = "agriculture", output_mult = 1.15 }]
+
+[technology.material-synthesis]
+display_name = "Material Synthesis"
+category = "engineering"
+cost = 1000
+prerequisites = ["improved-mining"]
+
+[technology.xeno-geology]
+display_name = "Xeno-Geology"
+description = "Locating and extracting strategic deposits on lifeless worlds."
+category = "engineering"
+cost = 1000
+prerequisites = ["automated-mining"]
+
+[technology.social-engineering]
+display_name = "Social Engineering"
+category = "society"
+cost = 1100
+prerequisites = ["holographic-entertainment"]
+stability = 5
+
+# --- tier 3 ----------------------------------------------------------------------------------
+
+[technology.advanced-alloys]
+display_name = "Advanced Alloys"
+category = "engineering"
+cost = 1400
+prerequisites = ["material-synthesis"]
+modifiers = [{ building_class = "forge", output_mult = 1.1 }]
+
+[technology.nano-fabrication]
+display_name = "Nano-Fabrication"
+category = "engineering"
+cost = 1500
+prerequisites = ["material-synthesis"]
+
+[technology.quantum-computing]
+display_name = "Quantum Computing"
+category = "physics"
+cost = 1600
+prerequisites = ["grid-optimization"]
+modifiers = [{ building_class = "research", output_mult = 1.1 }]
+
+[technology.gene-therapy]
+display_name = "Gene Therapy"
+category = "society"
+cost = 1500
+prerequisites = ["gene-tailored-crops"]
+pop_growth_mult = 1.25
+
+[technology.fusion-power]
+display_name = "Fusion Power"
+category = "physics"
+cost = 1800
+prerequisites = ["grid-optimization", "xeno-geology"]
+
+# --- tier 4 ----------------------------------------------------------------------------------
+
+[technology.atmospheric-engineering]
+display_name = "Atmospheric Engineering"
+description = "Makes it possible to terraform large barren worlds."
+category = "society"
+cost = 2500
+prerequisites = ["gene-tailored-crops", "xeno-geology"]
+
+[technology.arcology-project]
+display_name = "Arcology Project"
+category = "engineering"
+cost = 3000
+prerequisites = ["nano-fabrication", "social-engineering"]
+
+# --- military ----------------------------------------------------------------------------------
+
+[technology.naval-doctrine]
+display_name = "Naval Doctrine"
+description = "Fleet tactics that make destroyer-class warships practical."
+category = "military"
+cost = 600
+
+[technology.deflector-shields]
+display_name = "Deflector Shields"
+category = "military"
+cost = 900
+prerequisites = ["naval-doctrine", "grid-optimization"]
+
+[technology.plasma-weapons]
+display_name = "Plasma Weapons"
+category = "military"
+cost = 1400
+prerequisites = ["deflector-shields", "material-synthesis"]
+
+[technology.capital-ships]
+display_name = "Capital Ships"
+description = "Cruiser hulls with the keel strength to carry heavy weapons."
+category = "military"
+cost = 1800
+prerequisites = ["naval-doctrine", "advanced-alloys"]
+
+[technology.orbital-drydocks]
+display_name = "Orbital Drydocks"
+category = "military"
+cost = 1200
+prerequisites = ["naval-doctrine", "automated-mining"]
+
+[technology.titanic-hulls]
+display_name = "Titanic Hulls"
+category = "military"
+cost = 4000
+prerequisites = ["capital-ships", "plasma-weapons"]
+
+# --- tier 5 ----------------------------------------------------------------------------------
+
+[technology.planetary-reconstruction]
+display_name = "Planetary Reconstruction"
+description = "Rebuilds even small worlds and moons into habitable ones."
+category = "society"
+cost = 6000
+prerequisites = ["atmospheric-engineering", "arcology-project"]

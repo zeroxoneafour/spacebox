@@ -1,0 +1,13 @@
+# tradeable, non-transient resource
+[resource.example-resource]
+display-name = "Example resource"
+
+# currency is no different from other resources. make sure not to specify tradeable = false though...
+[resources.example-currency]
+display-name = "Example currency"
+
+# An example non-storable resource, used for ex. shipbuilding or research. "Produced" at all times but not stored, only consumed when requested
+[resource.example-transient-resource]
+display-name = "Example transient resource"
+transient = true
+tradeable = false # transient resources may be marked tradeable, but this example one is not

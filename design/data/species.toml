@@ -1,0 +1,18 @@
+[import]
+resources = "resources.toml"
+
+[species.example-species]
+display-name = "Example Species"
+
+[species.example-species.upkeep]
+upkeep-cost = [
+    { resource = "resources.example-resource", count = 0.1 },
+]
+starvation-resource = "resources.example-resource" # shortage kills pops
+comfort-resource = "resources.example-resource" # shortage lowers stability. if not defined (ex. for hive mind), then always satisfied
+
+[species.example-species.growth]
+growth-rate = 0.003       # logistic growth per pop per day
+min-growth = 0.05         # minimum growth per day on a planet with pops and free housing
+starvation-rate = 0.01        # fraction of pops lost per day at a total food shortage
+migration-rate = 0.05         # fraction of unemployed/homeless pops that move per day

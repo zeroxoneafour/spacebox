@@ -1,0 +1,40 @@
+[import]
+resources = "resources.toml"
+
+[ship.example-ship]
+display-name = "Example Ship"
+requires-tech = ["technologies.example-technology"]
+build-cost = [
+    { resource = "resources.example-resource", count = 120 },
+    # usually this would be the "shipbuilding" transient resource (but I suppose for ex. a science ship it could be research, or for an organic ship it could be left out?)
+    { resource = "resources.example-transient-resource", count = 250 },
+]
+upkeep-cost = [
+    { resource = "resources.example-resource", count = 2 }
+]
+hull = 1200 # hull of the ship
+shield = 600 # shield of the ship
+base-speed = 9 # speed in units/day (a system is 100x100 units)
+shield-regen = 15 # shield regenerated/day
+weapons = [ "example-weapon" ] # array of weapons
+outfits = [ "example-outfit" ] # array of outfits
+
+[ship-outfit.example-outfit]
+display-name = "Example Outfit"
+# can also have an upkeep cost
+build-cost = [
+    { resource = "resources.example-resource", count = 25 }
+]
+shield-add = 50
+shield-regen-mult = 1.5
+
+[ship-weapon.example-weapon]
+display_name = "Example Weapon"
+build_cost = [
+    { resource = "resources.example-resource", count = 10 }
+]
+shield-damage = 20
+hull-damage = 50
+# can fire once every 0.5 days. fire rate mult divides rather than adding
+fire-rate = 0.5
+range = 10

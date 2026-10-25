@@ -1,0 +1,32 @@
+[import]
+resources = "resources.toml"
+
+[technology.example-technology]
+display-name = "Example Technology 1"
+# if the resource is not transient, then it can pull out of the stockpile
+research-resources = [
+    { resource = "resources.example-transient-resource", count = 500 },
+]
+research-tags = [ "example-research-tag" ]
+# this research unlocks many things (can be seen in the other example data files) but does not change any stats.
+# as such, it needs no stats changed section below it.
+
+[technology.example-technology-2]
+display-name = "Example Technology 2"
+research-resources = [
+    { resource = "resources.example-transient-resource", count = 100 },
+]
+research-tags = [ "example-research-tag" ]
+prerequisites = [ "example-technology" ]
+
+# example effects a tech can have
+[technology.example-technology-2.pop]
+growth-mult = 1.1
+
+[technology.example-technology-2.ships]
+fleet-size-add = 10
+fire-rate-mult = 1.1
+
+[technology.example-technology-2.buildings]
+# can leave out the "buildings" value to apply to all buildings, or specify specific building names as well along with/instead of tags
+output-mult = { value = 1.1, buildings = [ "example-building-tag" ] }

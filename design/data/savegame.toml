@@ -1,0 +1,104 @@
+[import]
+rules = "rules.toml"
+resources = "resources.toml"
+technologies = "technologies.toml"
+ships = "ships.toml"
+buildings = "buildings.toml"
+species = "species.toml"
+
+[game]
+day = 10
+seed = 8902341 # 64 bit unsigned integer (u64)
+ruleset = "rules.example-ruleset"
+
+[empire.example-empire]
+display-name = "Example Empire"
+color = "#ff0000"
+capital = "example-system"
+dominant_species = "species.example-species"
+resource-stores = [
+    { resource = "resources.example-resource", count = 1000.0 },
+]
+technologies = [
+    "technologies.example-technology",
+]
+current-research = [
+    { technology = "technologies.example-technology-2", remaining = [ { resource = "resources.example-transient-resource", count = 100.0 } ] }
+]
+current-shipbuilding = [
+    { ship = "ships.example-ship", system = "example-system", planet = "example-planet", remaining = [{ resource = "resources.example-transient-resource", count = 100.0 }] },
+]
+truces = [
+    #{ empire = "example-empire-2", until_day = 300 }, # this is valid if there as an empire 2, which there isn't. this is how the truces field would be formatted
+]
+
+[empire.example-empire.fleets.home-fleet]
+display_name = "Example Empire Home Fleet"
+# fleets jump together and must necessarily all be in the same system to be a fleet
+# fleets can only jump if they are all at the edge of the system closest to the system they are jumping to
+system = "example-system"
+ships = [
+    # coordinates are system relative (x, y), like planets
+    { ship = "ships.example-ship", hull = 500.0, shield = 400.0, coords = [10, 10] },
+]
+
+# presence of this table means the empire is ai. values are all 0-1
+[empire.example-empire.ai]
+militant = 0.5 # willingness to fight others/defend itself. lower values prioritize economy/soft power over wars and raw military strength
+expansionist = 0.5 # willingness to expand its territories. lower values prioritize individual planet development over system expansion
+scientific = 0.5 # willingness to expand research capability. lower values prioritize other types of infrastructure investment
+
+[system.example-system]
+display-name = "Example System"
+star-type = "yellow-small"
+star-count = 1
+# this changes only when all planets in an occupied system are captured, or when an empty system has any one planet change loyalty
+owner = "example-empire"
+linked-systems = [
+    #"example-system-2" # would be valid if there was an example-system-2
+]
+# (x, y) coords in galactic map, (0, 0) is center
+coords = [0.0, 0.0]
+
+# barren planets can only have buildings with the "barren" tag built on them
+[system.example-system.planets.example-barren-planet]
+display-name = "Example Barren Planet"
+size = "large" # can be large or small (a truncated icosahedron with 32 faces or a regular dodecahedron with 12)
+habitable = false
+# (x, y) coords in system map. the star is at the center, and planets can be up to 100 units away radially.
+coords = [-14.0, 12]
+owner = "example-empire" # uninhabited planets change loyalty immediately when bombarded
+
+# tiles are laid out 0 to 11 or 0 to 31 with standard face mapping (up to implementation)
+[system.example-system.planets.example-barren-planet.tile-0]
+resource-multipliers = [{ resource = "resources.example-resource", mult = 1.4 }]
+building = { building = "buildings.example-barren-building", upgrades = ["buildings.example-building-upgrade"] }
+
+# blocker example, preventing new buildings until it is cleared
+[system.example-system.planets.example-barren-planet.tile-3]
+building = "buildings.example-barren-blocker-building"
+
+# example habitable planet
+[system.example-system.planets.example-planet]
+display-name = "Example Habitable Planet"
+size = "large"
+habitable = true
+population = [ { species = "species.example-species", count = 1000 } ]
+coords = [25.0, 4.0]
+owner = "example-empire" # inhabited planets must surrender before changing loyalty
+
+[system.example-system.planets.example-planet.tile-0]
+building = "buildings.example-housing-building"
+
+[system.example-system.planets.example-planet.tile-1]
+water = true
+building = { building = "buildings.example-water-building", workers = 100 }
+
+[system.example-system.planets.example-planet.tile-2]
+building = { building = "buildings.example-building", workers = 250 }
+# construction also tracks an "empire" field if the planet being built on is unclaimed, so it knows who to refund to in the event of a claim cancellation
+# it also refunds all non-remaining resources (the upgrade cost - resources remaining)
+construction = { upgrade = "buildings.example-building-upgrade", remaining = [ { days = 50 } ] }
+
+[system.example-system.planets.example-planet.tile-3]
+building = "buildings.example-blocker-building"

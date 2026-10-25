@@ -1,0 +1,89 @@
+# Global simulation constants. Saves pick one with `[game] ruleset = "rules.default"`.
+# Every numeric field is optional and falls back to the engine default shown here.
+
+[import]
+resources = "resources.toml"
+technologies = "technologies.toml"
+
+[ruleset.example-ruleset]
+display-name = "Example Ruleset"
+
+[ruleset.example-ruleset.resources]
+base-resource-stores = [
+    { resource = "resources.example-resource", count = 5000 },
+    { resource = "resources.example-currency", count = 10000 }
+]
+
+# Amenities and stability (0..100, 50 is neutral).
+[ruleset.example-ruleset.amenities]
+base-amenities = 10
+amenities-per-pop = 0.1
+base-stability = 50
+stability-output-factor = 0.004          # output x(1 + (stability - 50) * factor)
+unemployment-stability-penalty = 15      # at 100% unemployment
+homelessness-stability-penalty = 20      # at 100% homelessness
+comfort-stability-penalty = 20           # at a total consumer goods shortage
+crisis-stability-penalty = 25            # per unit of crisis severity, empire-wide
+
+# Economy.
+[ruleset.example-ruleset.economy]
+currency = "resources.example-currency" # settles galactic market trades
+logistics-loss = 0.05         # share of surplus lost shipping out of a non-capital system
+market-fee = 0.1              # galactic market buyer fee
+market-reserve = 1000         # empires only sell stock above this
+scarcity-appeal = 40          # max appeal bonus for jobs producing a scarce resource
+scarcity-target-days = 60     # a resource is scarce below this many days of demand in stock
+
+[ruleset.example-ruleset.ai]
+ai-interval-days = 30
+
+[ruleset.example-ruleset.technology]
+research-speed-mult = 1.0 # multiplier on research speed by being applied to research income
+
+# Expansion. Every empire receives the expansion resource each day. The max is set in the resource part of the ruleset.
+# Building in an unowned system costs expansion-base-cost * 2^n influence and
+# takes expansion-base-days * 2^(n/2) extra days, where n = jumps from the borders - 1.
+[ruleset.example-ruleset.expansion]
+expansion-resource = "resources.example-resource"
+expansion-resource-income = 5 # per day
+expansion-base-cost = 100
+expansion-base-days = 30
+
+# Fleets.
+[ruleset.example-ruleset.ships]
+hyperjump-days = 3            # charge time before a jump (x each ship's hyperjump-mult)
+combat-subticks = 8           # combat steps per day
+arrival-radius = 90           # distance from the star where fleets arrive
+ship-repair-rate = 0.05       # fraction of hull repaired per day in friendly, quiet systems
+
+# Bombardment and invasion.
+[ruleset.example-ruleset.invasion]
+building-hp = 1000                    # damage a building absorbs (unless it sets `hp`)
+building-disable-damage = 0.5         # buildings stop working past this much damage
+building-repair-rate = 0.02           # damage repaired per day when not bombarded
+bombardment-amenities-penalty = 40    # amenities lost while being bombarded
+surrender-resistance = 4000           # x (1 + pops/500) x (0.5 + stability/100)
+siege-decay = 0.02                    # siege progress lost per day without bombardment
+
+# Diplomacy.
+[ruleset.example-ruleset.diplomacy]
+truce-days = 360              # after peace, AI empires won't renew the war for this long
+
+[ruleset.example-ruleset.terraforming.large]
+requires-tech = "technologies.atmospheric-engineering"
+days = 360
+cost = [
+    { resource = "resources.minerals", count = 2000 },
+    { resource = "resources.alloy", count = 500 },
+    { resource = "resources.exotic-gases", count = 100 },
+]
+
+[ruleset.example-ruleset.terraforming.small]
+requires-tech = "technologies.planetary-reconstruction"
+days = 540
+cost = [
+    { resource = "resources.minerals", count = 3000 },
+    { resource = "resources.alloy", count = 1000 },
+    { resource = "resources.exotic-gases", count = 200 },
+    { resource = "resources.rare-crystals", count = 200 },
+]

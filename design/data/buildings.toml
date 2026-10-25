@@ -1,0 +1,115 @@
+[import]
+resources = "resources.toml"
+jobs = "jobs.toml"
+technologies = "technologies.toml"
+
+[building.example-housing-building]
+display-name = "Example Housing Building"
+housing = 500
+building-tags = [] # in a real data pack should include "housing"
+build-cost = [ { resource = "resources.example-resource", count = 150 }, { days = 90 } ]
+upkeep-cost = [
+    { resource = "resources.example-resource", count = 1 }
+]
+adjacency-bonus = [
+    { building-tag = "example-building-tag", housing-mult = 1.1 },
+    { building = "example-building", housing-mult = 0.75 },
+]
+
+[building.example-building]
+display-name = "Example Building"
+max-workers = 250
+job = "jobs.example-job"
+# no building tags field means = []
+build-cost = [ { resource = "resources.example-resource", count = 300 }, { days = 150 } ]
+max-per-planet = 5
+hp = 5000 # the default for this is defined in the ruleset
+upkeep-cost = [
+    { resource = "resources.example-resource", count = 1 }
+]
+# no adjacency bonus field also means = []
+# all the below fields are daily
+inputs = [
+    { resource = "resources.example-resource", count = 10 }
+]
+# in a real data pack you should never print money, but we'll use it here as an example of an output resource
+outputs = [
+    { resource = "resources.example-currency", count = 10 }
+]
+
+# there are a few special reserved tags for buildings - barren, blocker, water, land, and space.
+# By default, buildings can only be built on habitable planets on land.
+# Unless one or more of "water" or "space" is present, they are granted the "land" tag implicitly. building-tags = [ "a" ] still grants the "land" tag on top of "a".
+# If these tags are present, then the "land" tag must be explicit or the building cannot be built on land.
+# barren buildings can be built on non-habitable planets. They can also be built on habitable planets, but are usually less efficient than their inhabited counterparts.
+# space buildings can be built on space megastructures (coming soon).
+# blocker buildings generate naturally. Depending on their tags, they generate by default on habitable land, but can be configured to generate elsewhere.
+
+[building.example-water-building]
+display-name = "Example Water Building"
+max-workers = 100
+job = "jobs.example-job"
+requires-tech = [ "technologies.example-technology" ]
+build-cost = [ { resource = "resources.example-resource", count = 300 }, { days = 150 } ]
+building-tags = [ "water", "example-building-tag" ]
+upkeep-cost = [
+    { resource = "resources.example-resource", count = 1 }
+]
+# buildings can output amenities. There can also be a passive-outputs field for buildings that naturally generate amenities.
+# passive-outputs field has the same structure and function except it doesnt scale with workers (similar to upkeep-cost)
+outputs = [
+    { resource = "resources.example-resource", count = 10 },
+    { amenities = 100 }
+]
+
+[building.example-barren-building]
+display_name = "Example Barren Building"
+building-tags = [ "barren" ] # so equivalent to [ barren, land ]
+build-cost = [
+    { resource = "resources.example-resource", count = 250 },
+    { days = 100 }
+]
+upkeep-cost = [
+    { resource = "resources.example-resource", count = 6 }
+]
+# normally inputs and outputs scale linearly with the amount of workers. The given numbers are achieved when building employment is 100%.
+# However, for barren buildings (and other buildings with no max-workers field), they always operate with 100% input/output efficiency.
+outputs = [
+    { resource = "resources.example-transient-resource", count = 8 }
+]
+
+# can generate naturally in land tiles of habitable planets
+[building.example-blocker-building]
+display-name = "Example Blocker"
+building-tags = [ "blocker" ]
+# if remove-cost is not specified, it is free and instant. Notice that it is not specified for most buildings.
+remove-cost = [ { resource = "resources.example-resource", count = 500 }, { days = 150 } ]
+# not all blockers are all bad! this one makes some amenities. Maybe it is scenic or something...
+outputs = [
+    { amenities = 50 }
+]
+
+# can generate naturally in land tiles of uninhabitable planets
+[building.example-barren-blocker-building]
+display-name = "Example Barren Blocker"
+building-tags = [ "barren", "blocker" ]
+remove-cost = [ { resource = "resources.example-resource", count = 500 }, { days = 150 } ]
+
+[building.example-building-upgrade]
+display-name = "Example Building Upgrade"
+applies-to = [ "example-building", "example-building-tag" ]
+requires-tech = [ "technologies.example-technology" ]
+build-cost = [
+    { resource = "resources.example-resource", count = 750 },
+    { days = 10 }
+]
+#after-upgrades = [ "example-building-upgrade-0" ] # you can use this to set an upgrade ordering
+
+# you can add or multiply upkeep-cost, passive-output, input, and output fields
+# as well as max workers and jobs field
+# adds are applied before mults
+output-add = [
+    # for inputs, count could be negative to signal more efficiency
+    { resource = "resources.example-resource", count = 1 }
+]
+output-mult = 1.1

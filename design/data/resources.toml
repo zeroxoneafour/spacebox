@@ -1,10 +1,14 @@
 # tradeable, non-transient resource
 [resource.example-resource]
 display-name = "Example resource"
+# relative to currency selected in ruleset (if currency value is 10, you can buy 10 of this with one unit of currency)
+base-value = 1 # 1 is the default
 
 # currency is no different from other resources. make sure not to specify tradeable = false though...
-[resources.example-currency]
+[resource.example-currency]
 display-name = "Example currency"
+description = "An optional description"
+base-value = 1
 
 # An example non-storable resource, used for ex. shipbuilding or research. "Produced" at all times but not stored, only consumed when requested
 [resource.example-transient-resource]

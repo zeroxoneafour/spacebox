@@ -1,8 +1,6 @@
-# Jobs. Pops fill the most appealing open jobs on their planet first. Jobs whose outputs are
-# scarce in the empire gain extra appeal (see `scarcity_appeal` in rules.toml), so even
-# unglamorous work gets done when it matters.
-#
-# `upkeep` is consumed per worker per day, on top of the per-pop upkeep in the ruleset.
+# Jobs. Pops fill the most appealing open jobs on their planet first (appeal is 0-100). When an
+# associated resource runs low in the empire, the job becomes more appealing (up to the
+# ruleset's scarcity-appeal), which is how unglamorous but essential work gets done.
 
 [import]
 resources = "resources.toml"
@@ -10,66 +8,81 @@ resources = "resources.toml"
 # --- workers ---------------------------------------------------------------------------------
 
 [job.farmer]
-display_name = "Farmer"
+display-name = "Farmer"
 appeal = 40
+job-tags = ["worker"]
+associated-resource = ["resources.food"]
 
 [job.technician]
-display_name = "Technician"
+display-name = "Technician"
 appeal = 45
+job-tags = ["worker"]
+associated-resource = ["resources.energy"]
 
 [job.miner]
-display_name = "Miner"
+display-name = "Miner"
 appeal = 35
+job-tags = ["worker"]
+associated-resource = ["resources.minerals"]
 
 [job.clerk]
-display_name = "Clerk"
-description = "Keeps the paperwork flowing and the streets clean. Provides amenities."
+display-name = "Clerk"
+description = "Keeps the paperwork flowing and the streets clean."
 appeal = 30
+job-tags = ["worker"]
 
 # --- specialists -----------------------------------------------------------------------------
 
 [job.metallurgist]
-display_name = "Metallurgist"
+display-name = "Metallurgist"
 appeal = 70
+job-tags = ["specialist"]
+associated-resource = ["resources.alloy"]
 
 [job.artisan]
-display_name = "Artisan"
+display-name = "Artisan"
 appeal = 60
+job-tags = ["specialist"]
+associated-resource = ["resources.consumer-goods"]
 
 [job.chemist]
-display_name = "Chemist"
+display-name = "Chemist"
 appeal = 65
-upkeep = [{ resource = "resources.consumer-goods", count = 0.02 }]
+job-tags = ["specialist"]
+associated-resource = ["resources.volatile-motes"]
 
 [job.gas-refiner]
-display_name = "Gas Refiner"
+display-name = "Gas Refiner"
 appeal = 62
-upkeep = [{ resource = "resources.consumer-goods", count = 0.02 }]
+job-tags = ["specialist"]
+associated-resource = ["resources.exotic-gases"]
 
 [job.crystal-cutter]
-display_name = "Crystal Cutter"
+display-name = "Crystal Cutter"
 appeal = 66
-upkeep = [{ resource = "resources.consumer-goods", count = 0.02 }]
+job-tags = ["specialist"]
+associated-resource = ["resources.rare-crystals"]
 
 [job.entertainer]
-display_name = "Entertainer"
+display-name = "Entertainer"
 appeal = 65
-upkeep = [{ resource = "resources.consumer-goods", count = 0.02 }]
+job-tags = ["specialist"]
 
 [job.shipwright]
-display_name = "Shipwright"
-description = "Builds starships at a shipyard (only while ships are on order)."
+display-name = "Shipwright"
+description = "Builds starships. Their shipbuilding is wasted if no ships are on order."
 appeal = 58
+job-tags = ["specialist"]
 
 [job.researcher]
-display_name = "Researcher"
+display-name = "Researcher"
 appeal = 85
-upkeep = [{ resource = "resources.consumer-goods", count = 0.05 }]
+job-tags = ["specialist"]
 
 # --- rulers ----------------------------------------------------------------------------------
 
 [job.bureaucrat]
-display_name = "Bureaucrat"
+display-name = "Bureaucrat"
 description = "Runs the planetary administration from the capital complex."
 appeal = 90
-upkeep = [{ resource = "resources.consumer-goods", count = 0.1 }]
+job-tags = ["ruler"]

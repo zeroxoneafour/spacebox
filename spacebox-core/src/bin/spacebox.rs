@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use spacebox_core::generate::{GalaxyParams, generate};
 use spacebox_core::geometry::PlanetSize;
-use spacebox_core::world::Construction;
+use spacebox_core::world::ProjectKind;
 use spacebox_core::{EmpireId, PlanetId, World, load_assets, load_world, save};
 
 const USAGE: &str = "\
@@ -242,25 +242,26 @@ fn print_summary(world: &World) {
     for (i, e) in world.empires.iter().enumerate() {
         let eid = EmpireId::from_idx(i);
         println!(
-            "{} [{}]: {} systems, {} planets, {} pops, research {:.1}/day{}",
+            "{} [{}]: {} systems, {} planets, {} pops{}",
             e.display_name,
             e.name,
             world.empire_systems(eid).len(),
             e.stats.planets,
             e.stats.pop,
-            e.stats.research_income,
-            e.researching
-                .map(|t| format!(
-                    " -> {} ({:.0}/{:.0})",
-                    world.defs.tech(t).display_name,
-                    e.research_progress,
-                    world.defs.tech(t).cost
-                ))
+            e.dominant_species
+                .map(|s| format!(" (mostly {})", world.defs.species_def(s).display_name))
                 .unwrap_or_default()
         );
         let mut line = String::from("   ");
+        let mut transient = String::from("   ");
         for (r, v) in e.storage.iter().enumerate() {
-            if !world.defs.resources[r].stockpile {
+            if world.defs.resources[r].transient {
+                transient.push_str(&format!(
+                    " {} {:.1}/day ({:.1} wasted)",
+                    short(world, r),
+                    e.income[r],
+                    e.wasted[r]
+                ));
                 continue;
             }
             line.push_str(&format!(
@@ -271,6 +272,23 @@ fn print_summary(world: &World) {
             ));
         }
         println!("{line}");
+        println!("{transient}");
+        if !e.research.is_empty() {
+            let r: Vec<String> = e
+                .research
+                .iter()
+                .map(|p| {
+                    let total: f64 = world.defs.tech(p.tech).cost.iter().map(|a| a.count).sum();
+                    let left: f64 = p.remaining.resources.iter().map(|a| a.count).sum();
+                    format!(
+                        "{} ({:.0}%)",
+                        world.defs.tech(p.tech).display_name,
+                        100.0 * (1.0 - left / total.max(1e-9))
+                    )
+                })
+                .collect();
+            println!("    researching: {}", r.join(", "));
+        }
         if !e.crises.is_empty() {
             let c: Vec<String> = e
                 .crises
@@ -306,9 +324,9 @@ fn print_summary(world: &World) {
         if !fleets.is_empty() {
             println!("    fleets: {}", fleets.join(", "));
         }
-        if !e.ship_queue.is_empty() {
+        if !e.shipbuilding.is_empty() {
             let q: Vec<&str> = e
-                .ship_queue
+                .shipbuilding
                 .iter()
                 .map(|o| world.defs.ship(o.ship).display_name.as_str())
                 .collect();
@@ -350,14 +368,24 @@ fn print_summary(world: &World) {
 fn print_planet(world: &World, pid: PlanetId) {
     let p = world.planet(pid);
     let sys = world.system(p.system);
+    let species: Vec<String> = p
+        .population
+        .iter()
+        .map(|(s, n)| format!("{n} {}", world.defs.species_def(*s).display_name))
+        .collect();
     println!(
-        "{} ({}) in {} - {} {}, {} pops",
+        "{} ({}) in {} - {} {}, {} pops{}",
         p.display_name,
         p.name,
         sys.display_name,
         p.size.as_str(),
         if p.habitable { "habitable" } else { "barren" },
-        p.pop
+        p.pop(),
+        if species.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", species.join(", "))
+        }
     );
     let s = &p.stats;
     println!(
@@ -382,8 +410,8 @@ fn print_planet(world: &World, pid: PlanetId) {
             Some(b) => {
                 let d = world.defs.building(b.def);
                 let mut s = d.display_name.clone();
-                if d.max_workers > 0 {
-                    s.push_str(&format!(" [{}/{} workers]", b.workers, d.max_workers));
+                if let Some(max) = d.max_workers {
+                    s.push_str(&format!(" [{}/{max} workers]", b.workers));
                 }
                 for u in &b.upgrades {
                     s.push_str(&format!(" +{}", world.defs.upgrade(*u).display_name));
@@ -393,15 +421,19 @@ fn print_planet(world: &World, pid: PlanetId) {
             None => "(empty)".into(),
         };
         if let Some(c) = &t.construction {
-            let (what, days) = match c {
-                Construction::Building { def, days_left, .. } => {
-                    (&world.defs.building(*def).display_name, days_left)
+            let what = match c.kind {
+                ProjectKind::Building(b) => {
+                    format!("building {}", world.defs.building(b).display_name)
                 }
-                Construction::Upgrade { upgrade, days_left } => {
-                    (&world.defs.upgrade(*upgrade).display_name, days_left)
+                ProjectKind::Upgrade(u) => {
+                    format!("installing {}", world.defs.upgrade(u).display_name)
                 }
+                ProjectKind::Remove => "removing".to_string(),
             };
-            desc.push_str(&format!(" <building {what}, {days} days left>"));
+            desc.push_str(&format!(
+                " <{what}, {} left>",
+                spacebox_core::sim::commands::describe_cost(world, &c.remaining)
+            ));
         }
         for (r, m) in &t.resource_mults {
             desc.push_str(&format!(" {}×{m}", world.defs.resource(*r).display_name));

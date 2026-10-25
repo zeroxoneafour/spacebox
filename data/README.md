@@ -1,167 +1,179 @@
 # Spacebox data
 
-All game content is TOML. The format follows `design.md`. This file documents what the engine
-adds on top of it.
+All game content is TOML, in the format of the spec in `../design/` (see
+`design/data/readme.md` and its example files; `design/data/savegame.toml` loads as is). This
+file documents how the engine reads it and what it adds on top. Fields marked *(addition)* are
+not in the spec.
 
 | File | Contents |
 | --- | --- |
-| `resources.toml` | 11 resources: basic (energy, minerals, food), advanced (alloy, consumer goods, research), strategic (volatile motes, exotic gases, rare crystals), influence, and on-demand shipbuilding |
-| `jobs.toml` | 13 jobs in worker/specialist/ruler tiers, with appeal and per-worker upkeep |
-| `buildings.toml` | 27 buildings (housing, production, industry, refineries, research, shipyards, barren-world automation) and 10 upgrades |
-| `technologies.toml` | A 24-technology tree that unlocks buildings, upgrades, ship designs, empire modifiers and terraforming |
+| `resources.toml` | 11 resources: basic (energy, minerals, food), advanced (alloy, consumer goods), strategic (volatile motes, exotic gases, rare crystals), influence, and the transient research and shipbuilding |
+| `jobs.toml` | 13 jobs with appeal, tags and associated resources |
+| `species.toml` | Humans, Lithoids (eat minerals) and Hive Drones (no comfort needs) |
+| `buildings.toml` | Housing, production, industry, refineries, research, shipyards, barren-world automation, natural blockers, and building upgrades |
+| `technologies.toml` | A 24-technology tree that unlocks buildings, upgrades, ship designs and terraforming, with pop, ship and building effects |
 | `ships.toml` | 7 ship designs, 5 weapons and 6 outfits |
-| `rules.toml` | `[ruleset.default]`: pop upkeep, growth, stability, market, expansion, fleet, bombardment and terraforming constants |
+| `rules.toml` | `[ruleset.default]` |
 | `base.toml` | Index that imports everything (used by `spacebox generate`) |
-| `mods/orbital-agriculture.toml` | Example mod: a new barren building plus an upgrade for a base-game building |
+| `mods/orbital-agriculture.toml` | Example mod: a barren farm carrying the base game's `agriculture` tag, plus an upgrade for a base-game building |
 | `scenarios/sol.toml` | Hand-written scenario: Terran Federation vs. Cetian Concord |
-| `saves/` | Example output of `spacebox run ... --out` |
 
 ## Imports and references
 
 - `[import]` must be the first section, if present. Paths are relative to the importing file.
 - `"alias.name"` looks `name` up in the imported file. A bare `"name"` looks it up in the
-  current file. Imports do not leak: you can only use aliases your own file declares.
-- The slot decides which table a reference points into. `resource = "x.y"` looks for
-  `[resource.y]`, `job = "x.y"` for `[job.y]`, and so on.
-- `apply_to`, adjacency `building = "..."`, and technology modifiers take a building reference.
-  If no building has that name, the string is treated as a building class name (`"mining"`).
-  `building_class = "..."` always means a class.
-- Tile upgrade names are ordinary references, as in the design document:
-  `upgrades = ["buildings.faster-forge"]`.
-- Unknown top-level tables and unknown fields are errors, so typos are caught.
+  current file. Imports do not recurse: you can only use aliases your own file declares.
+- The slot decides which table a reference points into: `resource = "x.y"` looks for
+  `[resource.y]`, `job = "x.y"` for `[job.y]`, an upgrade slot for `[building-upgrade.y]`,
+  and so on.
+- **Tags** (`building-tags`, `job-tags`, `research-tags`) are scoped the same way: `"forge"`
+  is the `forge` tag of the current file, `"base.forge"` that of the file imported as `base`.
+  The reserved building tags (`barren`, `blocker`, `land`, `water`, `space`) are global. Tags
+  need no declaration, so the loader warns about tags that upgrades, adjacency bonuses or
+  technologies target but no building has.
+- Anything that targets buildings has separate `buildings = [...]` and `building-tags = [...]`
+  lists (upgrades, adjacency bonuses, technology building effects).
+- Keys are kebab-case. Unknown top-level tables and unknown fields are errors, so typos are
+  caught.
 - Files must be standard TOML 1.0. TOML 1.1 extensions such as multi-line inline tables are
-  rejected; use a `[table]` instead (as `[...tiles.N.building]` does).
-- Only the current format loads. The project is pre-alpha, so renamed fields have no
-  aliases and old saves are not migrated.
+  rejected.
+- Only the current format loads. The project is pre-alpha, so old saves are not migrated.
 - Asset tables load from every reachable file. Game state (`[game]`, `[empire.*]`,
   `[system.*]`) is only read from the file you load, so a save can import a scenario for its
   assets without duplicating its systems.
-- Ship designs reference weapons and outfits the same way: `weapons = ["laser"]` looks for
-  `[ship-weapon.laser]` in the same file, `"alias.laser"` in an import.
 
-## Field reference (beyond the design document)
+## Lists with special entries
 
-**resource**: `base_value` (market price in energy, default 1), `tradeable` (default true),
-`stockpile` (default true; research is false), `storage_cap`, `on_demand` (only produced while
-something needs it; buildings that output it sit idle otherwise).
+- **Costs** (`build-cost`, `remove-cost`, terraforming `cost`, `remaining`) mix
+  `{ resource, count }` with `{ days = N }`.
+- **Outputs** (`outputs`, `passive-outputs`, `output-add`, `passive-output-add`) mix
+  `{ resource, count }` with `{ amenities = N }`.
+- **`paid`** lists only normal resources: transient resources and days can't be refunded.
 
-**job**: `upkeep = [{ resource, count }]`, consumed per worker per day.
+## Housing
 
-**building**: `display_name` (defaults to the key), `amenities`, `build_cost`, `build_days`,
-`remove_cost` (paid to demolish or clear it), `requires_tech`, `buildable` (false = scenario
-only), `max_per_planet`, `hp` (bombardment damage it absorbs). Adjacency entries accept every
-modifier field, and they stack once per matching neighbour.
+There is no base housing: a planet only houses what its buildings provide. Pops can't be moved
+to a planet without free housing, and migrants only go where there is housing, so a new
+colony needs a housing building first.
 
-Special building classes:
+## Projects
 
-| Class | Meaning |
+Constructions, removals, upgrades, terraforming, research and ships are all *projects* with a
+list of what they still need. Every day, after the economy settles, each empire's projects
+draw normal resources from its stockpile (which has just received the day's income) as soon as
+they are available, recording them in `paid`, in a fixed order: tile projects and
+terraforming planet by planet, then ships, then research. Their days tick down at the same
+time, and a project finishes when nothing is left. A project can be started without the
+resources in hand; it just waits.
+
+Transient resources (`transient = true`: research, shipbuilding) are never stored:
+
+- A ship is only fed by the transient output (shipbuilding) of the planet it is built at, so
+  ships need a shipyard on their own planet.
+- Research uses the rest of the empire's transient output, scaled by `research-speed-mult`.
+- Whatever no project uses is wasted.
+
+Cancelling a project refunds its `paid` resources, except the expansion resource (influence),
+which is never refunded. Research has no `paid` list; its refund is its cost minus what
+remains.
+
+Research is a list of technologies. A technology can be added once its prerequisites are known
+*or* in the list; it waits (unfunded) until they are known. Cancelling one also cancels what
+waits on it.
+
+## Fleets
+
+A fleet works through its `orders` queue:
+
+- `{ order = "move", coords }` flies to a point in the current system.
+- `{ order = "jump", system }` flies to the edge of the system facing an adjacent system
+  (`arrival-radius` from the star), then charges every ship's `jump-charge` from 0 to 1 while
+  standing still there (taking `hyperjump-days × hyperjump-mult` days per ship). Once all are
+  charged the fleet jumps, arrives on the rim of the next system facing where it came from,
+  and the charges reset.
+- `{ order = "bombard", planet, tile }` closes on a planet in the current system and fires on
+  it until it surrenders.
+
+A fleet is `in-combat` while an enemy fleet shares its system (and either is armed). Its orders
+wait until the combat is over. New ships always form a fleet of their own; fleets in the same
+system can be merged. A fleet holds at most `base-fleet-size` plus its empire's
+`fleet-size-add` slots, and each ship takes its design's `fleet-size`. Bombarding an unowned
+planet in another empire's system is not allowed.
+
+Jumps must follow hyperlanes: in a save, each jump is checked against the system the fleet
+will be in by then, and so is each bombardment target.
+
+## Field reference (beyond the spec)
+
+**building**: buildings without `max-workers` run at 100%; with it, outputs and inputs scale
+with the share of jobs filled. A building with a `job` must have `max-workers`. Modifiers also
+accept `housing-add` / `housing-mult` *(addition)*. Adjacency entries stack once per matching
+neighbour.
+
+| Reserved tag | Meaning |
 | --- | --- |
-| `barren` | Can be built on barren planets (must have `max_workers = 0`) |
-| `blocker` | Natural feature: generated with planets, never constructed, cleared by paying `remove_cost`. With `barren` it appears on barren worlds, with `water` on water tiles, otherwise on land |
-| `land` | Must stand on a tile without water |
-| `water` | Must stand on a water tile |
-| `space` | Belongs on orbital megastructures, which are not implemented yet, so it cannot be placed |
+| `barren` | Can be built on barren planets |
+| `blocker` | Generated with planets, never constructed; cleared with a removal project (`remove-cost`). With `barren` it appears on barren worlds, with `water` on water tiles, otherwise on habitable land |
+| `land` | Can stand on land tiles. Implicit unless the building has `water` or `space` |
+| `water` | Can stand on water tiles |
+| `space` | Belongs on orbital megastructures, which are not implemented yet |
 
-Buildings with neither `land` nor `water` can stand on either.
+**building-upgrade**: `display-name`, `description`, `buildings`, `building-tags`,
+`after-upgrades`, `requires-tech`, `build-cost`, and modifiers: `upkeep-cost-add/-mult`,
+`input-add/-mult`, `output-add/-mult`, `passive-output-add/-mult`, `max-workers-add/-mult`,
+`housing-add/-mult` and `job` (replaces the building's job). All additions from upgrades,
+adjacency and technologies are summed before all multipliers are applied.
 
-**building-upgrade**: `display_name`, `cost`, `build_days`, `requires_tech`, `input_resources`,
-`upkeep_resources`, `housing`, `amenities`, `housing_mult`, `amenities_mult`.
+**resource**: `base-value` is relative to the currency's value: a resource worth 1 costs
+`1 / currency base-value` currency on the galactic market (before supply and demand).
 
-**technology**: `cost`, `prerequisites`, `category`, `pop_growth_mult`, `stability`, and
-`modifiers = [{ building_class = "...", output_mult = 1.1 }]` (empire-wide).
+**planet**: `siege` and `terraform = { paid, remaining }` *(additions)*. Without an `owner`
+a planet is unowned, even in an owned system.
 
-**ship**: as in the design document, plus `display_name`, `description`, `requires_tech` and
-`hyperjump_mult`. Build cost is the hull plus all weapons and outfits.
+**empire AI** (`[empire.x.ai]`): `militant`, `expansionist` and `scientific` are each 0–1
+(default 0.5):
 
-**ship-weapon**: as in the design document (`fire_rate` is days between shots, `range` is in
-system units).
-
-**ship-outfit**: `build_cost`, `upkeep_cost`, flat `hull` / `shield` / `shield_regen`, and the
-multipliers `hull_mult`, `shield_mult`, `shield_regen_mult`, `speed_mult`, `hyperjump_mult`,
-`damage_mult`, `range_mult` and `fire_rate_mult` (which divides the delay between shots).
-
-**ruleset**: see the comments in `rules.toml`. Every field has a default.
-`[ruleset.x.terraforming.large|small]` defines the tech, cost and duration for terraforming.
-
-**game** (saves): `day`, `seed`, `ruleset`.
-
-**empire**: `capital` (system), `technologies`, `researching`, `research_progress`,
-`accepts_migrants`, `market_access`, `color`, `crises`,
-`wars = [{ empire, since_day }]`, `truces = [{ empire, until_day }]`,
-`ship_queue = [{ ship, planet = "system/planet", remaining, fleet }]`.
-
-**empire AI** (`[empire.x.ai]`): the table's presence makes the empire AI-run. `militant`,
-`expansionist` and `scientific` are each 0–1 (default 0.5):
-
-- **militant**: fleet size (0.4×–1.6× the baseline), deeper ship queues, declaring war on a
-  neighbour within three jumps once its fleet outmatches the target's by
+- **militant**: fleet size (0.4×–1.6× the baseline), more ships in production, declaring war
+  on a neighbour within three jumps once its fleet outmatches the target's by
   `1.8 - 1.2 × militant`, one or (above 0.75) two wars at a time, attacking with smaller
   fleets, fighting longer before war-weariness (360 + 1440 × militant days), and favouring
-  military research.
+  technologies tagged `military`.
 - **expansionist**: claims systems up to 1–3 jumps out, keeps less influence in reserve
-  (`2 - expansionist` × the cost), and runs up to three claims at once. Near 0, it never
-  expands.
-- **scientific**: how highly research labs rank among its building priorities, and a lean
-  towards non-military research.
+  (`2 - expansionist` × the cost), and runs up to three claims at once.
+- **scientific**: more technologies in research at once, and a lean towards non-military
+  research.
 
-Every AI empire defends its systems, makes peace when it is clearly losing (after 120 days),
-when the enemy has no worlds left, or when war-weariness sets in, and respects truces after
-peace.
-
-**empire fleets** (`[empire.x.fleets.y]`): `display_name`, `ships = [{ ship, hull, shield }]`
-(hull and shield default to full), `system` (default: the capital), `coordinates`,
-`jump_charge`, and `order = { type = "move", system, coordinates }` or
-`{ type = "bombard", planet = "system/planet", tile }`.
-
-**system**: `coordinates = { x, y }` (galactic; the generator keeps them within 100 of the
-centre; required). Hyperlanes are undirected, so listing a link on one side is enough.
-
-**planet**: `size = "small" | "large"` (default large), `habitable` (default: true if large),
-`coordinates = { x, y }` (fixed, relative to the star; placed automatically if missing),
-`owned_by` (default: the system's owner), `moon_of`, `growth_progress`, `terraform_days_left`,
-`siege`.
-
-**tile**: `water = true` for sea tiles. `building` is either a bare reference or a
-`[...tiles.N.building]` table with `type`, `upgrades`, `workers`, `job_cap`, `pinned`,
-`enabled` and `damage`. Natural blockers are ordinary buildings
-(`building = "buildings.wetlands"`). `construction = { building = "...", days_left = N,
-empire, paid }` (or `upgrade = "..."`). `empire` is who is building it (it may differ from
-the planet's owner while staking a claim), and `paid` is refunded if a rival's claim cancels
-the site.
+AI empires build housing before anything else on empty worlds, keep enough research queued to
+use their output, switch off labs and shipyards whose output nothing would use, gather their
+new ships at the capital and merge them, and go after populated enemy worlds.
 
 ## Terrain
 
 Generated habitable planets have seas covering roughly a third of their tiles (grown outward
 from a few seeds, so water forms connected bodies) and natural blockers on roughly a third of
-their tiles. Barren planets are covered in barren blockers except for 0–2 tiles. A tile with a
-blocker can't be built on until the blocker is cleared, which costs its `remove_cost` and is
-paid by the planet's owner (or the system's owner, for an unowned planet). Blockers in
-unowned systems can't be cleared. Bombardment ignores blockers. Terraforming makes a planet
-habitable but does not change its terrain.
+their tiles. Barren planets are covered in barren blockers except for 0–2 tiles. A blocker is
+cleared with a removal project paid by the planet's owner (or the system's owner, for an
+unowned planet); blockers in unowned systems can't be cleared. Bombardment ignores blockers.
+Terraforming makes a planet habitable but does not change its terrain.
 
-## Expansion, ships and war
+## Expansion and war
 
-- Every empire gains `empire_income` each day (5 influence, capped at 1000).
-- Building in an unowned system costs `expansion_base_cost * 2^n` influence on top of the
-  building's cost and takes `expansion_base_days * 2^(n/2)` extra days, where n is the
-  number of jumps from the empire's borders minus one. You cannot build in a system another
-  empire owns. Finishing the building claims the system and its unowned planets, and cancels
-  and refunds every rival site there.
+- Every empire gains `expansion-resource-income` of the expansion resource each day (5
+  influence, capped at 1000 by `storage-caps`).
+- Building in an unowned system adds `expansion-base-cost * 2^n` influence and
+  `expansion-base-days * 2^(n/2)` days to the project, where n is the number of jumps from the
+  empire's borders minus one. You cannot build in a system another empire owns. Finishing the
+  building claims that planet and the system (its other planets stay unowned, but only the
+  owner can claim them) and cancels every rival project there, refunding what they paid
+  except influence.
 - A system only changes owner once its owner holds none of its planets.
-- Ships are ordered at a planet with a shipyard. The non-shipbuilding part of the cost is paid
-  up front. Shipyards only staff up while ships are queued, and their shipbuilding output feeds
-  the queue oldest-first. Finished ships join a fleet in the shipyard's system.
-- Fleets travel along hyperlanes. Before each jump they charge for `hyperjump_days` (times each
-  ship's `hyperjump_mult`, so the whole fleet waits for its slowest ship), then arrive on the
-  system rim facing where they came from.
-- Fleets of empires at war fight whenever they share a system, in `combat_subticks` steps per
+- Fleets of empires at war fight whenever they share a system, in `combat-subticks` steps per
   day, before any economy runs. Shields absorb shield damage first, and whatever breaks
   through hits the hull. Ships regenerate shields, and repair in friendly systems, as long as
   their upkeep is paid.
-- Fleets bombard planets of empires they are at war with (or unowned ones) only when no
-  enemy fleet is present. Bombardment damages buildings (they work at `1 - damage` and stop
-  past `building_disable_damage`), costs the planet amenities, and builds up siege. A planet
-  surrenders once siege exceeds `surrender_resistance * (1 + pops/500) * (0.5 +
+- Bombardment damages buildings (they work at `1 - damage` and stop past
+  `building-disable-damage`), costs the planet amenities, and builds up siege. A planet
+  surrenders once siege exceeds `surrender-resistance * (1 + pops/500) * (0.5 +
   stability/100)`. Barren or empty planets surrender immediately.
 
 ## Tile numbering

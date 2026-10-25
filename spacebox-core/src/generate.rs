@@ -128,26 +128,27 @@ enum Body {
     Small,
 }
 
-/// Tile-boostable resources: stockpiled, tradeable and producible by some building.
+/// Tile-boostable resources: normal, tradeable and producible by some building.
 fn boostable_resources(defs: &Defs) -> Vec<ResourceId> {
     (0..defs.resource_count())
         .map(ResourceId::from_idx)
         .filter(|r| {
             let d = defs.resource(*r);
-            d.stockpile
+            !d.transient
                 && d.tradeable
                 && defs
                     .buildings
                     .iter()
-                    .any(|b| b.outputs.iter().any(|o| o.resource == *r))
+                    .any(|b| b.outputs.get(*r) > 0.0 || b.passive_outputs.get(*r) > 0.0)
         })
         .collect()
 }
 
 /// Natural terrain for a fresh planet, per the design document: habitable worlds get seas over
 /// roughly a third of their surface and blockers on roughly a third of their tiles; barren
-/// worlds are covered in blockers except for 0-2 tiles. Blockers are chosen by class:
-/// `barren` ones for barren worlds, `water` ones for water tiles, and the rest for land.
+/// worlds are covered in blockers except for 0-2 tiles. Blockers are chosen by tag: `barren`
+/// ones for barren worlds, `water` ones for water tiles, and `land` ones (the default) for
+/// habitable land.
 /// Tiles that already hold something are left alone.
 pub fn generate_terrain(defs: &Defs, rng: &mut Rng, p: &mut Planet) {
     let n = p.tiles.len();
@@ -160,9 +161,9 @@ pub fn generate_terrain(defs: &Defs, rng: &mut Rng, p: &mut Planet) {
             .map(|(i, _)| BuildingId::from_idx(i))
             .collect()
     };
-    let barren = blockers(&|b| b.barren);
+    let barren = blockers(&|b| b.barren && b.land);
     let wet = blockers(&|b| b.water && !b.barren);
-    let dry = blockers(&|b| !b.water && !b.barren);
+    let dry = blockers(&|b| b.land && !b.barren);
     let place = |rng: &mut Rng, t: &mut crate::world::Tile, from: &[BuildingId]| {
         if t.is_free() && !from.is_empty() {
             t.building = Some(BuildingInstance::new(*rng.pick(from)));
@@ -256,7 +257,6 @@ pub fn random_system(
     for i in (1..bodies.len()).rev() {
         bodies.swap(i, rng.range(0, i as u64) as usize);
     }
-    let giant = format!("{name} Major");
     // Planets sit on fixed, spread-out orbits under 100 units from the star; moons cluster
     // around their (unrepresented) gas giant.
     let orbit_gap = 80.0 / bodies.len() as f64;
@@ -279,7 +279,6 @@ pub fn random_system(
         );
         let round = |v: f64| (v * 10.0).round() / 10.0;
         if *body == Body::Small && rng.chance(0.4) {
-            p.moon_of = Some(giant.clone());
             let a = rng.f64() * std::f64::consts::TAU;
             p.coordinates = [
                 round(giant_at[0] + 6.0 * a.cos()),
@@ -422,14 +421,7 @@ pub fn generate(defs: Arc<Defs>, params: &GalaxyParams) -> Result<World> {
         .iter()
         .filter_map(|n| b(n))
         .collect();
-    let starting_stock = [
-        ("food", 800.0),
-        ("minerals", 1500.0),
-        ("energy", 1000.0),
-        ("alloy", 300.0),
-        ("consumer-goods", 400.0),
-        ("influence", 200.0),
-    ];
+    let starting_stock = defs.ruleset(ruleset).starting_stores.clone();
     let starting_fleet: Vec<ShipId> = ["corvette", "corvette", "corvette"]
         .iter()
         .filter_map(|n| defs.find_ship(n))
@@ -456,11 +448,17 @@ pub fn generate(defs: Arc<Defs>, params: &GalaxyParams) -> Result<World> {
             }
         });
         e.capital = Some(home_id);
-        for (r, amount) in starting_stock {
-            if let Some(r) = defs.find_resource(r) {
-                e.storage[r.idx()] = amount;
+        if !defs.species.is_empty() {
+            e.dominant_species = Some(SpeciesId::from_idx(
+                rng.range(0, defs.species.len() as u64 - 1) as usize,
+            ));
+        }
+        for a in &starting_stock {
+            if !defs.is_transient(a.resource) {
+                e.storage[a.resource.idx()] += a.count;
             }
         }
+        let species = e.dominant_species;
         let eid = world.add_empire(e);
         world.systems[home].owner = Some(eid);
 
@@ -481,7 +479,6 @@ pub fn generate(defs: Arc<Defs>, params: &GalaxyParams) -> Result<World> {
                 p.size = PlanetSize::Large;
                 p.tiles
                     .resize(PlanetSize::Large.tile_count(), Default::default());
-                p.moon_of = None;
             }
             if !p.habitable {
                 // A barren world promoted to capital gets habitable terrain instead.
@@ -491,7 +488,9 @@ pub fn generate(defs: Arc<Defs>, params: &GalaxyParams) -> Result<World> {
                 }
                 generate_terrain(&defs, &mut rng, p);
             }
-            p.pop = 400;
+            if let Some(sp) = species {
+                p.add_pops(sp, 400);
+            }
             // The developed core sits on land, clearing whatever blockers were there.
             let land: Vec<usize> = (0..p.tiles.len()).filter(|t| !p.tiles[*t].water).collect();
             for (t, def) in land.into_iter().zip(&capital_layout) {
@@ -529,8 +528,9 @@ pub fn generate(defs: Arc<Defs>, params: &GalaxyParams) -> Result<World> {
             fleet.coordinates = world.planets[capital].coordinates;
             fleet.ships = starting_fleet
                 .iter()
-                .map(|s| Ship::new(*s, &defs))
+                .map(|s| Ship::new(*s, world.ship_stats(eid, *s)))
                 .collect();
+            fleet.reform();
             world.add_fleet(fleet);
         }
     }

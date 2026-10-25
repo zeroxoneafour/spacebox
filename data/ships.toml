@@ -1,251 +1,243 @@
 # Ship designs, weapons and outfits.
 #
-# A ship's build cost is its own `build_cost` plus those of its weapons and outfits. Resources
-# marked `on_demand` (shipbuilding) are supplied over time by the owner's shipyards; the rest
-# is paid when the ship is ordered.
+# A ship's build cost is its own build-cost plus those of its weapons and outfits. Normal
+# resources come out of the stockpile; transient shipbuilding comes from shipyards while the
+# ship is under construction.
 #
 # Units: distances are system units (planets sit within ~100 of their star), speeds are units
-# per day, `fire_rate` is days between shots, `shield_regen` is shield points per day.
-#
-# Outfits add flat bonuses (hull, shield, shield_regen) and multipliers (hull_mult,
-# shield_mult, shield_regen_mult, speed_mult, hyperjump_mult, damage_mult, range_mult,
-# fire_rate_mult). fire_rate_mult divides the delay between shots, so 1.25 fires 25% more often.
-# Additive bonuses are summed before multipliers are applied.
+# per day, fire-rate is days between shots, shield-regen is shield points per day.
+# fleet-size is how many fleet slots a ship takes (see the ruleset's base-fleet-size).
+# Outfits add (hull-add, shield-add, shield-regen-add, base-speed-add) and multiply (hull-mult,
+# shield-mult, shield-regen-mult, base-speed-mult, hyperjump-mult, damage-mult, range-mult,
+# fire-rate-mult, which divides the delay between shots).
 
 [import]
 resources = "resources.toml"
 technologies = "technologies.toml"
 
-# =============================================================================================
-# Weapons
-# =============================================================================================
-
 [ship-weapon.laser]
-display_name = "Laser"
-build_cost = [
-    { resource = "resources.alloy", count = 10 }
+display-name = "Laser"
+build-cost = [
+    { resource = "resources.alloy", count = 10 },
 ]
-shield_damage = 20
-hull_damage = 50
-# can fire once every 0.5 days. fire rate mult divides rather than adding
-fire_rate = 0.5
+shield-damage = 20
+hull-damage = 50
+fire-rate = 0.5
 range = 10
 
 [ship-weapon.mass-driver]
-display_name = "Mass Driver"
+display-name = "Mass Driver"
 description = "Kinetic slugs. Weak against shields, brutal against hulls."
-build_cost = [
-    { resource = "resources.alloy", count = 15 }
+build-cost = [
+    { resource = "resources.alloy", count = 15 },
 ]
-shield_damage = 10
-hull_damage = 80
-fire_rate = 1.0
+shield-damage = 10
+hull-damage = 80
+fire-rate = 1.0
 range = 8
 
 [ship-weapon.missile-launcher]
-display_name = "Missile Launcher"
-build_cost = [
-    { resource = "resources.alloy", count = 25 }
+display-name = "Missile Launcher"
+build-cost = [
+    { resource = "resources.alloy", count = 25 },
 ]
-shield_damage = 40
-hull_damage = 120
-fire_rate = 2.0
+shield-damage = 40
+hull-damage = 120
+fire-rate = 2.0
 range = 20
 
 [ship-weapon.plasma-cannon]
-display_name = "Plasma Cannon"
-build_cost = [
+display-name = "Plasma Cannon"
+build-cost = [
     { resource = "resources.alloy", count = 40 },
     { resource = "resources.volatile-motes", count = 5 },
 ]
-shield_damage = 60
-hull_damage = 200
-fire_rate = 1.5
+shield-damage = 60
+hull-damage = 200
+fire-rate = 1.5
 range = 12
 
 [ship-weapon.point-defense]
-display_name = "Point Defense"
-build_cost = [
-    { resource = "resources.alloy", count = 10 }
+display-name = "Point Defense"
+build-cost = [
+    { resource = "resources.alloy", count = 10 },
 ]
-shield_damage = 15
-hull_damage = 15
-fire_rate = 0.25
+shield-damage = 15
+hull-damage = 15
+fire-rate = 0.25
 range = 5
 
-# =============================================================================================
-# Outfits
-# =============================================================================================
-
 [ship-outfit.shield-booster]
-display_name = "Shield Booster"
-build_cost = [
-    { resource = "resources.alloy", count = 25 }
+display-name = "Shield Booster"
+build-cost = [
+    { resource = "resources.alloy", count = 25 },
 ]
-shield = 50
-shield_regen_mult = 1.5
+shield-add = 50
+shield-regen-mult = 1.5
 
 [ship-outfit.afterburner]
-display_name = "Afterburner"
-build_cost = [
-    { resource = "resources.alloy", count = 15 }
+display-name = "Afterburner"
+build-cost = [
+    { resource = "resources.alloy", count = 15 },
 ]
-speed_mult = 1.3
+base-speed-mult = 1.3
 
 [ship-outfit.armor-plating]
-display_name = "Armor Plating"
-build_cost = [
-    { resource = "resources.alloy", count = 40 }
+display-name = "Armor Plating"
+build-cost = [
+    { resource = "resources.alloy", count = 40 },
 ]
-hull = 300
-speed_mult = 0.95
+hull-add = 300
+base-speed-mult = 0.95
 
 [ship-outfit.deflector-array]
-display_name = "Deflector Array"
-build_cost = [
+display-name = "Deflector Array"
+build-cost = [
     { resource = "resources.alloy", count = 50 },
     { resource = "resources.exotic-gases", count = 5 },
 ]
-upkeep_cost = [
-    { resource = "resources.energy", count = 1 }
+upkeep-cost = [
+    { resource = "resources.energy", count = 1 },
 ]
-shield_regen = 5
-shield_mult = 1.4
+shield-regen-add = 5
+shield-mult = 1.4
 
 [ship-outfit.hyperdrive-tuner]
-display_name = "Hyperdrive Tuner"
-build_cost = [
+display-name = "Hyperdrive Tuner"
+build-cost = [
     { resource = "resources.alloy", count = 30 },
     { resource = "resources.exotic-gases", count = 5 },
 ]
-hyperjump_mult = 0.6
+hyperjump-mult = 0.6
 
 [ship-outfit.targeting-computer]
-display_name = "Targeting Computer"
-build_cost = [
+display-name = "Targeting Computer"
+build-cost = [
     { resource = "resources.alloy", count = 30 },
     { resource = "resources.rare-crystals", count = 5 },
 ]
-fire_rate_mult = 1.25
-range_mult = 1.1
-
-# =============================================================================================
-# Ships
-# =============================================================================================
+fire-rate-mult = 1.25
+range-mult = 1.1
 
 [ship.scout]
-display_name = "Scout"
+display-name = "Scout"
 description = "Unarmed and fast; good for keeping an eye on the neighbours."
-build_cost = [
+build-cost = [
     { resource = "resources.alloy", count = 20 },
     { resource = "resources.shipbuilding", count = 40 },
 ]
-upkeep_cost = [
-    { resource = "resources.energy", count = 0.5 }
+upkeep-cost = [
+    { resource = "resources.energy", count = 0.5 },
 ]
 hull = 150
-base_speed = 18
-outfits = [ "afterburner" ]
+base-speed = 18
+fleet-size = 1
+outfits = ["afterburner"]
 
 [ship.corvette]
-display_name = "Corvette"
-build_cost = [
+display-name = "Corvette"
+build-cost = [
     { resource = "resources.alloy", count = 40 },
     { resource = "resources.shipbuilding", count = 80 },
 ]
-upkeep_cost = [
-    { resource = "resources.energy", count = 1 }
+upkeep-cost = [
+    { resource = "resources.energy", count = 1 },
 ]
 hull = 400
 shield = 200
-base_speed = 12
-shield_regen = 8
-weapons = [ "laser" ]
-outfits = [ "afterburner" ]
+base-speed = 12
+shield-regen = 8
+fleet-size = 1
+weapons = ["laser"]
+outfits = ["afterburner"]
 
 [ship.fighter]
-display_name = "Fighter"
-build_cost = [
-    { resource = "resources.alloy", count = 50 }, # shipbuilding sites only turn labor into shipbuilding as the resource cost is accounted for here
-    { resource = "resources.shipbuilding", count = 100 } # this is a special resource generated by shipbuilding buildings on-demand
+display-name = "Fighter"
+build-cost = [
+    { resource = "resources.alloy", count = 50 },
+    { resource = "resources.shipbuilding", count = 100 },
 ]
-upkeep_cost = [
-    { resource = "resources.energy", count = 1 }
+upkeep-cost = [
+    { resource = "resources.energy", count = 1 },
 ]
 hull = 500
 shield = 350
-# system internal units per day
-base_speed = 10
-shield_regen = 10
-weapons = [ "laser", "laser" ]
-outfits = [ "shield-booster", "afterburner" ]
+base-speed = 10
+shield-regen = 10
+fleet-size = 1
+weapons = ["laser", "laser"]
+outfits = ["shield-booster", "afterburner"]
 
 [ship.destroyer]
-display_name = "Destroyer"
-requires_tech = ["technologies.naval-doctrine"]
-build_cost = [
+display-name = "Destroyer"
+requires-tech = ["technologies.naval-doctrine"]
+build-cost = [
     { resource = "resources.alloy", count = 120 },
     { resource = "resources.shipbuilding", count = 250 },
 ]
-upkeep_cost = [
-    { resource = "resources.energy", count = 2 }
+upkeep-cost = [
+    { resource = "resources.energy", count = 2 },
 ]
 hull = 1200
 shield = 600
-base_speed = 9
-shield_regen = 15
-weapons = [ "mass-driver", "mass-driver", "laser" ]
-outfits = [ "armor-plating" ]
+base-speed = 9
+shield-regen = 15
+fleet-size = 2
+weapons = ["mass-driver", "mass-driver", "laser"]
+outfits = ["armor-plating"]
 
 [ship.frigate]
-display_name = "Plasma Frigate"
-requires_tech = ["technologies.plasma-weapons", "technologies.deflector-shields"]
-build_cost = [
+display-name = "Plasma Frigate"
+requires-tech = ["technologies.plasma-weapons", "technologies.deflector-shields"]
+build-cost = [
     { resource = "resources.alloy", count = 150 },
     { resource = "resources.shipbuilding", count = 300 },
 ]
-upkeep_cost = [
-    { resource = "resources.energy", count = 2 }
+upkeep-cost = [
+    { resource = "resources.energy", count = 2 },
 ]
 hull = 1000
 shield = 900
-base_speed = 10
-shield_regen = 20
-weapons = [ "plasma-cannon", "point-defense" ]
-outfits = [ "deflector-array" ]
+base-speed = 10
+shield-regen = 20
+fleet-size = 2
+weapons = ["plasma-cannon", "point-defense"]
+outfits = ["deflector-array"]
 
 [ship.cruiser]
-display_name = "Cruiser"
-requires_tech = ["technologies.capital-ships"]
-build_cost = [
+display-name = "Cruiser"
+requires-tech = ["technologies.capital-ships"]
+build-cost = [
     { resource = "resources.alloy", count = 300 },
     { resource = "resources.shipbuilding", count = 600 },
 ]
-upkeep_cost = [
-    { resource = "resources.energy", count = 4 }
+upkeep-cost = [
+    { resource = "resources.energy", count = 4 },
 ]
 hull = 3000
 shield = 1500
-base_speed = 7
-shield_regen = 30
-weapons = [ "mass-driver", "mass-driver", "missile-launcher", "missile-launcher" ]
-outfits = [ "armor-plating", "shield-booster", "targeting-computer" ]
+base-speed = 7
+shield-regen = 30
+fleet-size = 3
+weapons = ["mass-driver", "mass-driver", "missile-launcher", "missile-launcher"]
+outfits = ["armor-plating", "shield-booster", "targeting-computer"]
 
 [ship.battleship]
-display_name = "Battleship"
-requires_tech = ["technologies.titanic-hulls"]
-build_cost = [
+display-name = "Battleship"
+requires-tech = ["technologies.titanic-hulls"]
+build-cost = [
     { resource = "resources.alloy", count = 800 },
     { resource = "resources.shipbuilding", count = 1500 },
 ]
-upkeep_cost = [
+upkeep-cost = [
     { resource = "resources.energy", count = 8 },
     { resource = "resources.volatile-motes", count = 0.1 },
 ]
 hull = 8000
 shield = 4000
-base_speed = 5
-shield_regen = 60
-hyperjump_mult = 1.5
-weapons = [ "plasma-cannon", "plasma-cannon", "plasma-cannon", "missile-launcher", "missile-launcher", "point-defense" ]
-outfits = [ "armor-plating", "armor-plating", "deflector-array", "targeting-computer", "hyperdrive-tuner" ]
+base-speed = 5
+shield-regen = 60
+hyperjump-mult = 1.5
+fleet-size = 5
+weapons = ["plasma-cannon", "plasma-cannon", "plasma-cannon", "missile-launcher", "missile-launcher", "point-defense"]
+outfits = ["armor-plating", "armor-plating", "deflector-array", "targeting-computer", "hyperdrive-tuner"]

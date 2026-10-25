@@ -14,11 +14,11 @@ use serde_json::{Value, json};
 use spacebox_core::generate::{self, GalaxyParams};
 use spacebox_core::geometry::PlanetSize;
 use spacebox_core::world::{
-    AiPersonality, BuildingInstance, Construction, Empire, Fleet, FleetOrder, Planet, Ship,
+    AiPersonality, BuildingInstance, Empire, Fleet, FleetOrder, Planet, ProjectKind, Ship,
 };
 use spacebox_core::{
-    BuildingId, Command, EmpireId, FleetId, PlanetId, ResourceId, ShipId, SystemId, TechId,
-    UpgradeId, World, load_assets, load_world, save,
+    BuildingId, Command, EmpireId, FleetId, PlanetId, ResourceId, ShipId, SpeciesId, SystemId,
+    TechId, UpgradeId, World, load_assets, load_world, save,
 };
 
 use crate::engine::{Engine, Known};
@@ -101,6 +101,9 @@ fn building(w: &World, id: u32) -> Result<BuildingId, ApiError> {
 fn upgrade(w: &World, id: u32) -> Result<UpgradeId, ApiError> {
     check(id, w.defs.upgrades.len(), "upgrade").map(UpgradeId)
 }
+fn species(w: &World, id: u32) -> Result<SpeciesId, ApiError> {
+    check(id, w.defs.species.len(), "species").map(SpeciesId)
+}
 fn tech(w: &World, id: u32) -> Result<TechId, ApiError> {
     check(id, w.defs.technologies.len(), "technology").map(TechId)
 }
@@ -170,6 +173,11 @@ pub enum Cmd {
         to: u32,
         count: u64,
     },
+    SetPopulation {
+        planet: u32,
+        species: u32,
+        count: u64,
+    },
     AssignWorkers {
         planet: u32,
         tile: usize,
@@ -204,9 +212,16 @@ pub enum Cmd {
     Terraform {
         planet: u32,
     },
-    SetResearch {
+    CancelTerraform {
+        planet: u32,
+    },
+    Research {
         empire: u32,
-        tech: Option<u32>,
+        tech: u32,
+    },
+    CancelResearch {
+        empire: u32,
+        tech: u32,
     },
     SetOwner {
         system: u32,
@@ -236,11 +251,17 @@ pub enum Cmd {
     BuildShip {
         planet: u32,
         ship: u32,
-        fleet: Option<u32>,
     },
-    CancelShipOrder {
+    CancelShip {
         empire: u32,
         index: usize,
+    },
+    /// Replace (or with `append`, extend) a fleet's order queue.
+    SetOrders {
+        fleet: u32,
+        orders: Vec<OrderReq>,
+        #[serde(default)]
+        append: bool,
     },
     MoveFleet {
         fleet: u32,
@@ -280,6 +301,16 @@ pub enum Cmd {
     },
 }
 
+/// One fleet order: `{ order: "move", coordinates }`, `{ order: "jump", system }` or
+/// `{ order: "bombard", planet, tile }`.
+#[derive(Deserialize)]
+#[serde(tag = "order", rename_all = "snake_case")]
+pub enum OrderReq {
+    Move { coordinates: [f64; 2] },
+    Jump { system: u32 },
+    Bombard { planet: u32, tile: Option<usize> },
+}
+
 fn ship(w: &World, id: u32) -> Result<ShipId, ApiError> {
     check(id, w.defs.ships.len(), "ship design").map(ShipId)
 }
@@ -289,6 +320,15 @@ fn to_command(w: &World, c: Cmd) -> Result<Command, ApiError> {
         Cmd::MovePops { from, to, count } => Command::MovePops {
             from: planet(w, from)?,
             to: planet(w, to)?,
+            count,
+        },
+        Cmd::SetPopulation {
+            planet: p,
+            species: sp,
+            count,
+        } => Command::SetPopulation {
+            planet: planet(w, p)?,
+            species: species(w, sp)?,
             count,
         },
         Cmd::AssignWorkers {
@@ -363,9 +403,16 @@ fn to_command(w: &World, c: Cmd) -> Result<Command, ApiError> {
         Cmd::Terraform { planet: p } => Command::Terraform {
             planet: planet(w, p)?,
         },
-        Cmd::SetResearch { empire: e, tech: t } => Command::SetResearch {
+        Cmd::CancelTerraform { planet: p } => Command::CancelTerraform {
+            planet: planet(w, p)?,
+        },
+        Cmd::Research { empire: e, tech: t } => Command::Research {
             empire: empire(w, e)?,
-            tech: t.map(|t| tech(w, t)).transpose()?,
+            tech: tech(w, t)?,
+        },
+        Cmd::CancelResearch { empire: e, tech: t } => Command::CancelResearch {
+            empire: empire(w, e)?,
+            tech: tech(w, t)?,
         },
         Cmd::SetOwner { system: s, owner } => Command::SetOwner {
             system: system(w, s)?,
@@ -399,18 +446,36 @@ fn to_command(w: &World, c: Cmd) -> Result<Command, ApiError> {
             planet: planet(w, p)?,
             owner: owner.map(|o| empire(w, o)).transpose()?,
         },
-        Cmd::BuildShip {
-            planet: p,
-            ship: s,
-            fleet,
-        } => Command::BuildShip {
+        Cmd::BuildShip { planet: p, ship: s } => Command::BuildShip {
             planet: planet(w, p)?,
             ship: ship(w, s)?,
-            fleet: fleet.map(FleetId),
         },
-        Cmd::CancelShipOrder { empire: e, index } => Command::CancelShipOrder {
+        Cmd::CancelShip { empire: e, index } => Command::CancelShip {
             empire: empire(w, e)?,
             index,
+        },
+        Cmd::SetOrders {
+            fleet,
+            orders,
+            append,
+        } => Command::SetOrders {
+            fleet: FleetId(fleet),
+            orders: orders
+                .into_iter()
+                .map(|o| {
+                    Ok(match o {
+                        OrderReq::Move { coordinates } => FleetOrder::Move { coordinates },
+                        OrderReq::Jump { system: s } => FleetOrder::Jump {
+                            system: system(w, s)?,
+                        },
+                        OrderReq::Bombard { planet: p, tile } => FleetOrder::Bombard {
+                            planet: planet(w, p)?,
+                            tile,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, ApiError>>()?,
+            append,
         },
         Cmd::MoveFleet {
             fleet,
@@ -490,9 +555,10 @@ pub struct NewEmpire {
     color: Option<String>,
     /// System to claim as the capital.
     capital: Option<u32>,
-    /// Seed storage with the generator's starting stockpile.
+    /// Seed storage with the ruleset's `base-resource-stores`.
     #[serde(default = "yes")]
     starting_resources: bool,
+    dominant_species: Option<u32>,
 }
 
 fn yes() -> bool {
@@ -544,6 +610,7 @@ pub async fn create_empire(State(s): State<Shared>, Json(req): Json<NewEmpire>) 
     run(s, move |eng| {
         let w = &mut eng.world;
         let capital = req.capital.map(|c| system(w, c)).transpose()?;
+        let dominant = req.dominant_species.map(|s| species(w, s)).transpose()?;
         let mut n = w.empires.len() + 1;
         while w.empire_by_name(&format!("empire-{n}")).is_some() {
             n += 1;
@@ -551,17 +618,11 @@ pub async fn create_empire(State(s): State<Shared>, Json(req): Json<NewEmpire>) 
         let mut e = Empire::new(format!("empire-{n}"), req.display_name, &w.defs);
         e.ai = req.ai.as_ref().map(AiTraits::personality).transpose()?;
         e.color = req.color;
+        e.dominant_species = dominant;
         if req.starting_resources {
-            for (name, amount) in [
-                ("food", 800.0),
-                ("minerals", 1500.0),
-                ("energy", 1000.0),
-                ("alloy", 300.0),
-                ("consumer-goods", 400.0),
-                ("influence", 200.0),
-            ] {
-                if let Some(r) = w.defs.find_resource(name) {
-                    e.storage[r.idx()] = amount;
+            for a in &w.rules().starting_stores {
+                if !w.defs.is_transient(a.resource) {
+                    e.storage[a.resource.idx()] += a.count;
                 }
             }
         }
@@ -591,6 +652,8 @@ pub struct EmpirePatch {
     color: Option<String>,
     accepts_migrants: Option<bool>,
     market_access: Option<bool>,
+    #[serde(default, deserialize_with = "double")]
+    dominant_species: Option<Option<u32>>,
 }
 
 pub async fn patch_empire(
@@ -600,7 +663,14 @@ pub async fn patch_empire(
 ) -> ApiResult {
     run(s, move |eng| {
         let id = empire(&eng.world, id)?;
+        let dominant = p
+            .dominant_species
+            .map(|s| s.map(|s| species(&eng.world, s)).transpose())
+            .transpose()?;
         let e = &mut eng.world.empires[id.idx()];
+        if let Some(v) = dominant {
+            e.dominant_species = v;
+        }
         if let Some(v) = p.display_name {
             e.display_name = v;
         }
@@ -640,8 +710,8 @@ pub async fn set_tech(
         let defs = w.defs.clone();
         let e = &mut w.empires[id.idx()];
         e.techs[t.idx()] = req.known;
-        if e.researching == Some(t) && req.known {
-            e.researching = None;
+        if req.known {
+            e.research.retain(|p| p.tech != t);
         }
         e.rebuild_modifiers(&defs);
         Ok(ok())
@@ -667,6 +737,9 @@ pub async fn set_storage(
         let r = resource(w, req.resource)?;
         if !req.count.is_finite() {
             return Err("count must be finite".into());
+        }
+        if w.defs.is_transient(r) {
+            return Err("transient resources cannot be stored".into());
         }
         w.empires[id.idx()].storage[r.idx()] = req.count.max(0.0);
         Ok(ok())
@@ -812,9 +885,10 @@ pub struct NewPlanet {
     #[serde(default = "large")]
     size: String,
     habitable: Option<bool>,
+    /// Initial pops, of `species` (default: the system owner's dominant species).
     #[serde(default)]
     pop: u64,
-    moon_of: Option<String>,
+    species: Option<u32>,
     /// Position relative to the star (placed automatically if omitted).
     coordinates: Option<[f64; 2]>,
     /// Generate natural terrain (seas and blockers) like a newly generated planet.
@@ -824,6 +898,16 @@ pub struct NewPlanet {
 
 fn large() -> String {
     "large".into()
+}
+
+/// Default planet placement: an outward spiral from the star, under 100 units radially.
+fn default_planet_coordinates(index: usize) -> [f64; 2] {
+    let r = (15.0 + index as f64 * 10.0).min(95.0);
+    let a = index as f64 * 2.399_963; // golden angle
+    [
+        (r * a.cos() * 10.0).round() / 10.0,
+        (r * a.sin() * 10.0).round() / 10.0,
+    ]
 }
 
 pub async fn create_planet(
@@ -858,12 +942,21 @@ pub async fn create_planet(
             habitable,
             w.defs.resource_count(),
         );
-        p.pop = req.pop;
-        p.moon_of = req.moon_of.filter(|m| !m.is_empty());
         p.owner = w.system(sid).owner;
-        p.coordinates = req.coordinates.unwrap_or_else(|| {
-            spacebox_core::loader::default_planet_coordinates(w.system(sid).planet_range().len())
-        });
+        if req.pop > 0 {
+            let sp = match req.species {
+                Some(s) => species(w, s)?,
+                None => p
+                    .owner
+                    .and_then(|o| w.empire(o).dominant_species)
+                    .or((!w.defs.species.is_empty()).then_some(SpeciesId(0)))
+                    .ok_or("no species defined")?,
+            };
+            p.add_pops(sp, req.pop);
+        }
+        p.coordinates = req
+            .coordinates
+            .unwrap_or_else(|| default_planet_coordinates(w.system(sid).planet_range().len()));
         if req.terrain {
             let defs = w.defs.clone();
             generate::generate_terrain(&defs, &mut eng.rng, &mut p);
@@ -877,13 +970,14 @@ pub async fn create_planet(
 #[derive(Deserialize)]
 pub struct PlanetPatch {
     display_name: Option<String>,
-    /// Set the population exactly.
-    pop: Option<u64>,
-    /// Add (or with a negative number, remove) pops.
+    /// Replace the population: `[[species, count], ...]`.
+    population: Option<Vec<(u32, u64)>>,
+    /// Add (or with a negative number, remove) pops of `species` (default: the most numerous
+    /// species, or the owner's dominant one).
     add_pops: Option<i64>,
+    species: Option<u32>,
     habitable: Option<bool>,
-    moon_of: Option<String>,
-    /// Instantly finish (0) or set the remaining days of terraforming.
+    /// Instantly finish (0) or set the remaining days of terraforming in progress.
     terraform_days_left: Option<u32>,
     coordinates: Option<[f64; 2]>,
     /// Clear siege progress and repair all bombardment damage.
@@ -897,29 +991,52 @@ pub async fn patch_planet(
     Json(p): Json<PlanetPatch>,
 ) -> ApiResult {
     run(s, move |eng| {
-        let id = planet(&eng.world, id)?;
+        let w = &eng.world;
+        let id = planet(w, id)?;
+        let population = p
+            .population
+            .map(|list| {
+                list.into_iter()
+                    .map(|(s, n)| Ok((species(w, s)?, n)))
+                    .collect::<Result<Vec<_>, ApiError>>()
+            })
+            .transpose()?;
+        let add_species = match p.species {
+            Some(s) => Some(species(w, s)?),
+            None => w.planet(id).main_species().or_else(|| {
+                w.planet(id)
+                    .owner
+                    .and_then(|o| w.empire(o).dominant_species)
+                    .or((!w.defs.species.is_empty()).then_some(SpeciesId(0)))
+            }),
+        };
         let planet = eng.world.planet_mut(id);
         if let Some(v) = p.display_name {
             planet.display_name = v;
         }
-        if let Some(v) = p.pop {
-            planet.pop = v;
+        if let Some(list) = population {
+            planet.population.clear();
+            for (s, n) in list {
+                planet.add_pops(s, n);
+            }
         }
         if let Some(d) = p.add_pops {
-            planet.pop = (planet.pop as i64 + d).max(0) as u64;
+            let sp = add_species.ok_or("no species defined")?;
+            if d >= 0 {
+                planet.add_pops(sp, d as u64);
+            } else {
+                planet.remove_species(sp, d.unsigned_abs());
+            }
         }
         if let Some(v) = p.habitable {
             planet.habitable = v;
         }
-        if let Some(v) = p.moon_of {
-            planet.moon_of = (!v.is_empty()).then_some(v);
-        }
         if let Some(d) = p.terraform_days_left {
             if d == 0 {
-                planet.terraform_days_left = None;
+                planet.terraform = None;
                 planet.habitable = true;
-            } else {
-                planet.terraform_days_left = Some(d);
+            } else if let Some(t) = &mut planet.terraform {
+                t.remaining.days = d;
             }
         }
         if let Some(c) = p.coordinates {
@@ -1030,7 +1147,11 @@ pub async fn edit_tile(
                 )
                 .into());
             }
-            if matches!(p.tiles[t].construction, Some(Construction::Upgrade { .. })) {
+            if p.tiles[t]
+                .construction
+                .as_ref()
+                .is_some_and(|c| matches!(c.kind, ProjectKind::Upgrade(_)))
+            {
                 p.tiles[t].construction = None;
             }
             p.tiles[t].building.as_mut().unwrap().upgrades = us;
@@ -1042,7 +1163,7 @@ pub async fn edit_tile(
             p.tiles[t].water = wet;
         }
         if let Some(b) = p.tiles[t].building.as_ref().map(|b| defs.building(b.def))
-            && ((b.land && p.tiles[t].water) || (b.water && !p.tiles[t].water))
+            && !b.fits_terrain(p.tiles[t].water)
         {
             warning = Some(format!(
                 "{} normally needs a {} tile",
@@ -1194,9 +1315,10 @@ pub async fn create_fleet(State(s): State<Shared>, Json(req): Json<NewFleet>) ->
         for sc in req.ships {
             let def = ship(w, sc.ship)?;
             for _ in 0..sc.count.min(500) {
-                fleet.ships.push(Ship::new(def, &w.defs));
+                fleet.ships.push(Ship::new(def, w.ship_stats(owner, def)));
             }
         }
+        fleet.reform();
         if fleet.ships.is_empty() {
             return Err("a fleet needs at least one ship".into());
         }
@@ -1227,7 +1349,6 @@ pub async fn patch_fleet(
         let w = &mut eng.world;
         let owner = p.owner.map(|o| empire(w, o)).transpose()?;
         let sys = p.system.map(|s| system(w, s)).transpose()?;
-        let defs = w.defs.clone();
         let f = w
             .fleet_mut(FleetId(id))
             .ok_or_else(|| ApiError::from(format!("no fleet with id {id}")))?;
@@ -1236,19 +1357,24 @@ pub async fn patch_fleet(
         }
         if let Some(o) = owner {
             f.owner = o;
-            f.order = FleetOrder::Idle;
+            f.orders.clear();
         }
         if let Some(s) = sys {
             f.system = s;
-            f.jump_charge = 0.0;
-            f.order = FleetOrder::Idle;
+            f.orders.clear();
+            for ship in &mut f.ships {
+                ship.jump_charge = 0.0;
+            }
         }
         if let Some(c) = p.coordinates {
             f.coordinates = c;
         }
         if p.repair {
+            let owner = f.owner;
+            let stats = w.empire(owner).ship_stats.clone();
+            let f = w.fleet_mut(FleetId(id)).unwrap();
             for s in &mut f.ships {
-                let d = defs.ship(s.def);
+                let d = &stats[s.def.idx()];
                 s.hull = d.max_hull;
                 s.shield = d.max_shield;
             }

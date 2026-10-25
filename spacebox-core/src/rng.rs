@@ -38,3 +38,24 @@ impl Rng {
         &items[self.next_u64() as usize % items.len()]
     }
 }
+
+/// Deterministic hash of a seed and salts to a number in `[0, 1)`, for decisions that must be
+/// reproducible without keeping generator state (AI rolls, rounding of fractional growth).
+pub fn hash01(seed: u64, salt: &[u64]) -> f64 {
+    let mut x = seed ^ 0x9E37_79B9_7F4A_7C15;
+    for s in salt {
+        x = (x ^ s.wrapping_mul(0xBF58_476D_1CE4_E5B9)).rotate_left(29);
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    }
+    x ^= x >> 31;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 29;
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Rounds `x >= 0` down or up at random, so the expected value is `x`.
+pub fn stochastic_round(x: f64, roll: f64) -> u64 {
+    let x = x.max(0.0);
+    let base = x.floor();
+    base as u64 + u64::from(roll < x - base)
+}

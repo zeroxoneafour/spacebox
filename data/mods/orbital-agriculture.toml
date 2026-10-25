@@ -7,31 +7,29 @@ base = "../buildings.toml"
 technologies = "../technologies.toml"
 
 [building.orbital-farm]
-display_name = "Orbital Farm"
+display-name = "Orbital Farm"
 description = "Spin-gravity greenhouses parked in low orbit."
-building_class = ["barren", "agriculture"]
-build_cost = [
-    { resource = "resources.minerals", count = 250 },
-    { resource = "resources.alloy", count = 40 },
+# The base game's agriculture tag, so technologies boosting farms boost this too.
+building-tags = ["barren", "base.agriculture"]
+build-cost = [{ resource = "resources.minerals", count = 250 }, { resource = "resources.alloy", count = 40 }, { days = 120 }]
+upkeep-cost = [
+    { resource = "resources.energy", count = 3 },
 ]
-build_days = 120
-upkeep_resources = [
-    { resource = "resources.energy", count = 3 }
+outputs = [
+    { resource = "resources.food", count = 6 },
 ]
-output_resources = [
-    { resource = "resources.food", count = 6 }
-]
-adjacency_bonus = [
-    { building = "base.solar-array", upkeep_mult = 0.5 },
+adjacency-bonus = [
+    { buildings = ["base.solar-array"], upkeep-cost-mult = 0.5 },
 ]
 
 # Upgrades can target buildings from other files through an import alias.
 [building-upgrade.vertical-farming]
-display_name = "Vertical Farming"
-apply_to = [ "base.farm" ]
-needs_upgrades = [ "base.irrigation-network" ]
-requires_tech = ["technologies.hydroponics"]
-cost = [{ resource = "resources.minerals", count = 200 }]
-build_days = 90
-output_mult = 1.2
-upkeep_resources = [ { resource = "resources.energy", count = 1 } ]
+display-name = "Vertical Farming"
+buildings = ["base.farm"]
+after-upgrades = ["base.irrigation-network"]
+requires-tech = ["technologies.hydroponics"]
+build-cost = [{ resource = "resources.minerals", count = 200 }, { days = 90 }]
+output-mult = 1.2
+upkeep-cost-add = [
+    { resource = "resources.energy", count = 1 },
+]

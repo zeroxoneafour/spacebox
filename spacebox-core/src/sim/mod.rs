@@ -13,9 +13,9 @@
 //!    fleet upkeep and empire income), match migrants within the empire.
 //! 5. **Galaxy** (serial, cheap): galactic market and inter-empire migration.
 //! 6. **Settlement** (parallel): surpluses go to storage, deficits drain it, empty stores start
-//!    crises; research and ship construction progress; shortage ratios are published for the
-//!    next tick. Then (serially) migrations are committed, finished ships launched and
-//!    completed expansion sites claim their planets and systems.
+//!    crises; shortage ratios are published for the next tick. Then (serially) projects draw
+//!    from storage and transient production, research completes, migrations are committed,
+//!    finished ships launched and completed expansion sites claim their planets and systems.
 //! 7. **Governors** (parallel per AI empire) look at the fresh state and queue commands.
 
 pub mod ai;
@@ -30,7 +30,7 @@ use rayon::prelude::*;
 
 use crate::ids::*;
 use crate::sim::events::{Event, EventKind};
-use crate::world::{Construction, Fleet, Pool, Ship, SystemGroup, World};
+use crate::world::{Fleet, Pool, Ship, SystemGroup, World};
 
 impl World {
     /// Advances the simulation by one day.
@@ -61,6 +61,7 @@ impl World {
         if self.topology_dirty {
             self.refresh_topology();
         }
+        let seed = self.seed;
 
         let World {
             defs,
@@ -83,8 +84,8 @@ impl World {
                 sat: &pool.sat,
                 scarcity: &pool.scarcity,
                 owner,
-                shipyards_needed: owner.is_some_and(|(_, e)| !e.ship_queue.is_empty()),
                 day,
+                seed,
             };
             planet::tick(p, PlanetId::from_idx(i), &ctx);
         });
@@ -152,6 +153,7 @@ impl World {
         pools
             .par_iter_mut()
             .for_each(|p| economy::finalize_pool(p, empires));
+        economy::fund_projects(self);
         migration::commit(self);
         self.launch_ships();
         self.apply_claims();
@@ -199,53 +201,31 @@ impl World {
         }
     }
 
-    /// Turns finished ship orders into ships: they join the requested fleet if it is in the
-    /// shipyard's system, else the empire's first idle fleet there, else a new fleet.
+    /// Turns finished ships into fleets: every new ship starts a fleet of its own in orbit of
+    /// the planet that built it.
     fn launch_ships(&mut self) {
         let day = self.day;
         for ei in 0..self.empires.len() {
             let eid = EmpireId::from_idx(ei);
-            for order in std::mem::take(&mut self.empires[ei].completed_ships) {
-                if order.planet.idx() >= self.planets.len() {
+            for project in std::mem::take(&mut self.empires[ei].completed_ships) {
+                if project.planet.idx() >= self.planets.len() {
                     continue;
                 }
-                let p = &self.planets[order.planet.idx()];
+                let p = &self.planets[project.planet.idx()];
                 let (sys, coords, pname) = (p.system, p.coordinates, p.display_name.clone());
-                let ship = Ship::new(order.ship, &self.defs);
-                let target = order
-                    .fleet
-                    .filter(|f| {
-                        self.fleet(*f)
-                            .is_some_and(|f| f.owner == eid && f.system == sys)
-                    })
-                    .or_else(|| {
-                        self.fleets
-                            .iter()
-                            .find(|f| {
-                                f.owner == eid
-                                    && f.system == sys
-                                    && f.order == crate::world::FleetOrder::Idle
-                            })
-                            .map(|f| f.id)
-                    });
-                let fleet = match target {
-                    Some(f) => f,
-                    None => {
-                        // The next fleet id keeps names unique even after merges and losses.
-                        let n = self.next_fleet_id;
-                        let mut fl = Fleet::new(
-                            String::new(),
-                            format!("{} Fleet {n}", self.systems[sys.idx()].display_name),
-                            eid,
-                            sys,
-                        );
-                        fl.coordinates = coords;
-                        self.add_fleet(fl)
-                    }
-                };
-                let f = self.fleet_mut(fleet).unwrap();
-                f.ships.push(ship);
-                let fname = f.display_name.clone();
+                let ship = Ship::new(project.ship, self.ship_stats(eid, project.ship));
+                // The next fleet id keeps names unique even after merges and losses.
+                let n = self.next_fleet_id;
+                let mut fl = Fleet::new(
+                    String::new(),
+                    format!("{} Fleet {n}", self.systems[sys.idx()].display_name),
+                    eid,
+                    sys,
+                );
+                fl.coordinates = coords;
+                fl.ships.push(ship);
+                let fname = fl.display_name.clone();
+                self.add_fleet(fl);
                 self.events.push(
                     Event::new(
                         day,
@@ -253,19 +233,20 @@ impl World {
                         format!(
                             "{} launches a {} at {pname} ({fname})",
                             self.empires[ei].display_name,
-                            self.defs.ship(order.ship).display_name
+                            self.defs.ship(project.ship).display_name
                         ),
                     )
                     .empire(Some(eid))
-                    .planet(order.planet),
+                    .planet(project.planet),
                 );
             }
         }
     }
 
     /// Applies construction sites that finished on planets their builder did not own. The
-    /// builder claims the planet; if the system was unowned it claims the system (and its
-    /// other unowned planets), and every rival site in the system is cancelled and refunded.
+    /// builder claims the planet; if the system was unowned it claims the system too (its
+    /// other planets stay unowned, but no other empire can claim them), and every rival site
+    /// in the system is cancelled and refunded.
     fn apply_claims(&mut self) {
         let day = self.day;
         let mut claims = Vec::new();
@@ -289,27 +270,19 @@ impl World {
             if claiming_system {
                 self.systems[sys.idx()].owner = Some(e);
                 let ids: Vec<PlanetId> = self.systems[sys.idx()].planet_ids().collect();
-                for p in &ids {
-                    let planet = &mut self.planets[p.idx()];
-                    if planet.owner.is_none() {
-                        planet.owner = Some(e);
-                        planet.dirty = true;
-                    }
-                }
                 for p in ids {
                     let planet = &mut self.planets[p.idx()];
                     for t in &mut planet.tiles {
                         let rival = match &t.construction {
-                            Some(Construction::Building {
-                                empire: Some(r), ..
-                            }) if *r != e => *r,
+                            Some(c) if c.empire.is_some_and(|r| r != e) => c.empire.unwrap(),
                             _ => continue,
                         };
-                        if let Some(Construction::Building { paid, .. }) = t.construction.take() {
-                            for a in paid {
-                                self.empires[rival.idx()].storage[a.resource.idx()] += a.count;
-                            }
-                        }
+                        let c = t.construction.take().unwrap();
+                        commands::refund(
+                            self.defs.ruleset(self.ruleset),
+                            &c.paid,
+                            &mut self.empires[rival.idx()].storage,
+                        );
                         planet.dirty = true;
                         self.events.push(
                             Event::new(
@@ -446,7 +419,7 @@ impl World {
                     self.planets[self.systems[s.idx()].planet_range()]
                         .iter()
                         .filter(|p| p.owner == Some(eid))
-                        .map(|p| p.pop)
+                        .map(|p| p.pop())
                         .sum()
                 };
                 let best = *present

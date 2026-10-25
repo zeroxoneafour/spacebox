@@ -27,12 +27,14 @@ id_types!(
     FileId,
     ResourceId,
     JobId,
+    SpeciesId,
     BuildingId,
+    /// A building upgrade (a `[building.*]` table with `applies-to`).
     UpgradeId,
     TechId,
     RulesetId,
-    /// An interned building class name (e.g. `"forge"`, `"barren"`).
-    ClassId,
+    /// An interned building tag (e.g. `"forge"`, `"barren"`).
+    TagId,
     EmpireId,
     SystemId,
     PlanetId,

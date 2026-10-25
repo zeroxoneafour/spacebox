@@ -1,5 +1,6 @@
 [import]
 resources = "resources.toml"
+technologies = "technologies.toml"
 
 [ship.example-ship]
 display-name = "Example Ship"
@@ -16,6 +17,8 @@ hull = 1200 # hull of the ship
 shield = 600 # shield of the ship
 base-speed = 9 # speed in units/day (a system is 100x100 units)
 shield-regen = 15 # shield regenerated/day
+hyperjump-mult = 1.5 # multiplies the ruleset's hyperjump-days (default 1)
+fleet-size = 1 # how many fleet slots this ship uses up, larger with larger ships
 weapons = [ "example-weapon" ] # array of weapons
 outfits = [ "example-outfit" ] # array of outfits
 
@@ -25,12 +28,24 @@ display-name = "Example Outfit"
 build-cost = [
     { resource = "resources.example-resource", count = 25 }
 ]
+# additions (default 0), applied before multipliers
+hull-add = 300
 shield-add = 50
+shield-regen-add = 5
+base-speed-add = 2
+# multipliers (default 1)
+hull-mult = 1.1
+shield-mult = 1.4
 shield-regen-mult = 1.5
+base-speed-mult = 1.3
+hyperjump-mult = 0.6
+damage-mult = 1.2
+range-mult = 1.1
+fire-rate-mult = 1.25 # divides the delay between shots
 
 [ship-weapon.example-weapon]
-display_name = "Example Weapon"
-build_cost = [
+display-name = "Example Weapon"
+build-cost = [
     { resource = "resources.example-resource", count = 10 }
 ]
 shield-damage = 20

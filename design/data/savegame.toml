@@ -15,7 +15,7 @@ ruleset = "rules.example-ruleset"
 display-name = "Example Empire"
 color = "#ff0000"
 capital = "example-system"
-dominant_species = "species.example-species"
+dominant-species = "species.example-species"
 resource-stores = [
     { resource = "resources.example-resource", count = 1000.0 },
 ]
@@ -23,24 +23,56 @@ technologies = [
     "technologies.example-technology",
 ]
 current-research = [
-    { technology = "technologies.example-technology-2", remaining = [ { resource = "resources.example-transient-resource", count = 100.0 } ] }
+    # research usually uses transient resources which do not get refunded, so paid is usually = []
+    # if paid = [], then it does not need to be specified. it is specified here for reference.
+    # i.e. paid defaults to []
+    # if research uses refundable resources, then paid must be specified with said resources/counts.
+    { technology = "technologies.example-technology-2", paid = [], remaining = [ { resource = "resources.example-transient-resource", count = 100.0 } ] }
 ]
+# only supply transient resources (shipbuilding resources) from the planet that is building the ship
 current-shipbuilding = [
-    { ship = "ships.example-ship", system = "example-system", planet = "example-planet", remaining = [{ resource = "resources.example-transient-resource", count = 100.0 }] },
+    { ship = "ships.example-ship", system = "example-system", planet = "example-planet", paid = [ { resource = "resources.example-resource", count = 155 } ], remaining = [{ resource = "resources.example-transient-resource", count = 100.0 }] },
+]
+
+[empire.example-empire.policy]
+accepts-migrants = true                   # whether other empires' pops may settle here (default true)
+market-access = true                      # whether it trades on the galactic market (default true)
+
+[empire.example-empire.diplomacy]
+wars = [
+    #{ empire = "example-empire-2", since-day = 120 },  # since-day is required and should always be specified
 ]
 truces = [
-    #{ empire = "example-empire-2", until_day = 300 }, # this is valid if there as an empire 2, which there isn't. this is how the truces field would be formatted
+    #{ empire = "example-empire-2", until-day = 300 }, # this is valid if there as an empire 2, which there isn't. this is how the truces field would be formatted
 ]
 
 [empire.example-empire.fleets.home-fleet]
-display_name = "Example Empire Home Fleet"
+display-name = "Example Empire Home Fleet"
 # fleets jump together and must necessarily all be in the same system to be a fleet
 # fleets can only jump if they are all at the edge of the system closest to the system they are jumping to
 system = "example-system"
 ships = [
     # coordinates are system relative (x, y), like planets
-    { ship = "ships.example-ship", hull = 500.0, shield = 400.0, coords = [10, 10] },
+    # jump-charge is 0-1 and charges at a rate determined by the ship. Only charges when stationary while executing the jump order.
+    # Once all ships jump-charge = 1, the fleet can jump and the charge resets
+    { ship = "ships.example-ship", hull = 500.0, shield = 400.0, coords = [10, 10], jump-charge = 0.0 },
 ]
+# this is the orders queue. The top order is the one currently being executed. If there are no orders, the fleet sits idle.
+orders = [
+    { order = "move", coords = [10.0, -5.0] }, # move inside of system
+    { order = "bombard", planet = "example-planet", tile = 3 }, # bombard planet. if tile not specified, bombard randomly until surrender
+    # the jump order first implicitly moves the fleet to the coordinates to jump.
+    # Once the fleet is stationary, it begins to charge the hyperdrives.
+    # Finally, once all hyperdrives in the fleet are charged, it jumps
+    #{ order = "jump", system = "example-system-2" } # invalid bc example-system-2 doesnt exist but you get the gist
+]
+
+# if an enemy fleet enters the same system, this becomes true.
+# ships will not follow queued orders until this becomes false
+# (either this fleet wins or loses the combat)
+# once this goes back to false, the fleet re-executes its current order
+in-combat = false
+
 
 # presence of this table means the empire is ai. values are all 0-1
 [empire.example-empire.ai]
@@ -67,7 +99,10 @@ size = "large" # can be large or small (a truncated icosahedron with 32 faces or
 habitable = false
 # (x, y) coords in system map. the star is at the center, and planets can be up to 100 units away radially.
 coords = [-14.0, 12]
+# if there is no owner specified, the planet is unowned even if it is in an owned system
 owner = "example-empire" # uninhabited planets change loyalty immediately when bombarded
+# terraforming progress
+terraform = { paid = [ { resource = "resources.example-resource", count = 1500.0 } ], remaining = [ { resource = "resources.example-resource", count = 500.0 }, { days = 120 } ] }
 
 # tiles are laid out 0 to 11 or 0 to 31 with standard face mapping (up to implementation)
 [system.example-system.planets.example-barren-planet.tile-0]
@@ -86,19 +121,35 @@ habitable = true
 population = [ { species = "species.example-species", count = 1000 } ]
 coords = [25.0, 4.0]
 owner = "example-empire" # inhabited planets must surrender before changing loyalty
+siege = 1250.0      # optional, default 0
 
 [system.example-system.planets.example-planet.tile-0]
 building = "buildings.example-housing-building"
 
 [system.example-system.planets.example-planet.tile-1]
 water = true
-building = { building = "buildings.example-water-building", workers = 100 }
+
+# the spec just defines valid toml; it doesn't say that it has to be formatted one way or another
+# this could be wrapped up into a single line object, but here it is expanded for readability
+[system.example-system.planets.example-planet.tile-1.building]
+building = "buildings.example-water-building"
+workers = 100
+# how much damage the building has sustained, between 0 (default if not specified, = no damage) and 1 (devastated and no longer functional)
+damage = 0.3
+# the below settings can be tweaked by the empire manually. They cannot be tweaked on blockers
+job-cap = 100
+pinned = true # fill this building with workers first if possible if set to true (defaults to false)
+enabled = true # if disabled, no employment, no inputs/outputs, but no upkeep. defaults to true though
 
 [system.example-system.planets.example-planet.tile-2]
 building = { building = "buildings.example-building", workers = 250 }
 # construction also tracks an "empire" field if the planet being built on is unclaimed, so it knows who to refund to in the event of a claim cancellation
-# it also refunds all non-remaining resources (the upgrade cost - resources remaining)
-construction = { upgrade = "buildings.example-building-upgrade", remaining = [ { days = 50 } ] }
+# it also refunds all non-remaining resources with the LARGE EXCEPTION of influence. resources expent already are in a paid array.
+# the paid array in construction does not track days or transient resources
+construction = { upgrade = "buildings.example-building-upgrade", paid = [ { resource = "resources.example-resource", count = 750 }], remaining = [ { days = 50 } ] }
 
 [system.example-system.planets.example-planet.tile-3]
 building = "buildings.example-blocker-building"
+# resources should be paid as soon as possible
+# the amount paid could plausibly be an empty array if construction prices drop that low due to tech
+construction = { remove = true, paid = [], remaining = [ { days = 10 } ] }

@@ -9,7 +9,11 @@ technologies = "technologies.toml"
 display-name = "Example Ruleset"
 
 [ruleset.example-ruleset.resources]
-base-resource-stores = [
+starting-stores = [
+    { resource = "resources.example-resource", count = 500 },
+    { resource = "resources.example-currency", count = 100 }
+]
+storage-caps = [
     { resource = "resources.example-resource", count = 5000 },
     { resource = "resources.example-currency", count = 10000 }
 ]
@@ -55,6 +59,7 @@ hyperjump-days = 3            # charge time before a jump (x each ship's hyperju
 combat-subticks = 8           # combat steps per day
 arrival-radius = 90           # distance from the star where fleets arrive
 ship-repair-rate = 0.05       # fraction of hull repaired per day in friendly, quiet systems
+base-fleet-size = 10 # most ships per fleet before tech
 
 # Bombardment and invasion.
 [ruleset.example-ruleset.invasion]
@@ -69,21 +74,17 @@ siege-decay = 0.02                    # siege progress lost per day without bomb
 [ruleset.example-ruleset.diplomacy]
 truce-days = 360              # after peace, AI empires won't renew the war for this long
 
+# Terraforming
 [ruleset.example-ruleset.terraforming.large]
-requires-tech = "technologies.atmospheric-engineering"
+requires-tech = "technologies.example-technology"
 days = 360
 cost = [
-    { resource = "resources.minerals", count = 2000 },
-    { resource = "resources.alloy", count = 500 },
-    { resource = "resources.exotic-gases", count = 100 },
+    { resource = "resources.example-resource", count = 2000 },
 ]
 
 [ruleset.example-ruleset.terraforming.small]
-requires-tech = "technologies.planetary-reconstruction"
+requires-tech = "technologies.example-technology-2"
 days = 540
 cost = [
-    { resource = "resources.minerals", count = 3000 },
-    { resource = "resources.alloy", count = 1000 },
-    { resource = "resources.exotic-gases", count = 200 },
-    { resource = "resources.rare-crystals", count = 200 },
+    { resource = "resources.example-resource", count = 3000 },
 ]

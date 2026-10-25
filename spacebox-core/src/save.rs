@@ -1,18 +1,19 @@
 //! Writes a [`World`] as a TOML save file in the same format the loader reads.
 //!
 //! The save imports every asset file it references (with paths relative to the save's own
-//! location) and contains all game state inline: `[game]`, `[empire.*]`, `[system.*]`,
-//! `[system.*.planets.*]` and the non-empty `[...tiles.N]` of each planet.
+//! location) and contains all game state inline, following `design/data/savegame.toml`:
+//! `[game]`, `[empire.*]` (with `.fleets.*` and `.ai`), `[system.*]`, `[system.*.planets.*]`
+//! and the non-empty `[...tile-N]` of each planet.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::defs::{DefKey, Defs};
+use crate::defs::{Cost, DefKey, Defs, ResourceAmount};
 use crate::error::{Error, Result};
 use crate::ids::*;
-use crate::world::{BuildingInstance, Construction, FleetOrder, World};
+use crate::world::{BuildingInstance, FleetOrder, ProjectKind, World};
 
 /// Writes the world to `path`.
 pub fn save(world: &World, path: impl AsRef<Path>) -> Result<()> {
@@ -147,17 +148,17 @@ impl<'a> Writer<'a> {
                     self.use_file(d.technologies[t].key.file);
                 }
             }
-            if let Some(t) = e.researching {
-                self.use_file(d.tech(t).key.file);
+            if let Some(s) = e.dominant_species {
+                self.use_file(d.species_def(s).key.file);
             }
-            for c in &e.crises {
-                self.use_file(d.resource(c.resource).key.file);
+            for p in &e.research {
+                self.use_file(d.tech(p.tech).key.file);
+                self.use_cost(&p.remaining);
             }
-            for o in &e.ship_queue {
-                self.use_file(d.ship(o.ship).key.file);
-                for (r, _) in &o.remaining {
-                    self.use_file(d.resource(*r).key.file);
-                }
+            for p in &e.shipbuilding {
+                self.use_file(d.ship(p.ship).key.file);
+                self.use_cost(&p.remaining);
+                self.use_amounts(&p.paid);
             }
         }
         for f in &world.fleets {
@@ -166,6 +167,13 @@ impl<'a> Writer<'a> {
             }
         }
         for p in &world.planets {
+            for (s, _) in &p.population {
+                self.use_file(d.species_def(*s).key.file);
+            }
+            if let Some(t) = &p.terraform {
+                self.use_cost(&t.remaining);
+                self.use_amounts(&t.paid);
+            }
             for t in &p.tiles {
                 for (r, _) in &t.resource_mults {
                     self.use_file(d.resource(*r).key.file);
@@ -176,24 +184,65 @@ impl<'a> Writer<'a> {
                         self.use_file(d.upgrade(*u).key.file);
                     }
                 }
-                match &t.construction {
-                    Some(Construction::Building { def, paid, .. }) => {
-                        self.use_file(d.building(*def).key.file);
-                        for a in paid {
-                            self.use_file(d.resource(a.resource).key.file);
-                        }
+                if let Some(c) = &t.construction {
+                    match c.kind {
+                        ProjectKind::Building(b) => self.use_file(d.building(b).key.file),
+                        ProjectKind::Upgrade(u) => self.use_file(d.upgrade(u).key.file),
+                        ProjectKind::Remove => {}
                     }
-                    Some(Construction::Upgrade { upgrade, .. }) => {
-                        self.use_file(d.upgrade(*upgrade).key.file);
-                    }
-                    None => {}
+                    self.use_cost(&c.remaining);
+                    self.use_amounts(&c.paid);
                 }
             }
         }
     }
 
+    fn use_amounts(&mut self, list: &[ResourceAmount]) {
+        for a in list {
+            self.use_file(self.defs.resource(a.resource).key.file);
+        }
+    }
+
+    fn use_cost(&mut self, c: &Cost) {
+        for a in &c.resources {
+            self.use_file(self.defs.resource(a.resource).key.file);
+        }
+    }
+
     fn r(&self, k: &DefKey) -> String {
         s(&format!("{}.{}", self.aliases[&k.file], k.name))
+    }
+
+    /// `[{ resource = ..., count = ... }, ..., { days = N }]`
+    fn cost(&self, c: &Cost) -> String {
+        let mut parts: Vec<String> = c
+            .resources
+            .iter()
+            .filter(|a| a.count > 0.0)
+            .map(|a| self.amount(&a.resource, a.count))
+            .collect();
+        if c.days > 0 {
+            parts.push(format!("{{ days = {} }}", c.days));
+        }
+        format!("[{}]", parts.join(", "))
+    }
+
+    /// `[{ resource = ..., count = ... }, ...]`
+    fn amounts(&self, list: &[ResourceAmount]) -> String {
+        let parts: Vec<String> = list
+            .iter()
+            .filter(|a| a.count > 0.0)
+            .map(|a| self.amount(&a.resource, a.count))
+            .collect();
+        format!("[{}]", parts.join(", "))
+    }
+
+    fn amount(&self, r: &ResourceId, count: f64) -> String {
+        format!(
+            "{{ resource = {}, count = {} }}",
+            self.r(&self.defs.resource(*r).key),
+            f(count)
+        )
     }
 
     fn write_state(&self, world: &World, out: &mut String) {
@@ -208,35 +257,27 @@ impl<'a> Writer<'a> {
         out.push('\n');
 
         for e in &world.empires {
-            let _ = writeln!(out, "[empire.{}]", key(&e.name));
-            let _ = writeln!(out, "display_name = {}", s(&e.display_name));
+            let ek = key(&e.name);
+            let _ = writeln!(out, "[empire.{ek}]");
+            let _ = writeln!(out, "display-name = {}", s(&e.display_name));
             if let Some(c) = &e.color {
                 let _ = writeln!(out, "color = {}", s(c));
             }
             if let Some(c) = e.capital {
                 let _ = writeln!(out, "capital = {}", s(&world.system(c).name));
             }
-            if !e.accepts_migrants {
-                out.push_str("accepts_migrants = false\n");
-            }
-            if !e.market_access {
-                out.push_str("market_access = false\n");
+            if let Some(sp) = e.dominant_species {
+                let _ = writeln!(out, "dominant-species = {}", self.r(&d.species_def(sp).key));
             }
             let stores: Vec<String> = e
                 .storage
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| **v != 0.0)
-                .map(|(r, v)| {
-                    format!(
-                        "    {{ resource = {}, count = {} }},\n",
-                        self.r(&d.resources[r].key),
-                        f(*v)
-                    )
-                })
+                .map(|(r, v)| format!("    {},\n", self.amount(&ResourceId::from_idx(r), *v)))
                 .collect();
             if !stores.is_empty() {
-                let _ = write!(out, "resource_stores = [\n{}]\n", stores.concat());
+                let _ = write!(out, "resource-stores = [\n{}]\n", stores.concat());
             }
             let techs: Vec<String> = e
                 .techs
@@ -248,180 +289,165 @@ impl<'a> Writer<'a> {
             if !techs.is_empty() {
                 let _ = write!(out, "technologies = [\n{}]\n", techs.concat());
             }
-            if let Some(t) = e.researching {
-                let _ = writeln!(out, "researching = {}", self.r(&d.tech(t).key));
-                let _ = writeln!(out, "research_progress = {}", f(e.research_progress));
-            }
-            if !e.crises.is_empty() {
-                out.push_str("crises = [\n");
-                for c in &e.crises {
+            if !e.research.is_empty() {
+                out.push_str("current-research = [\n");
+                for p in &e.research {
                     let _ = writeln!(
                         out,
-                        "    {{ resource = {}, since_day = {}, severity = {} }},",
-                        self.r(&d.resource(c.resource).key),
-                        c.since_day,
-                        f(c.severity)
+                        "    {{ technology = {}, remaining = {} }},",
+                        self.r(&d.tech(p.tech).key),
+                        self.cost(&p.remaining)
                     );
                 }
                 out.push_str("]\n");
             }
-            if !e.wars.is_empty() {
-                out.push_str("wars = [\n");
-                for w in &e.wars {
+            if !e.shipbuilding.is_empty() {
+                out.push_str("current-shipbuilding = [\n");
+                for p in &e.shipbuilding {
+                    let planet = world.planet(p.planet);
                     let _ = writeln!(
                         out,
-                        "    {{ empire = {}, since_day = {} }},",
-                        s(&world.empire(w.enemy).name),
-                        w.since_day
-                    );
-                }
-                out.push_str("]\n");
-            }
-            let truces: Vec<_> = e
-                .truces
-                .iter()
-                .filter(|t| t.until_day > world.day)
-                .collect();
-            if !truces.is_empty() {
-                out.push_str("truces = [\n");
-                for t in truces {
-                    let _ = writeln!(
-                        out,
-                        "    {{ empire = {}, until_day = {} }},",
-                        s(&world.empire(t.with).name),
-                        t.until_day
-                    );
-                }
-                out.push_str("]\n");
-            }
-            if !e.ship_queue.is_empty() {
-                out.push_str("ship_queue = [\n");
-                for o in &e.ship_queue {
-                    let remaining: Vec<String> = o
-                        .remaining
-                        .iter()
-                        .map(|(r, c)| {
-                            format!(
-                                "{{ resource = {}, count = {} }}",
-                                self.r(&d.resource(*r).key),
-                                f(*c)
-                            )
-                        })
-                        .collect();
-                    let fleet = o
-                        .fleet
-                        .and_then(|id| world.fleet(id))
-                        .map(|fl| format!(", fleet = {}", s(&fl.name)))
-                        .unwrap_or_default();
-                    let _ = writeln!(
-                        out,
-                        "    {{ ship = {}, planet = {}, remaining = [{}]{fleet} }},",
-                        self.r(&d.ship(o.ship).key),
-                        s(&planet_path(world, o.planet)),
-                        remaining.join(", ")
+                        "    {{ ship = {}, system = {}, planet = {}, paid = {}, remaining = {} }},",
+                        self.r(&d.ship(p.ship).key),
+                        s(&world.system(planet.system).name),
+                        s(&planet.name),
+                        self.amounts(&p.paid),
+                        self.cost(&p.remaining)
                     );
                 }
                 out.push_str("]\n");
             }
             out.push('\n');
 
-            if let Some(ai) = &e.ai {
-                let _ = writeln!(out, "[empire.{}.ai]", key(&e.name));
-                let _ = writeln!(out, "militant = {}", f(ai.militant));
-                let _ = writeln!(out, "expansionist = {}", f(ai.expansionist));
-                let _ = writeln!(out, "scientific = {}\n", f(ai.scientific));
+            let _ = writeln!(out, "[empire.{ek}.policy]");
+            let _ = writeln!(out, "accepts-migrants = {}", e.accepts_migrants);
+            let _ = writeln!(out, "market-access = {}\n", e.market_access);
+
+            let _ = writeln!(out, "[empire.{ek}.diplomacy]");
+            out.push_str("wars = [\n");
+            for w in &e.wars {
+                let _ = writeln!(
+                    out,
+                    "    {{ empire = {}, since-day = {} }},",
+                    s(&world.empire(w.enemy).name),
+                    w.since_day
+                );
             }
+            out.push_str("]\ntruces = [\n");
+            for t in e.truces.iter().filter(|t| t.until_day > world.day) {
+                let _ = writeln!(
+                    out,
+                    "    {{ empire = {}, until-day = {} }},",
+                    s(&world.empire(t.with).name),
+                    t.until_day
+                );
+            }
+            out.push_str("]\n\n");
 
             let eid = world.empire_by_name(&e.name);
             for fl in world.fleets.iter().filter(|fl| Some(fl.owner) == eid) {
-                let _ = writeln!(out, "[empire.{}.fleets.{}]", key(&e.name), key(&fl.name));
-                let _ = writeln!(out, "display_name = {}", s(&fl.display_name));
+                let _ = writeln!(out, "[empire.{ek}.fleets.{}]", key(&fl.name));
+                let _ = writeln!(out, "display-name = {}", s(&fl.display_name));
                 let _ = writeln!(out, "system = {}", s(&world.system(fl.system).name));
-                let _ = writeln!(out, "coordinates = {}", coords(fl.coordinates));
-                if fl.jump_charge > 0.0 {
-                    let _ = writeln!(out, "jump_charge = {}", f(fl.jump_charge));
-                }
-                match &fl.order {
-                    FleetOrder::Idle => {}
-                    FleetOrder::Move {
-                        system,
-                        coordinates,
-                    } => {
-                        let c = coordinates
-                            .map(|c| format!(", coordinates = {}", coords(c)))
-                            .unwrap_or_default();
-                        let _ = writeln!(
-                            out,
-                            "order = {{ type = \"move\", system = {}{c} }}",
-                            s(&world.system(*system).name)
-                        );
-                    }
-                    FleetOrder::Bombard { planet, tile } => {
-                        let t = tile.map(|t| format!(", tile = {t}")).unwrap_or_default();
-                        let _ = writeln!(
-                            out,
-                            "order = {{ type = \"bombard\", planet = {}{t} }}",
-                            s(&planet_path(world, *planet))
-                        );
-                    }
-                }
                 out.push_str("ships = [\n");
-                for sh in &fl.ships {
+                for (i, sh) in fl.ships.iter().enumerate() {
                     let _ = writeln!(
                         out,
-                        "    {{ ship = {}, hull = {}, shield = {} }},",
+                        "    {{ ship = {}, hull = {}, shield = {}, coords = {}, jump-charge = {} }},",
                         self.r(&d.ship(sh.def).key),
                         f(sh.hull),
-                        f(sh.shield)
+                        f(sh.shield),
+                        coords(fl.ship_coordinates(i)),
+                        f(sh.jump_charge)
                     );
                 }
-                out.push_str("]\n\n");
+                out.push_str("]\norders = [\n");
+                for o in &fl.orders {
+                    let _ = match o {
+                        FleetOrder::Move { coordinates } => writeln!(
+                            out,
+                            "    {{ order = \"move\", coords = {} }},",
+                            coords(*coordinates)
+                        ),
+                        FleetOrder::Jump { system } => writeln!(
+                            out,
+                            "    {{ order = \"jump\", system = {} }},",
+                            s(&world.system(*system).name)
+                        ),
+                        FleetOrder::Bombard { planet, tile } => {
+                            let t = tile.map(|t| format!(", tile = {t}")).unwrap_or_default();
+                            writeln!(
+                                out,
+                                "    {{ order = \"bombard\", planet = {}{t} }},",
+                                s(&world.planet(*planet).name)
+                            )
+                        }
+                    };
+                }
+                out.push_str("]\n");
+                let _ = writeln!(out, "in-combat = {}\n", fl.in_combat);
+            }
+
+            if let Some(ai) = &e.ai {
+                let _ = writeln!(out, "[empire.{ek}.ai]");
+                let _ = writeln!(out, "militant = {}", f(ai.militant));
+                let _ = writeln!(out, "expansionist = {}", f(ai.expansionist));
+                let _ = writeln!(out, "scientific = {}\n", f(ai.scientific));
             }
         }
 
         for sys in &world.systems {
             let sk = key(&sys.name);
             let _ = writeln!(out, "[system.{sk}]");
-            let _ = writeln!(out, "display_name = {}", s(&sys.display_name));
-            let _ = writeln!(out, "star_type = {}", s(&sys.star_type));
-            let _ = writeln!(out, "star_count = {}", sys.star_count);
+            let _ = writeln!(out, "display-name = {}", s(&sys.display_name));
+            let _ = writeln!(out, "star-type = {}", s(&sys.star_type));
+            let _ = writeln!(out, "star-count = {}", sys.star_count);
             if let Some(o) = sys.owner {
-                let _ = writeln!(out, "owned_by = {}", s(&world.empire(o).name));
+                let _ = writeln!(out, "owner = {}", s(&world.empire(o).name));
             }
-            if !sys.links.is_empty() {
-                let links: Vec<String> = sys
-                    .links
-                    .iter()
-                    .map(|l| s(&world.system(*l).name))
-                    .collect();
-                let _ = writeln!(out, "linked_systems = [{}]", links.join(", "));
-            }
-            let _ = writeln!(out, "coordinates = {}", coords(sys.coordinates));
+            let links: Vec<String> = sys
+                .links
+                .iter()
+                .map(|l| s(&world.system(*l).name))
+                .collect();
+            let _ = writeln!(out, "linked-systems = [{}]", links.join(", "));
+            let _ = writeln!(out, "coords = {}", coords(sys.coordinates));
             out.push('\n');
 
             for pid in sys.planet_ids() {
                 let p = world.planet(pid);
                 let pk = format!("system.{sk}.planets.{}", key(&p.name));
                 let _ = writeln!(out, "[{pk}]");
-                let _ = writeln!(out, "display_name = {}", s(&p.display_name));
+                let _ = writeln!(out, "display-name = {}", s(&p.display_name));
                 let _ = writeln!(out, "size = {}", s(p.size.as_str()));
                 let _ = writeln!(out, "habitable = {}", p.habitable);
-                let _ = writeln!(out, "total_pop = {}", p.pop);
-                let _ = writeln!(out, "coordinates = {}", coords(p.coordinates));
+                let _ = writeln!(out, "coords = {}", coords(p.coordinates));
                 if let Some(o) = p.owner {
-                    let _ = writeln!(out, "owned_by = {}", s(&world.empire(o).name));
+                    let _ = writeln!(out, "owner = {}", s(&world.empire(o).name));
+                }
+                if !p.population.is_empty() {
+                    let pops: Vec<String> = p
+                        .population
+                        .iter()
+                        .map(|(sp, n)| {
+                            format!(
+                                "{{ species = {}, count = {n} }}",
+                                self.r(&d.species_def(*sp).key)
+                            )
+                        })
+                        .collect();
+                    let _ = writeln!(out, "population = [{}]", pops.join(", "));
                 }
                 if p.siege > 0.0 {
                     let _ = writeln!(out, "siege = {}", f(p.siege));
                 }
-                if p.growth_progress != 0.0 {
-                    let _ = writeln!(out, "growth_progress = {}", f(p.growth_progress));
-                }
-                if let Some(m) = &p.moon_of {
-                    let _ = writeln!(out, "moon_of = {}", s(m));
-                }
-                if let Some(t) = p.terraform_days_left {
-                    let _ = writeln!(out, "terraform_days_left = {t}");
+                if let Some(t) = &p.terraform {
+                    let _ = writeln!(
+                        out,
+                        "terraform = {{ paid = {}, remaining = {} }}",
+                        self.amounts(&t.paid),
+                        self.cost(&t.remaining)
+                    );
                 }
                 out.push('\n');
 
@@ -433,7 +459,7 @@ impl<'a> Writer<'a> {
                     {
                         continue;
                     }
-                    let _ = writeln!(out, "[{pk}.tiles.{i}]");
+                    let _ = writeln!(out, "[{pk}.tile-{i}]");
                     if !t.resource_mults.is_empty() {
                         let mults: Vec<String> = t
                             .resource_mults
@@ -446,59 +472,34 @@ impl<'a> Writer<'a> {
                                 )
                             })
                             .collect();
-                        let _ = writeln!(out, "resource_multipliers = [{}]", mults.join(", "));
+                        let _ = writeln!(out, "resource-multipliers = [{}]", mults.join(", "));
                     }
                     if t.water {
                         out.push_str("water = true\n");
                     }
-                    // Plain buildings are a bare reference; anything with state gets a
-                    // `[...tiles.N.building]` table, written after the tile's own keys.
-                    let detail = t.building.as_ref().and_then(|b| self.building_table(b));
-                    if let (Some(b), None) = (&t.building, &detail) {
-                        let _ = writeln!(out, "building = {}", self.r(&d.building(b.def).key));
+                    if let Some(b) = &t.building {
+                        let _ = writeln!(out, "building = {}", self.building(b));
                     }
-                    match &t.construction {
-                        Some(Construction::Building {
-                            def,
-                            days_left,
-                            empire,
-                            paid,
-                        }) => {
-                            let who = empire
-                                .map(|e| format!(", empire = {}", s(&world.empire(e).name)))
-                                .unwrap_or_default();
-                            let paid: Vec<String> = paid
-                                .iter()
-                                .map(|a| {
-                                    format!(
-                                        "{{ resource = {}, count = {} }}",
-                                        self.r(&d.resource(a.resource).key),
-                                        f(a.count)
-                                    )
-                                })
-                                .collect();
-                            let paid = if paid.is_empty() {
-                                String::new()
-                            } else {
-                                format!(", paid = [{}]", paid.join(", "))
-                            };
-                            let _ = writeln!(
-                                out,
-                                "construction = {{ building = {}, days_left = {days_left}{who}{paid} }}",
-                                self.r(&d.building(*def).key)
-                            );
-                        }
-                        Some(Construction::Upgrade { upgrade, days_left }) => {
-                            let _ = writeln!(
-                                out,
-                                "construction = {{ upgrade = {}, days_left = {days_left} }}",
-                                self.r(&d.upgrade(*upgrade).key)
-                            );
-                        }
-                        None => {}
-                    }
-                    if let Some(table) = detail {
-                        let _ = write!(out, "\n[{pk}.tiles.{i}.building]\n{table}");
+                    if let Some(c) = &t.construction {
+                        let what = match c.kind {
+                            ProjectKind::Building(b) => {
+                                format!("building = {}", self.r(&d.building(b).key))
+                            }
+                            ProjectKind::Upgrade(u) => {
+                                format!("upgrade = {}", self.r(&d.upgrade(u).key))
+                            }
+                            ProjectKind::Remove => "remove = true".to_string(),
+                        };
+                        let who = c
+                            .empire
+                            .map(|e| format!(", empire = {}", s(&world.empire(e).name)))
+                            .unwrap_or_default();
+                        let _ = writeln!(
+                            out,
+                            "construction = {{ {what}, paid = {}, remaining = {}{who} }}",
+                            self.amounts(&c.paid),
+                            self.cost(&c.remaining)
+                        );
                     }
                     out.push('\n');
                 }
@@ -506,52 +507,47 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// The `[...tiles.N.building]` table body for a building with state worth saving, or
-    /// `None` if a bare reference is enough.
-    fn building_table(&self, b: &BuildingInstance) -> Option<String> {
+    /// A bare building reference, or an inline table for a building with state.
+    fn building(&self, b: &BuildingInstance) -> String {
+        let r = self.r(&self.defs.building(b.def).key);
         let simple = b.upgrades.is_empty()
             && b.job_cap.is_none()
             && b.enabled
             && b.workers == 0
             && b.damage == 0.0;
         if simple {
-            return None;
+            return r;
         }
-        let mut out = format!("type = {}\n", self.r(&self.defs.building(b.def).key));
+        let mut parts = vec![format!("building = {r}")];
         if !b.upgrades.is_empty() {
             let ups: Vec<String> = b
                 .upgrades
                 .iter()
                 .map(|u| self.r(&self.defs.upgrade(*u).key))
                 .collect();
-            let _ = writeln!(out, "upgrades = [{}]", ups.join(", "));
+            parts.push(format!("upgrades = [{}]", ups.join(", ")));
         }
         if b.workers > 0 {
-            let _ = writeln!(out, "workers = {}", b.workers);
+            parts.push(format!("workers = {}", b.workers));
         }
         if let Some(c) = b.job_cap {
-            let _ = writeln!(out, "job_cap = {c}");
+            parts.push(format!("job-cap = {c}"));
         }
         if b.pinned {
-            out.push_str("pinned = true\n");
+            parts.push("pinned = true".into());
         }
         if !b.enabled {
-            out.push_str("enabled = false\n");
+            parts.push("enabled = false".into());
         }
         if b.damage > 0.0 {
-            let _ = writeln!(out, "damage = {}", f(b.damage));
+            parts.push(format!("damage = {}", f(b.damage)));
         }
-        Some(out)
+        format!("{{ {} }}", parts.join(", "))
     }
 }
 
 fn coords(c: [f64; 2]) -> String {
-    format!("{{ x = {}, y = {} }}", f(c[0]), f(c[1]))
-}
-
-fn planet_path(world: &World, p: PlanetId) -> String {
-    let planet = world.planet(p);
-    format!("{}/{}", world.system(planet.system).name, planet.name)
+    format!("[{}, {}]", f(c[0]), f(c[1]))
 }
 
 /// Relative path from directory `from` to file `to` (both absolute).

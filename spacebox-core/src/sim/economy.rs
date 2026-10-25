@@ -15,12 +15,20 @@
 //! fully independent within a tick while still propagating shortages through production
 //! chains. Any stockpiled resource with `sat < 1` (storage is empty and income cannot cover
 //! demand) puts the empire into a crisis for that resource.
+//!
+//! # Projects
+//!
+//! Constructions, removals, terraforming, research and shipbuilding all have a list of
+//! remaining resources (and days). After settlement each empire's projects draw normal
+//! resources from its stockpile, in a fixed order, as far as stock allows. Transient resources
+//! (research, shipbuilding) are never stored: the day's production goes to the projects that
+//! need it, and whatever is left over is wasted.
 
-use crate::defs::{Defs, Ruleset};
+use crate::defs::{Cost, Defs, ResourceAmount, Ruleset, add_amounts};
 use crate::ids::*;
 use crate::sim::events::{Event, EventKind};
 use crate::sim::migration::match_migrants;
-use crate::world::{Crisis, Empire, Planet, Pool, System, World};
+use crate::world::{Crisis, Empire, Planet, Pool, ResearchProject, System, World};
 
 /// Phase 3: sum each ownership group's planets and match migrants inside the group.
 pub(crate) fn tick_system(sys: &mut System, planets: &[Planet]) {
@@ -78,8 +86,8 @@ pub(crate) fn aggregate_pool(
     }
     if let (true, Some(e)) = (pool.core, pool.empire) {
         let e = &empires[e.idx()];
-        for a in &rules.empire_income {
-            pool.net[a.resource.idx()] += a.count;
+        if let Some(r) = rules.expansion_resource {
+            pool.net[r.idx()] += rules.expansion_resource_income;
         }
         for (r, &u) in e.fleet_upkeep.iter().enumerate() {
             if u > 0.0 {
@@ -115,7 +123,7 @@ pub(crate) fn market(world: &mut World) {
     let mut bid = vec![0.0; n_emp * n_res];
     let tradeable = |r: usize| {
         let d = &defs.resources[r];
-        d.tradeable && d.stockpile && r != currency.idx()
+        d.tradeable && !d.transient && r != currency.idx()
     };
 
     for (ei, e) in world.empires.iter().enumerate() {
@@ -134,7 +142,9 @@ pub(crate) fn market(world: &mut World) {
     let price: Vec<f64> = (0..n_res)
         .map(|r| {
             let (o, b) = (totals(&offer, r), totals(&bid, r));
-            let base = defs.resources[r].base_value;
+            // Values are relative to the currency's own value.
+            let base =
+                defs.resources[r].base_value / defs.resources[currency.idx()].base_value.max(1e-9);
             if o > 0.0 && b > 0.0 {
                 base * (b / o).clamp(0.5, 2.0)
             } else {
@@ -180,7 +190,8 @@ pub(crate) fn market(world: &mut World) {
     }
 }
 
-/// Phase 5a: settle an empire's core pool into storage, update crises and research.
+/// Phase 5a: settle an empire's core pool into storage and update crises. Transient
+/// production from all of the empire's planets becomes this tick's transient income.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize_empire(
     e: &mut Empire,
@@ -200,9 +211,18 @@ pub(crate) fn finalize_empire(
         ..Default::default()
     };
     let mut last_system = None;
+    let transient: Vec<usize> = (0..defs.resource_count())
+        .filter(|&r| defs.resources[r].transient)
+        .collect();
+    for &r in &transient {
+        e.income[r] = 0.0;
+    }
     for p in owned {
         let p = &planets[p.idx()];
-        stats.pop += p.pop;
+        stats.pop += p.pop();
+        for &r in &transient {
+            e.income[r] += (p.flows.supply[r] - p.flows.demand[r]).max(0.0);
+        }
         if last_system != Some(p.system) {
             last_system = Some(p.system);
             // Planets are stored per system, so this counts systems with a planet we own.
@@ -223,8 +243,7 @@ pub(crate) fn finalize_empire(
     for (r, res) in defs.resources.iter().enumerate() {
         let full = pool.demand_full[r];
         let supply = pool.demand[r] + pool.net[r];
-        if Some(ResourceId::from_idx(r)) == rules.research_resource || !res.stockpile {
-            e.income[r] = pool.net[r];
+        if res.transient {
             if full > 1e-9 {
                 sat[r] = (supply.max(0.0) / full).clamp(0.0, 1.0);
             }
@@ -236,7 +255,7 @@ pub(crate) fn finalize_empire(
         }
         let before = e.storage[r];
         let mut after = (available - pool.demand[r]).max(0.0);
-        if let Some(cap) = res.storage_cap {
+        if let Some(cap) = rules.storage_cap(ResourceId::from_idx(r)) {
             after = after.min(cap);
         }
         e.storage[r] = after;
@@ -303,83 +322,237 @@ pub(crate) fn finalize_empire(
         * rules.crisis_stability_penalty)
         .min(40.0);
 
-    if let Some(rr) = rules.research_resource {
-        let points = pool.net[rr.idx()].max(0.0);
-        stats.research_income = points;
-        research(e, id, defs, points, day);
-    }
-    build_ships(e, pool, defs);
     e.stats = stats;
 }
 
-/// Feeds on-demand production (shipbuilding) into the ship queue, oldest order first.
-fn build_ships(e: &mut Empire, pool: &Pool, defs: &Defs) {
-    for (r, res) in defs.resources.iter().enumerate() {
-        if !res.on_demand {
+/// Draws what a project still needs: normal resources from `storage` (recorded in `paid`),
+/// transient ones from `transient` (stretched by `mult`), as far as they go.
+fn draw(
+    remaining: &mut Cost,
+    paid: Option<&mut Vec<ResourceAmount>>,
+    defs: &Defs,
+    storage: &mut [f64],
+    transient: &mut [f64],
+    mult: f64,
+) {
+    let mut spent: Vec<ResourceAmount> = Vec::new();
+    for a in &mut remaining.resources {
+        if a.count <= 0.0 {
             continue;
         }
-        let mut points = pool.net[r].max(0.0);
-        for order in &mut e.ship_queue {
-            if points <= 0.0 {
-                break;
+        let r = a.resource.idx();
+        let take = if defs.resources[r].transient {
+            let take = (transient[r] * mult).min(a.count);
+            transient[r] -= take / mult;
+            take
+        } else {
+            let take = storage[r].max(0.0).min(a.count);
+            storage[r] -= take;
+            if take > 0.0 {
+                spent.push(ResourceAmount {
+                    resource: a.resource,
+                    count: take,
+                });
             }
-            for (res, left) in &mut order.remaining {
-                if res.idx() == r && *left > 0.0 {
-                    let used = left.min(points);
-                    *left -= used;
-                    points -= used;
+            take
+        };
+        a.count -= take;
+        if a.count < 1e-9 {
+            a.count = 0.0;
+        }
+    }
+    if let Some(paid) = paid {
+        add_amounts(paid, &spent);
+    }
+}
+
+/// Phase 6b: funds every project from its empire's stockpile and transient production, in
+/// order: tile constructions and terraforming (planet by planet), ships, then research.
+/// Ships only get the transient output (shipbuilding) of the planet they are built at;
+/// research gets what is left of the empire's. Finishes research and shipbuilding projects
+/// with nothing left (tile projects finish during the planet phase). Unused transient
+/// production is recorded as wasted.
+pub(crate) fn fund_projects(world: &mut World) {
+    let defs = world.defs.clone();
+    let rules = defs.ruleset(world.ruleset);
+    let day = world.day;
+    let n_res = defs.resource_count();
+    let World {
+        empires, planets, ..
+    } = world;
+    let mut transient: Vec<Vec<f64>> = empires
+        .iter()
+        .map(|e| {
+            (0..n_res)
+                .map(|r| {
+                    if defs.resources[r].transient {
+                        e.income[r]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let before: Vec<Vec<f64>> = empires.iter().map(|e| e.storage.clone()).collect();
+
+    for p in planets.iter_mut() {
+        let owner = p.owner;
+        if p.constructing {
+            for t in &mut p.tiles {
+                let Some(c) = &mut t.construction else {
+                    continue;
+                };
+                if let Some(b) = c.empire.or(owner).filter(|b| b.idx() < empires.len()) {
+                    let e = &mut empires[b.idx()];
+                    draw(
+                        &mut c.remaining,
+                        Some(&mut c.paid),
+                        &defs,
+                        &mut e.storage,
+                        &mut transient[b.idx()],
+                        1.0,
+                    );
                 }
             }
         }
+        if let (Some(t), Some(o)) = (&mut p.terraform, owner) {
+            let e = &mut empires[o.idx()];
+            draw(
+                &mut t.remaining,
+                Some(&mut t.paid),
+                &defs,
+                &mut e.storage,
+                &mut transient[o.idx()],
+                1.0,
+            );
+        }
     }
-    let (done, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut e.ship_queue)
-        .into_iter()
-        .partition(|o| o.remaining.iter().all(|(_, left)| *left <= 1e-9));
-    e.ship_queue = waiting;
-    e.completed_ships.extend(done);
+
+    for (i, e) in empires.iter_mut().enumerate() {
+        let id = EmpireId::from_idx(i);
+        let pool = &mut transient[i];
+
+        // Ships: each planet's transient output only feeds the ships built there.
+        let mut local: Vec<(PlanetId, Vec<f64>)> = Vec::new();
+        for project in &mut e.shipbuilding {
+            project.remaining.days = project.remaining.days.saturating_sub(1);
+            let pid = project.planet;
+            let slot = match local.iter().position(|(p, _)| *p == pid) {
+                Some(k) => k,
+                None => {
+                    let p = &planets[pid.idx()];
+                    let avail = (0..n_res)
+                        .map(|r| {
+                            if defs.resources[r].transient && p.owner == Some(id) {
+                                (p.flows.supply[r] - p.flows.demand[r]).max(0.0)
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect();
+                    local.push((pid, avail));
+                    local.len() - 1
+                }
+            };
+            let avail = &mut local[slot].1;
+            let start = avail.clone();
+            draw(
+                &mut project.remaining,
+                Some(&mut project.paid),
+                &defs,
+                &mut e.storage,
+                avail,
+                1.0,
+            );
+            for r in 0..n_res {
+                pool[r] = (pool[r] - (start[r] - avail[r])).max(0.0);
+            }
+        }
+        let (done, active): (Vec<_>, Vec<_>) = std::mem::take(&mut e.shipbuilding)
+            .into_iter()
+            .partition(|p| p.remaining.is_done());
+        e.shipbuilding = active;
+        e.completed_ships.extend(done);
+
+        for project in &mut e.research {
+            // Waiting on a prerequisite that is still being researched.
+            if defs
+                .tech(project.tech)
+                .prerequisites
+                .iter()
+                .any(|p| !e.techs[p.idx()])
+            {
+                continue;
+            }
+            project.remaining.days = project.remaining.days.saturating_sub(1);
+            draw(
+                &mut project.remaining,
+                None,
+                &defs,
+                &mut e.storage,
+                pool,
+                rules.research_speed_mult.max(1e-9),
+            );
+        }
+        let (done, active): (Vec<ResearchProject>, Vec<ResearchProject>) =
+            std::mem::take(&mut e.research)
+                .into_iter()
+                .partition(|p| p.remaining.is_done());
+        e.research = active;
+        for project in &done {
+            e.techs[project.tech.idx()] = true;
+            e.events.push(
+                Event::new(
+                    day,
+                    EventKind::ResearchFinished,
+                    format!(
+                        "{} has researched {}",
+                        e.display_name,
+                        defs.tech(project.tech).display_name
+                    ),
+                )
+                .empire(Some(id)),
+            );
+        }
+        if !done.is_empty() {
+            e.rebuild_modifiers(&defs);
+        }
+
+        for r in 0..n_res {
+            if defs.resources[r].transient {
+                e.wasted[r] = pool[r].max(0.0);
+            } else {
+                e.income[r] += e.storage[r] - before[i][r];
+            }
+        }
+    }
 }
 
-fn research(e: &mut Empire, id: EmpireId, defs: &Defs, points: f64, day: u64) {
-    if e.researching.is_some_and(|t| e.knows(t)) {
-        e.researching = None;
-    }
-    if e.researching.is_none() {
-        e.researching = next_research(e, defs);
-    }
-    let Some(t) = e.researching else { return };
-    e.research_progress += points;
-    let cost = defs.tech(t).cost;
-    if e.research_progress >= cost {
-        e.research_progress -= cost;
-        e.techs[t.idx()] = true;
-        e.researching = next_research(e, defs);
-        e.rebuild_modifiers(defs);
-        e.events.push(
-            Event::new(
-                day,
-                EventKind::ResearchFinished,
-                format!(
-                    "{} has researched {}",
-                    e.display_name,
-                    defs.tech(t).display_name
-                ),
-            )
-            .empire(Some(id)),
-        );
-    }
-}
-
-/// The cheapest technology whose prerequisites are all known.
-pub fn next_research(e: &Empire, defs: &Defs) -> Option<TechId> {
+/// Picks a technology to research for governors: the cheapest one not yet known or being
+/// researched whose prerequisites are known or being researched, after dividing costs by
+/// `weight`.
+pub fn next_research(e: &Empire, defs: &Defs, weight: impl Fn(TechId) -> f64) -> Option<TechId> {
+    let value = |t: TechId| -> f64 {
+        defs.tech(t)
+            .cost
+            .iter()
+            .map(|a| a.count * defs.resource(a.resource).base_value)
+            .sum::<f64>()
+            / weight(t).max(1e-9)
+    };
     (0..defs.technologies.len())
         .map(TechId::from_idx)
-        .filter(|t| defs.tech_available(*t, &e.techs))
-        .min_by(|a, b| {
-            defs.tech(*a)
-                .cost
-                .total_cmp(&defs.tech(*b).cost)
-                .then(a.cmp(b))
+        .filter(|t| {
+            !e.techs[t.idx()]
+                && !e.is_researching(*t)
+                && defs
+                    .tech(*t)
+                    .prerequisites
+                    .iter()
+                    .all(|p| e.techs[p.idx()] || e.is_researching(*p))
         })
+        .min_by(|a, b| value(*a).total_cmp(&value(*b)).then(a.cmp(b)))
 }
 
 /// Phase 5b: publish satisfaction ratios for next tick.

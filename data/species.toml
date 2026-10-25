@@ -1,0 +1,56 @@
+# Species. Every pop belongs to one; a planet can host several. Each species has its own
+# upkeep, food (starvation resource), comfort resource, growth and migration rates.
+
+[import]
+resources = "resources.toml"
+
+[species.human]
+display-name = "Humans"
+
+[species.human.upkeep]
+upkeep-cost = [
+    { resource = "resources.food", count = 0.1 },
+    { resource = "resources.consumer-goods", count = 0.02 },
+]
+starvation-resource = "resources.food"
+comfort-resource = "resources.consumer-goods"
+
+[species.human.growth]
+growth-rate = 0.003
+min-growth = 0.05
+starvation-rate = 0.01
+migration-rate = 0.05
+
+[species.lithoid]
+display-name = "Lithoids"
+description = "Slow-growing silicon life that eats rock instead of food."
+
+[species.lithoid.upkeep]
+upkeep-cost = [
+    { resource = "resources.minerals", count = 0.1 },
+    { resource = "resources.consumer-goods", count = 0.02 },
+]
+starvation-resource = "resources.minerals"
+comfort-resource = "resources.consumer-goods"
+
+[species.lithoid.growth]
+growth-rate = 0.002
+min-growth = 0.03
+starvation-rate = 0.005
+migration-rate = 0.03
+
+[species.hive]
+display-name = "Hive Drones"
+description = "A single mind in many bodies. Content with anything, but hungry."
+
+[species.hive.upkeep]
+upkeep-cost = [
+    { resource = "resources.food", count = 0.12 },
+]
+starvation-resource = "resources.food"
+
+[species.hive.growth]
+growth-rate = 0.004
+min-growth = 0.06
+starvation-rate = 0.015
+migration-rate = 0.08

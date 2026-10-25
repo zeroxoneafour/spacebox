@@ -1,7 +1,10 @@
-//! Serde mirrors of the TOML format. References are still unresolved strings here.
+//! Serde mirrors of the TOML format (see `design/data/`). References are still unresolved
+//! strings here.
 //!
-//! Every struct denies unknown fields so that typos in mods are reported instead of ignored.
-//! Only the current format is accepted: there are no aliases for renamed fields.
+//! Every struct uses kebab-case keys and denies unknown fields, so typos in mods are reported
+//! instead of ignored. Lists that mix kinds of entries (costs with `{ days }`, outputs with
+//! `{ amenities }`) are kept as raw TOML values and interpreted by the loader, which also
+//! splits tables that combine fixed fields with modifier fields.
 
 use serde::Deserialize;
 
@@ -10,6 +13,9 @@ fn one() -> f64 {
 }
 fn yes() -> bool {
     true
+}
+fn half() -> f64 {
+    0.5
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -27,78 +33,201 @@ pub struct RawMult {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawResource {
     pub display_name: String,
     pub description: Option<String>,
-    pub image: Option<String>,
-    #[serde(default = "one")]
-    pub base_value: f64,
+    #[serde(default)]
+    pub transient: bool,
     #[serde(default = "yes")]
     pub tradeable: bool,
-    #[serde(default = "yes")]
-    pub stockpile: bool,
-    pub storage_cap: Option<f64>,
-    /// Produced only while something needs it (e.g. shipbuilding capacity).
-    #[serde(default)]
-    pub on_demand: bool,
+    #[serde(default = "one")]
+    pub base_value: f64,
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawJob {
     pub display_name: String,
     pub description: Option<String>,
     pub appeal: i32,
     #[serde(default)]
-    pub upkeep: Vec<RawAmount>,
+    pub job_tags: Vec<String>,
+    #[serde(default)]
+    pub associated_resource: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawSpeciesUpkeep {
+    #[serde(default)]
+    pub upkeep_cost: Vec<RawAmount>,
+    pub starvation_resource: Option<String>,
+    pub comfort_resource: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawSpeciesGrowth {
+    pub growth_rate: Option<f64>,
+    pub min_growth: Option<f64>,
+    pub starvation_rate: Option<f64>,
+    pub migration_rate: Option<f64>,
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawBuilding {
-    /// Defaults to the building's key.
-    pub display_name: Option<String>,
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawSpecies {
+    pub display_name: String,
     pub description: Option<String>,
-    pub image: Option<String>,
     #[serde(default)]
-    pub max_workers: u32,
+    pub upkeep: RawSpeciesUpkeep,
+    #[serde(default)]
+    pub growth: RawSpeciesGrowth,
+}
+
+/// A `[building.*]` table.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawBuilding {
+    pub display_name: String,
+    pub description: Option<String>,
+    pub max_workers: Option<u32>,
     pub job: Option<String>,
     #[serde(default)]
-    pub building_class: Vec<String>,
-    #[serde(default)]
-    pub upkeep_resources: Vec<RawAmount>,
-    #[serde(default)]
-    pub input_resources: Vec<RawAmount>,
-    #[serde(default)]
-    pub output_resources: Vec<RawAmount>,
+    pub building_tags: Vec<String>,
     #[serde(default)]
     pub housing: f64,
+    /// Resources and `{ days }`.
     #[serde(default)]
-    pub amenities: f64,
-    /// Parsed separately as targeted modifiers.
-    #[serde(default)]
-    pub adjacency_bonus: Vec<toml::Table>,
-    #[serde(default)]
-    pub build_cost: Vec<RawAmount>,
-    #[serde(default)]
-    pub build_days: u32,
+    pub build_cost: Vec<toml::Value>,
+    /// Resources and `{ days }`; absent means removal is free and instant.
+    pub remove_cost: Option<Vec<toml::Value>>,
+    pub max_per_planet: Option<u32>,
+    pub hp: Option<f64>,
     #[serde(default)]
     pub requires_tech: Vec<String>,
-    #[serde(default = "yes")]
-    pub buildable: bool,
-    pub max_per_planet: Option<u32>,
-    /// Damage a building absorbs before it is destroyed (default: the ruleset's building_hp).
-    pub hp: Option<f64>,
-    /// Paid to demolish (or, for natural blockers, clear) the building.
     #[serde(default)]
-    pub remove_cost: Vec<RawAmount>,
+    pub upkeep_cost: Vec<RawAmount>,
+    #[serde(default)]
+    pub inputs: Vec<RawAmount>,
+    /// Resources and `{ amenities }`; scale with workers.
+    #[serde(default)]
+    pub outputs: Vec<toml::Value>,
+    /// Resources and `{ amenities }`; do not scale with workers.
+    #[serde(default)]
+    pub passive_outputs: Vec<toml::Value>,
+    /// `building` or `building-tag` plus modifier fields; parsed by the loader.
+    #[serde(default)]
+    pub adjacency_bonus: Vec<toml::Table>,
+}
+
+/// The fixed fields of a `[building-upgrade.*]` table. The remaining fields are a
+/// [`RawModifier`].
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawUpgradeHead {
+    pub display_name: String,
+    pub description: Option<String>,
+    /// Buildings the upgrade applies to.
+    #[serde(default)]
+    pub buildings: Vec<String>,
+    /// Building tags the upgrade applies to.
+    #[serde(default)]
+    pub building_tags: Vec<String>,
+    #[serde(default)]
+    pub after_upgrades: Vec<String>,
+    #[serde(default)]
+    pub requires_tech: Vec<String>,
+    /// Resources and `{ days }`.
+    #[serde(default)]
+    pub build_cost: Vec<toml::Value>,
+}
+
+pub const UPGRADE_HEAD_KEYS: &[&str] = &[
+    "display-name",
+    "description",
+    "buildings",
+    "building-tags",
+    "after-upgrades",
+    "requires-tech",
+    "build-cost",
+];
+
+/// Modifier fields shared by upgrades, adjacency bonuses and technology building effects.
+/// Additions are applied before multipliers.
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawModifier {
+    #[serde(default)]
+    pub upkeep_cost_add: Vec<RawAmount>,
+    pub upkeep_cost_mult: Option<f64>,
+    #[serde(default)]
+    pub input_add: Vec<RawAmount>,
+    pub input_mult: Option<f64>,
+    /// Resources and `{ amenities }`.
+    #[serde(default)]
+    pub output_add: Vec<toml::Value>,
+    pub output_mult: Option<f64>,
+    /// Resources and `{ amenities }`.
+    #[serde(default)]
+    pub passive_output_add: Vec<toml::Value>,
+    pub passive_output_mult: Option<f64>,
+    pub max_workers_add: Option<f64>,
+    pub max_workers_mult: Option<f64>,
+    pub housing_add: Option<f64>,
+    pub housing_mult: Option<f64>,
+    /// Upgrades only: replaces the building's job.
+    pub job: Option<String>,
+}
+
+/// Ship stat modifiers, shared by outfits and technology `ships` effects.
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawShipMods {
+    pub hull_add: Option<f64>,
+    pub shield_add: Option<f64>,
+    pub shield_regen_add: Option<f64>,
+    pub base_speed_add: Option<f64>,
+    pub hull_mult: Option<f64>,
+    pub shield_mult: Option<f64>,
+    pub shield_regen_mult: Option<f64>,
+    pub base_speed_mult: Option<f64>,
+    pub hyperjump_mult: Option<f64>,
+    pub fire_rate_mult: Option<f64>,
+    pub damage_mult: Option<f64>,
+    pub range_mult: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawTechPop {
+    pub growth_mult: Option<f64>,
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawTech {
+    pub display_name: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub research_resources: Vec<RawAmount>,
+    #[serde(default)]
+    pub research_tags: Vec<String>,
+    #[serde(default)]
+    pub prerequisites: Vec<String>,
+    #[serde(default)]
+    pub pop: RawTechPop,
+    /// Ship stat modifiers plus `fleet-size-add` (split by the loader).
+    pub ships: Option<toml::Table>,
+    /// `field = { value, buildings = [...] }` building modifiers.
+    pub buildings: Option<toml::Table>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawWeapon {
-    pub display_name: Option<String>,
+    pub display_name: String,
     pub description: Option<String>,
     #[serde(default)]
     pub build_cost: Vec<RawAmount>,
@@ -111,46 +240,30 @@ pub struct RawWeapon {
     pub range: f64,
 }
 
+/// The fixed fields of a `[ship-outfit.*]`; the remaining fields are [`RawShipMods`].
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawOutfit {
-    pub display_name: Option<String>,
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawOutfitHead {
+    pub display_name: String,
     pub description: Option<String>,
     #[serde(default)]
     pub build_cost: Vec<RawAmount>,
     #[serde(default)]
     pub upkeep_cost: Vec<RawAmount>,
-    #[serde(default)]
-    pub hull: f64,
-    #[serde(default)]
-    pub shield: f64,
-    #[serde(default)]
-    pub shield_regen: f64,
-    #[serde(default = "one")]
-    pub hull_mult: f64,
-    #[serde(default = "one")]
-    pub shield_mult: f64,
-    #[serde(default = "one")]
-    pub shield_regen_mult: f64,
-    #[serde(default = "one")]
-    pub speed_mult: f64,
-    #[serde(default = "one")]
-    pub hyperjump_mult: f64,
-    #[serde(default = "one")]
-    pub fire_rate_mult: f64,
-    #[serde(default = "one")]
-    pub damage_mult: f64,
-    #[serde(default = "one")]
-    pub range_mult: f64,
 }
 
+pub const OUTFIT_HEAD_KEYS: &[&str] = &["display-name", "description", "build-cost", "upkeep-cost"];
+
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawShip {
-    pub display_name: Option<String>,
+    pub display_name: String,
     pub description: Option<String>,
     #[serde(default)]
-    pub build_cost: Vec<RawAmount>,
+    pub requires_tech: Vec<String>,
+    /// Resources and (optionally) `{ days }`.
+    #[serde(default)]
+    pub build_cost: Vec<toml::Value>,
     #[serde(default)]
     pub upkeep_cost: Vec<RawAmount>,
     pub hull: f64,
@@ -161,124 +274,31 @@ pub struct RawShip {
     pub shield_regen: f64,
     #[serde(default = "one")]
     pub hyperjump_mult: f64,
+    /// Fleet slots the ship takes up.
+    #[serde(default = "one_u32")]
+    pub fleet_size: u32,
     #[serde(default)]
     pub weapons: Vec<String>,
     #[serde(default)]
     pub outfits: Vec<String>,
-    #[serde(default)]
-    pub requires_tech: Vec<String>,
 }
 
-/// The modifier fields shared by upgrades, adjacency bonuses and technology modifiers.
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawModifier {
-    #[serde(default = "one")]
-    pub input_mult: f64,
-    #[serde(default = "one")]
-    pub output_mult: f64,
-    #[serde(default = "one")]
-    pub upkeep_mult: f64,
-    #[serde(default = "one")]
-    pub housing_mult: f64,
-    #[serde(default = "one")]
-    pub amenities_mult: f64,
-    #[serde(default)]
-    pub input_resources: Vec<RawAmount>,
-    #[serde(default)]
-    pub output_resources: Vec<RawAmount>,
-    #[serde(default)]
-    pub upkeep_resources: Vec<RawAmount>,
-    #[serde(default)]
-    pub housing: f64,
-    #[serde(default)]
-    pub amenities: f64,
-}
+// ---------------------------------------------------------------------------------------------
+// Ruleset
+// ---------------------------------------------------------------------------------------------
 
-/// Non-modifier fields of a `[building-upgrade.*]`.
-#[derive(Deserialize, Debug)]
-pub struct RawUpgradeHead {
-    pub display_name: Option<String>,
-    pub description: Option<String>,
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesResources {
     #[serde(default)]
-    pub apply_to: Vec<String>,
+    pub starting_stores: Vec<RawAmount>,
     #[serde(default)]
-    pub needs_upgrades: Vec<String>,
-    #[serde(default)]
-    pub cost: Vec<RawAmount>,
-    #[serde(default)]
-    pub build_days: u32,
-    #[serde(default)]
-    pub requires_tech: Vec<String>,
-}
-
-pub const UPGRADE_HEAD_KEYS: &[&str] = &[
-    "display_name",
-    "description",
-    "apply_to",
-    "needs_upgrades",
-    "cost",
-    "build_days",
-    "requires_tech",
-];
-
-/// Target fields of an adjacency bonus or technology modifier.
-#[derive(Deserialize, Debug)]
-pub struct RawTarget {
-    pub building: Option<String>,
-    pub building_class: Option<String>,
-}
-
-pub const TARGET_KEYS: &[&str] = &["building", "building_class"];
-
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawTech {
-    pub display_name: String,
-    pub description: Option<String>,
-    pub category: Option<String>,
-    pub cost: f64,
-    #[serde(default)]
-    pub prerequisites: Vec<String>,
-    #[serde(default)]
-    pub modifiers: Vec<toml::Table>,
-    #[serde(default = "one")]
-    pub pop_growth_mult: f64,
-    #[serde(default)]
-    pub stability: f64,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawTerraform {
-    pub requires_tech: Option<String>,
-    pub days: u32,
-    #[serde(default)]
-    pub cost: Vec<RawAmount>,
+    pub storage_caps: Vec<RawAmount>,
 }
 
 #[derive(Deserialize, Debug, Default)]
-#[serde(deny_unknown_fields)]
-pub struct RawTerraformRules {
-    pub large: Option<RawTerraform>,
-    pub small: Option<RawTerraform>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawRuleset {
-    #[serde(default)]
-    pub pop_upkeep: Vec<RawAmount>,
-    pub starvation_resource: Option<String>,
-    pub comfort_resource: Option<String>,
-    pub research_resource: Option<String>,
-    pub currency: Option<String>,
-    pub pop_growth_rate: Option<f64>,
-    pub min_pop_growth: Option<f64>,
-    pub starvation_rate: Option<f64>,
-    pub migration_rate: Option<f64>,
-    pub base_housing_large: Option<f64>,
-    pub base_housing_small: Option<f64>,
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesAmenities {
     pub base_amenities: Option<f64>,
     pub amenities_per_pop: Option<f64>,
     pub base_stability: Option<f64>,
@@ -287,30 +307,107 @@ pub struct RawRuleset {
     pub homelessness_stability_penalty: Option<f64>,
     pub comfort_stability_penalty: Option<f64>,
     pub crisis_stability_penalty: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesEconomy {
+    pub currency: Option<String>,
     pub logistics_loss: Option<f64>,
     pub market_fee: Option<f64>,
     pub market_reserve: Option<f64>,
     pub scarcity_appeal: Option<f64>,
     pub scarcity_target_days: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesAi {
     pub ai_interval_days: Option<u32>,
-    #[serde(default)]
-    pub empire_income: Vec<RawAmount>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesTechnology {
+    pub research_speed_mult: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesExpansion {
     pub expansion_resource: Option<String>,
+    pub expansion_resource_income: Option<f64>,
     pub expansion_base_cost: Option<f64>,
     pub expansion_base_days: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesShips {
     pub hyperjump_days: Option<f64>,
     pub combat_subticks: Option<u32>,
     pub arrival_radius: Option<f64>,
     pub ship_repair_rate: Option<f64>,
+    pub base_fleet_size: Option<u32>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesInvasion {
     pub building_hp: Option<f64>,
     pub building_disable_damage: Option<f64>,
     pub building_repair_rate: Option<f64>,
     pub bombardment_amenities_penalty: Option<f64>,
     pub surrender_resistance: Option<f64>,
     pub siege_decay: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesDiplomacy {
     pub truce_days: Option<u64>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawTerraform {
+    pub requires_tech: Option<String>,
+    pub days: u32,
     #[serde(default)]
-    pub terraforming: RawTerraformRules,
+    pub cost: Vec<RawAmount>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesTerraforming {
+    pub large: Option<RawTerraform>,
+    pub small: Option<RawTerraform>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRuleset {
+    pub display_name: String,
+    #[serde(default)]
+    pub resources: RawRulesResources,
+    #[serde(default)]
+    pub amenities: RawRulesAmenities,
+    #[serde(default)]
+    pub economy: RawRulesEconomy,
+    #[serde(default)]
+    pub ai: RawRulesAi,
+    #[serde(default)]
+    pub technology: RawRulesTechnology,
+    #[serde(default)]
+    pub expansion: RawRulesExpansion,
+    #[serde(default)]
+    pub ships: RawRulesShips,
+    #[serde(default)]
+    pub invasion: RawRulesInvasion,
+    #[serde(default)]
+    pub diplomacy: RawRulesDiplomacy,
+    #[serde(default)]
+    pub terraforming: RawRulesTerraforming,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -318,7 +415,7 @@ pub struct RawRuleset {
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Deserialize, Debug, Default)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawGame {
     #[serde(default)]
     pub day: u64,
@@ -328,52 +425,7 @@ pub struct RawGame {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawCrisis {
-    pub resource: String,
-    pub since_day: u64,
-    #[serde(default)]
-    pub severity: f64,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawEmpire {
-    pub display_name: String,
-    #[serde(default)]
-    pub resource_stores: Vec<RawAmount>,
-    pub capital: Option<String>,
-    #[serde(default)]
-    pub technologies: Vec<String>,
-    pub researching: Option<String>,
-    #[serde(default)]
-    pub research_progress: f64,
-    /// `[empire.x.ai]`: present means the empire is AI-run.
-    pub ai: Option<RawAi>,
-    #[serde(default = "yes")]
-    pub accepts_migrants: bool,
-    #[serde(default = "yes")]
-    pub market_access: bool,
-    pub color: Option<String>,
-    #[serde(default)]
-    pub crises: Vec<RawCrisis>,
-    #[serde(default)]
-    pub wars: Vec<RawWar>,
-    #[serde(default)]
-    pub truces: Vec<RawTruce>,
-    #[serde(default)]
-    pub ship_queue: Vec<RawShipOrder>,
-    /// `[empire.x.fleets.y]` tables.
-    #[serde(default)]
-    pub fleets: toml::Table,
-}
-
-fn half() -> f64 {
-    0.5
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawAi {
     #[serde(default = "half")]
     pub militant: f64,
@@ -384,95 +436,144 @@ pub struct RawAi {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawWar {
     pub empire: String,
-    #[serde(default)]
     pub since_day: u64,
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawTruce {
     pub empire: String,
     pub until_day: u64,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy)]
-#[serde(deny_unknown_fields)]
-pub struct RawCoords {
-    pub x: f64,
-    pub y: f64,
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawResearch {
+    pub technology: String,
+    /// Defaults to the full research cost.
+    pub remaining: Option<Vec<toml::Value>>,
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawShipOrder {
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawShipbuilding {
     pub ship: String,
-    /// Shipyard planet as `system/planet`.
+    pub system: String,
     pub planet: String,
-    /// Remaining on-demand resources; defaults to the full amount.
-    pub remaining: Option<Vec<RawAmount>>,
-    /// Fleet (in the same empire) the ship joins when finished.
-    pub fleet: Option<String>,
+    /// Normal resources already spent (refunded if cancelled).
+    #[serde(default)]
+    pub paid: Vec<RawAmount>,
+    /// Defaults to the full build cost.
+    pub remaining: Option<Vec<toml::Value>>,
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawEmpire {
+    pub display_name: String,
+    pub color: Option<String>,
+    pub capital: Option<String>,
+    pub dominant_species: Option<String>,
+    #[serde(default)]
+    pub resource_stores: Vec<RawAmount>,
+    #[serde(default)]
+    pub technologies: Vec<String>,
+    #[serde(default)]
+    pub current_research: Vec<RawResearch>,
+    #[serde(default)]
+    pub current_shipbuilding: Vec<RawShipbuilding>,
+    #[serde(default)]
+    pub policy: RawPolicy,
+    #[serde(default)]
+    pub diplomacy: RawDiplomacy,
+    /// Presence makes the empire AI-run.
+    pub ai: Option<RawAi>,
+    #[serde(default)]
+    pub fleets: toml::Table,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawPolicy {
+    #[serde(default = "yes")]
+    pub accepts_migrants: bool,
+    #[serde(default = "yes")]
+    pub market_access: bool,
+}
+
+impl Default for RawPolicy {
+    fn default() -> Self {
+        RawPolicy {
+            accepts_migrants: true,
+            market_access: true,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawDiplomacy {
+    #[serde(default)]
+    pub wars: Vec<RawWar>,
+    #[serde(default)]
+    pub truces: Vec<RawTruce>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawShipInstance {
     pub ship: String,
     pub hull: Option<f64>,
     pub shield: Option<f64>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawFleetOrder {
-    /// `"idle"`, `"move"` or `"bombard"`.
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub system: Option<String>,
-    pub coordinates: Option<RawCoords>,
-    /// Target of a bombardment, as `system/planet`.
-    pub planet: Option<String>,
-    pub tile: Option<usize>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawFleet {
-    pub display_name: String,
-    #[serde(default)]
-    pub ships: Vec<RawShipInstance>,
-    /// Current system; defaults to the empire's capital.
-    pub system: Option<String>,
-    pub coordinates: Option<RawCoords>,
-    pub order: Option<RawFleetOrder>,
+    pub coords: [f64; 2],
+    /// Hyperdrive charge, 0 to 1.
     #[serde(default)]
     pub jump_charge: f64,
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawFleetOrder {
+    /// `"move"`, `"jump"` or `"bombard"`.
+    pub order: String,
+    pub coords: Option<[f64; 2]>,
+    pub system: Option<String>,
+    pub planet: Option<String>,
+    pub tile: Option<usize>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawFleet {
+    pub display_name: String,
+    pub system: String,
+    #[serde(default)]
+    pub ships: Vec<RawShipInstance>,
+    #[serde(default)]
+    pub orders: Vec<RawFleetOrder>,
+    #[serde(default)]
+    pub in_combat: bool,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawSystem {
     pub display_name: String,
-    #[serde(default = "default_star")]
     pub star_type: String,
-    #[serde(default = "default_star_count")]
+    #[serde(default = "one_u32")]
     pub star_count: u32,
-    pub owned_by: Option<String>,
+    pub owner: Option<String>,
     #[serde(default)]
     pub linked_systems: Vec<String>,
-    /// Position relative to the galaxy centre.
-    pub coordinates: RawCoords,
+    pub coords: [f64; 2],
     #[serde(default)]
     pub planets: toml::Table,
 }
 
-fn default_star() -> String {
-    "yellow".into()
-}
-fn default_star_count() -> u32 {
+fn one_u32() -> u32 {
     1
 }
 
@@ -484,40 +585,43 @@ pub enum RawSize {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct RawPlanet {
-    pub display_name: String,
-    #[serde(default)]
-    pub total_pop: u64,
-    #[serde(default = "default_size")]
-    pub size: RawSize,
-    /// Defaults to true for large planets and false for small ones.
-    pub habitable: Option<bool>,
-    pub moon_of: Option<String>,
-    /// Position relative to the star; generated if missing.
-    pub coordinates: Option<RawCoords>,
-    /// Defaults to the owner of the system.
-    pub owned_by: Option<String>,
-    /// Accumulated bombardment towards surrender.
-    #[serde(default)]
-    pub siege: f64,
-    #[serde(default)]
-    pub growth_progress: f64,
-    pub terraform_days_left: Option<u32>,
-    #[serde(default)]
-    pub tiles: toml::Table,
-}
-
-fn default_size() -> RawSize {
-    RawSize::Large
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawPopulation {
+    pub species: String,
+    pub count: u64,
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawProject {
+    #[serde(default)]
+    pub paid: Vec<RawAmount>,
+    pub remaining: Vec<toml::Value>,
+}
+
+/// A planet table without its `tile-N` entries (split off by the loader).
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawPlanet {
+    pub display_name: String,
+    pub size: RawSize,
+    pub habitable: bool,
+    pub coords: [f64; 2],
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub population: Vec<RawPopulation>,
+    /// Accumulated bombardment towards surrender.
+    #[serde(default)]
+    pub siege: f64,
+    /// Terraforming in progress.
+    pub terraform: Option<RawProject>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawTile {
     #[serde(default)]
     pub resource_multipliers: Vec<RawMult>,
-    /// Whether the tile is covered by water.
     #[serde(default)]
     pub water: bool,
     /// Either a bare building reference or a [`RawTileBuilding`] table.
@@ -526,9 +630,8 @@ pub struct RawTile {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawTileBuilding {
-    #[serde(rename = "type")]
     pub building: String,
     #[serde(default)]
     pub upgrades: Vec<String>,
@@ -545,14 +648,17 @@ pub struct RawTileBuilding {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawConstruction {
     pub building: Option<String>,
     pub upgrade: Option<String>,
-    pub days_left: u32,
-    /// Empire building it (defaults to the planet's owner).
-    pub empire: Option<String>,
-    /// What was paid, refunded if the site is cancelled by a rival claim.
+    /// Removing the tile's building (e.g. clearing a blocker).
+    #[serde(default)]
+    pub remove: bool,
+    /// Normal resources already spent (refunded if cancelled).
     #[serde(default)]
     pub paid: Vec<RawAmount>,
+    pub remaining: Vec<toml::Value>,
+    /// Who is building, when it is not the planet's owner.
+    pub empire: Option<String>,
 }

@@ -1,762 +1,592 @@
-# Buildings and building upgrades.
+# Buildings, building upgrades and natural blockers.
 #
-# Inputs and outputs are daily at full employment and scale linearly with workers/max_workers.
-# Upkeep is daily and does not scale with workers. Buildings with the "barren" class can be
-# built on barren planets; they must have max_workers = 0 (they run themselves).
+# Inputs and outputs are daily at full employment and scale with workers / max-workers;
+# buildings without max-workers always run at 100%. Upkeep and passive-outputs do not scale.
+# Outputs may include amenities ({ amenities = N }). Build and remove costs are lists of
+# resources plus { days = N }.
 #
-# Extra fields beyond the design document:
-#   amenities      - amenities provided (scales with workers for staffed buildings)
-#   build_cost     - paid from empire storage when construction starts
-#   build_days     - construction time
-#   requires_tech  - technologies the owner must know
-#   buildable      - false for scenario-only buildings
-#   max_per_planet - limit per planet
-#   hp             - bombardment damage absorbed before destruction (default: ruleset)
+# Reserved tags: barren, blocker, water, land, space. Buildings get "land" implicitly unless
+# they have "water" or "space". "barren" buildings can also go on barren planets. Blockers
+# generate naturally (barren ones on barren worlds, water ones on water tiles, otherwise on
+# habitable land) and are cleared by paying their remove-cost.
 #
-# Buildings that output an on-demand resource (shipbuilding) only staff and run while their
-# owner has ships queued.
-#
-# Terrain classes: "land" buildings need a tile without water and "water" buildings need a
-# water tile; buildings with neither may stand on either. Natural "blocker"s are generated
-# with the planet (a third of habitable worlds, nearly all of barren ones) and are never
-# built; clearing one costs its `remove_cost`.
-#
-# Adjacency bonuses apply once per adjacent matching building (they stack). Use
-# `building = "..."` (a building, or a class if no building has that name) or
-# `building_class = "..."`.
+# Upgrades are [building-upgrade.*] tables applying to `buildings` and/or `building-tags`.
+# They add (`x-add`) and then multiply (`x-mult`) upkeep-cost, inputs, outputs,
+# passive-outputs, max-workers and housing. Adjacency bonuses name their neighbours the same
+# way. Tags belong to this file; other files refer to them as `alias.tag`.
 
 [import]
 resources = "resources.toml"
 jobs = "jobs.toml"
 technologies = "technologies.toml"
 
-# =============================================================================================
-# Administration and housing
-# =============================================================================================
-
 [building.capital-complex]
-display_name = "Capital Complex"
+display-name = "Capital Complex"
 description = "Seat of planetary government. Self-sufficient enough to bootstrap a colony."
-max_workers = 50
+max-workers = 50
 job = "jobs.bureaucrat"
-building_class = ["capital", "administration", "land"]
+building-tags = ["capital", "administration"]
 housing = 300
-amenities = 50
-buildable = false
-max_per_planet = 1
+build-cost = [{ resource = "resources.minerals", count = 2000 }, { resource = "resources.alloy", count = 500 }, { days = 720 }]
+max-per-planet = 1
 hp = 4000
-output_resources = [
+outputs = [
     { resource = "resources.energy", count = 20 },
     { resource = "resources.minerals", count = 10 },
     { resource = "resources.food", count = 10 },
     { resource = "resources.research", count = 5 },
+    { amenities = 50 },
 ]
 
 [building.housing]
-display_name = "Basic Housing"
+display-name = "Basic Housing"
+building-tags = ["housing"]
 housing = 500
-building_class = ["housing", "land"]
-build_cost = [{ resource = "resources.minerals", count = 150 }]
-build_days = 90
-upkeep_resources = [
-    { resource = "resources.energy", count = 1 }
+build-cost = [{ resource = "resources.minerals", count = 150 }, { days = 90 }]
+upkeep-cost = [
+    { resource = "resources.energy", count = 1 },
 ]
-adjacency_bonus = [
-    { building_class = "amenities", housing_mult = 1.1 },
+adjacency-bonus = [
+    { building-tags = ["amenities"], housing-mult = 1.1 },
 ]
 
 [building.arcology]
-display_name = "Arcology"
+display-name = "Arcology"
 description = "A city in a single tower."
+building-tags = ["housing"]
 housing = 2000
-amenities = 50
-building_class = ["housing", "land"]
-requires_tech = ["technologies.arcology-project"]
-build_cost = [
-    { resource = "resources.minerals", count = 500 },
-    { resource = "resources.alloy", count = 200 },
-    { resource = "resources.rare-crystals", count = 20 },
-]
-build_days = 360
-upkeep_resources = [
+build-cost = [{ resource = "resources.minerals", count = 500 }, { resource = "resources.alloy", count = 200 }, { resource = "resources.rare-crystals", count = 20 }, { days = 360 }]
+requires-tech = ["technologies.arcology-project"]
+upkeep-cost = [
     { resource = "resources.energy", count = 6 },
     { resource = "resources.rare-crystals", count = 0.5 },
 ]
+passive-outputs = [ { amenities = 50 } ]
 
 [building.administrative-office]
-display_name = "Administrative Office"
-max_workers = 50
+display-name = "Administrative Office"
+max-workers = 50
 job = "jobs.clerk"
-building_class = ["amenities", "administration", "land"]
-amenities = 40
-build_cost = [{ resource = "resources.minerals", count = 150 }]
-build_days = 90
-upkeep_resources = [
-    { resource = "resources.energy", count = 1 }
+building-tags = ["amenities", "administration"]
+build-cost = [{ resource = "resources.minerals", count = 150 }, { days = 90 }]
+upkeep-cost = [
+    { resource = "resources.energy", count = 1 },
 ]
-adjacency_bonus = [
-    { building = "capital-complex", amenities_mult = 1.25 },
+outputs = [
+    { amenities = 40 },
+]
+adjacency-bonus = [
+    { buildings = ["capital-complex"], output-mult = 1.25 },
 ]
 
 [building.holo-theatre]
-display_name = "Holo-Theatre"
-max_workers = 50
+display-name = "Holo-Theatre"
+max-workers = 50
 job = "jobs.entertainer"
-building_class = ["amenities", "land"]
-amenities = 80
-requires_tech = ["technologies.holographic-entertainment"]
-build_cost = [
-    { resource = "resources.minerals", count = 100 },
-    { resource = "resources.alloy", count = 50 },
-]
-build_days = 120
-upkeep_resources = [
+building-tags = ["amenities"]
+build-cost = [{ resource = "resources.minerals", count = 100 }, { resource = "resources.alloy", count = 50 }, { days = 120 }]
+requires-tech = ["technologies.holographic-entertainment"]
+upkeep-cost = [
     { resource = "resources.energy", count = 2 },
     { resource = "resources.consumer-goods", count = 1 },
 ]
-
-# =============================================================================================
-# Basic production (habitable planets)
-# =============================================================================================
+outputs = [
+    { amenities = 80 },
+]
 
 [building.farm]
-display_name = "Agricultural Complex"
-max_workers = 100
+display-name = "Agricultural Complex"
+max-workers = 100
 job = "jobs.farmer"
-building_class = ["agriculture", "land"]
-build_cost = [{ resource = "resources.minerals", count = 100 }]
-build_days = 60
-upkeep_resources = [
-    { resource = "resources.energy", count = 1 }
+building-tags = ["agriculture"]
+build-cost = [{ resource = "resources.minerals", count = 100 }, { days = 60 }]
+upkeep-cost = [
+    { resource = "resources.energy", count = 1 },
 ]
-output_resources = [
-    { resource = "resources.food", count = 30 }
+outputs = [
+    { resource = "resources.food", count = 30 },
 ]
-adjacency_bonus = [
-    { building = "farm", output_mult = 1.05 },
+adjacency-bonus = [
+    { buildings = ["farm"], output-mult = 1.05 },
 ]
 
 [building.hydroponic-farm]
-display_name = "Hydroponic Farm"
+display-name = "Hydroponic Farm"
 description = "Compact, power-hungry food production."
-max_workers = 50
+max-workers = 50
 job = "jobs.farmer"
-building_class = ["agriculture", "land"]
-requires_tech = ["technologies.hydroponics"]
-build_cost = [{ resource = "resources.minerals", count = 150 }]
-build_days = 60
-upkeep_resources = [
-    { resource = "resources.energy", count = 4 }
+building-tags = ["agriculture"]
+build-cost = [{ resource = "resources.minerals", count = 150 }, { days = 60 }]
+requires-tech = ["technologies.hydroponics"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 4 },
 ]
-output_resources = [
-    { resource = "resources.food", count = 25 }
+outputs = [
+    { resource = "resources.food", count = 25 },
 ]
 
 [building.power-plant]
-display_name = "Power Plant"
-max_workers = 100
+display-name = "Power Plant"
+max-workers = 100
 job = "jobs.technician"
-building_class = ["power", "land"]
-build_cost = [{ resource = "resources.minerals", count = 100 }]
-build_days = 60
-output_resources = [
-    { resource = "resources.energy", count = 40 }
+building-tags = ["power"]
+build-cost = [{ resource = "resources.minerals", count = 100 }, { days = 60 }]
+outputs = [
+    { resource = "resources.energy", count = 40 },
 ]
-adjacency_bonus = [
-    { building = "power-plant", output_mult = 1.03 },
+adjacency-bonus = [
+    { buildings = ["power-plant"], output-mult = 1.03 },
 ]
 
 [building.fusion-reactor]
-display_name = "Fusion Reactor"
-max_workers = 100
+display-name = "Fusion Reactor"
+max-workers = 100
 job = "jobs.technician"
-building_class = ["power", "land"]
-requires_tech = ["technologies.fusion-power"]
-build_cost = [
-    { resource = "resources.minerals", count = 300 },
-    { resource = "resources.alloy", count = 100 },
+building-tags = ["power"]
+build-cost = [{ resource = "resources.minerals", count = 300 }, { resource = "resources.alloy", count = 100 }, { days = 180 }]
+requires-tech = ["technologies.fusion-power"]
+upkeep-cost = [
+    { resource = "resources.exotic-gases", count = 0.5 },
 ]
-build_days = 180
-upkeep_resources = [
-    { resource = "resources.exotic-gases", count = 0.5 }
-]
-output_resources = [
-    { resource = "resources.energy", count = 90 }
+outputs = [
+    { resource = "resources.energy", count = 90 },
 ]
 
 [building.mine]
-display_name = "Mine"
-max_workers = 100
+display-name = "Mine"
+max-workers = 100
 job = "jobs.miner"
-building_class = ["mining", "land"]
-build_cost = [{ resource = "resources.minerals", count = 100 }]
-build_days = 60
-upkeep_resources = [
-    { resource = "resources.energy", count = 1 }
+building-tags = ["mining"]
+build-cost = [{ resource = "resources.minerals", count = 100 }, { days = 60 }]
+upkeep-cost = [
+    { resource = "resources.energy", count = 1 },
 ]
-output_resources = [
-    { resource = "resources.minerals", count = 30 }
+outputs = [
+    { resource = "resources.minerals", count = 30 },
 ]
-adjacency_bonus = [
-    { building = "mine", output_mult = 1.05 },
+adjacency-bonus = [
+    { buildings = ["mine"], output-mult = 1.05 },
 ]
-
-# =============================================================================================
-# Industry
-# =============================================================================================
 
 [building.alloy-forge]
-display_name = "Alloy Forge"
-max_workers = 100
+display-name = "Alloy Forge"
+max-workers = 100
 job = "jobs.metallurgist"
-building_class = ["forge", "land"]
-build_cost = [{ resource = "resources.minerals", count = 200 }]
-build_days = 120
-
-upkeep_resources = [
-    { resource = "resources.energy", count = 5 }
+building-tags = ["forge"]
+build-cost = [{ resource = "resources.minerals", count = 200 }, { days = 120 }]
+upkeep-cost = [
+    { resource = "resources.energy", count = 5 },
 ]
-input_resources = [
-    { resource = "resources.minerals", count = 20 }
+inputs = [
+    { resource = "resources.minerals", count = 20 },
 ]
-output_resources = [
-    { resource = "resources.alloy", count = 6 }
+outputs = [
+    { resource = "resources.alloy", count = 6 },
 ]
-
-adjacency_bonus = [
-    { building = "mine", input_mult = 0.95 },
-    { building = "power-plant", upkeep_mult = 0.9 },
+adjacency-bonus = [
+    { buildings = ["mine"], input-mult = 0.95 },
+    { buildings = ["power-plant"], upkeep-cost-mult = 0.9 },
 ]
 
 [building.civilian-factory]
-display_name = "Civilian Factory"
-max_workers = 100
+display-name = "Civilian Factory"
+max-workers = 100
 job = "jobs.artisan"
-building_class = ["factory", "land"]
-build_cost = [{ resource = "resources.minerals", count = 200 }]
-build_days = 120
-upkeep_resources = [
-    { resource = "resources.energy", count = 2 }
+building-tags = ["factory"]
+build-cost = [{ resource = "resources.minerals", count = 200 }, { days = 120 }]
+upkeep-cost = [
+    { resource = "resources.energy", count = 2 },
 ]
-input_resources = [
-    { resource = "resources.minerals", count = 20 }
+inputs = [
+    { resource = "resources.minerals", count = 20 },
 ]
-output_resources = [
-    { resource = "resources.consumer-goods", count = 20 }
+outputs = [
+    { resource = "resources.consumer-goods", count = 20 },
 ]
-adjacency_bonus = [
-    { building = "alloy-forge", output_mult = 1.05 },
+adjacency-bonus = [
+    { buildings = ["alloy-forge"], output-mult = 1.05 },
 ]
 
 [building.chemical-plant]
-display_name = "Chemical Plant"
-max_workers = 50
+display-name = "Chemical Plant"
+max-workers = 50
 job = "jobs.chemist"
-building_class = ["refinery", "land"]
-requires_tech = ["technologies.material-synthesis"]
-build_cost = [
-    { resource = "resources.minerals", count = 250 },
-    { resource = "resources.alloy", count = 50 },
+building-tags = ["refinery"]
+build-cost = [{ resource = "resources.minerals", count = 250 }, { resource = "resources.alloy", count = 50 }, { days = 150 }]
+requires-tech = ["technologies.material-synthesis"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 3 },
 ]
-build_days = 150
-upkeep_resources = [
-    { resource = "resources.energy", count = 3 }
+inputs = [
+    { resource = "resources.minerals", count = 15 },
 ]
-input_resources = [
-    { resource = "resources.minerals", count = 15 }
-]
-output_resources = [
-    { resource = "resources.volatile-motes", count = 2 }
+outputs = [
+    { resource = "resources.volatile-motes", count = 2 },
 ]
 
 [building.gas-refinery]
-display_name = "Exotic Gas Refinery"
-max_workers = 50
+display-name = "Exotic Gas Refinery"
+max-workers = 50
 job = "jobs.gas-refiner"
-building_class = ["refinery", "land"]
-requires_tech = ["technologies.material-synthesis"]
-build_cost = [
-    { resource = "resources.minerals", count = 250 },
-    { resource = "resources.alloy", count = 50 },
+building-tags = ["refinery"]
+build-cost = [{ resource = "resources.minerals", count = 250 }, { resource = "resources.alloy", count = 50 }, { days = 150 }]
+requires-tech = ["technologies.material-synthesis"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 3 },
 ]
-build_days = 150
-upkeep_resources = [
-    { resource = "resources.energy", count = 3 }
+inputs = [
+    { resource = "resources.minerals", count = 15 },
 ]
-input_resources = [
-    { resource = "resources.minerals", count = 15 }
-]
-output_resources = [
-    { resource = "resources.exotic-gases", count = 2 }
+outputs = [
+    { resource = "resources.exotic-gases", count = 2 },
 ]
 
 [building.crystal-plant]
-display_name = "Synthetic Crystal Plant"
-max_workers = 50
+display-name = "Synthetic Crystal Plant"
+max-workers = 50
 job = "jobs.crystal-cutter"
-building_class = ["refinery", "land"]
-requires_tech = ["technologies.material-synthesis"]
-build_cost = [
-    { resource = "resources.minerals", count = 250 },
-    { resource = "resources.alloy", count = 50 },
+building-tags = ["refinery"]
+build-cost = [{ resource = "resources.minerals", count = 250 }, { resource = "resources.alloy", count = 50 }, { days = 150 }]
+requires-tech = ["technologies.material-synthesis"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 3 },
 ]
-build_days = 150
-upkeep_resources = [
-    { resource = "resources.energy", count = 3 }
+inputs = [
+    { resource = "resources.minerals", count = 15 },
 ]
-input_resources = [
-    { resource = "resources.minerals", count = 15 }
+outputs = [
+    { resource = "resources.rare-crystals", count = 2 },
 ]
-output_resources = [
-    { resource = "resources.rare-crystals", count = 2 }
-]
-
-# =============================================================================================
-# Research
-# =============================================================================================
 
 [building.research-lab]
-display_name = "Research Lab"
-max_workers = 50
+display-name = "Research Lab"
+max-workers = 50
 job = "jobs.researcher"
-building_class = ["research", "land"]
-build_cost = [
-    { resource = "resources.minerals", count = 150 },
-    { resource = "resources.alloy", count = 30 },
+building-tags = ["research"]
+build-cost = [{ resource = "resources.minerals", count = 150 }, { resource = "resources.alloy", count = 30 }, { days = 120 }]
+upkeep-cost = [
+    { resource = "resources.energy", count = 2 },
 ]
-build_days = 120
-upkeep_resources = [
-    { resource = "resources.energy", count = 2 }
+inputs = [
+    { resource = "resources.consumer-goods", count = 2 },
 ]
-input_resources = [
-    { resource = "resources.consumer-goods", count = 2 }
+outputs = [
+    { resource = "resources.research", count = 15 },
 ]
-output_resources = [
-    { resource = "resources.research", count = 15 }
+adjacency-bonus = [
+    { buildings = ["research-lab"], output-mult = 1.05 },
 ]
-adjacency_bonus = [
-    { building = "research-lab", output_mult = 1.05 },
-]
-
-# =============================================================================================
-# Barren-world installations (automated, no workers)
-# =============================================================================================
 
 [building.mining-outpost]
-display_name = "Mining Outpost"
-building_class = ["barren", "barren-mining"]
-build_cost = [{ resource = "resources.minerals", count = 150 }]
-build_days = 90
-upkeep_resources = [
-    { resource = "resources.energy", count = 2 }
+display-name = "Mining Outpost"
+building-tags = ["barren", "barren-mining"]
+build-cost = [{ resource = "resources.minerals", count = 150 }, { days = 90 }]
+upkeep-cost = [
+    { resource = "resources.energy", count = 2 },
 ]
-output_resources = [
-    { resource = "resources.minerals", count = 10 }
+outputs = [
+    { resource = "resources.minerals", count = 10 },
 ]
 
 [building.solar-array]
-display_name = "Solar Array"
-building_class = ["barren", "barren-power"]
-build_cost = [{ resource = "resources.minerals", count = 100 }]
-build_days = 60
-upkeep_resources = [
-    { resource = "resources.minerals", count = 1 }
+display-name = "Solar Array"
+building-tags = ["barren", "barren-power"]
+build-cost = [{ resource = "resources.minerals", count = 100 }, { days = 60 }]
+upkeep-cost = [
+    { resource = "resources.minerals", count = 1 },
 ]
-output_resources = [
-    { resource = "resources.energy", count = 12 }
+outputs = [
+    { resource = "resources.energy", count = 12 },
 ]
-adjacency_bonus = [
-    { building = "solar-array", output_mult = 1.05 },
+adjacency-bonus = [
+    { buildings = ["solar-array"], output-mult = 1.05 },
 ]
 
 [building.automated-mine]
-display_name = "Automated Mine"
-building_class = ["barren", "barren-mining"]
-requires_tech = ["technologies.automated-mining"]
-build_cost = [
-    { resource = "resources.minerals", count = 150 },
-    { resource = "resources.alloy", count = 40 },
+display-name = "Automated Mine"
+building-tags = ["barren", "barren-mining"]
+build-cost = [{ resource = "resources.minerals", count = 150 }, { resource = "resources.alloy", count = 40 }, { days = 120 }]
+requires-tech = ["technologies.automated-mining"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 4 },
 ]
-build_days = 120
-upkeep_resources = [
-    { resource = "resources.energy", count = 4 }
-]
-output_resources = [
-    { resource = "resources.minerals", count = 25 }
+outputs = [
+    { resource = "resources.minerals", count = 25 },
 ]
 
 [building.hydroponics-dome]
-display_name = "Hydroponics Dome"
-building_class = ["barren", "agriculture"]
-requires_tech = ["technologies.hydroponics"]
-build_cost = [
-    { resource = "resources.minerals", count = 200 },
-    { resource = "resources.alloy", count = 20 },
+display-name = "Hydroponics Dome"
+building-tags = ["barren", "agriculture"]
+build-cost = [{ resource = "resources.minerals", count = 200 }, { resource = "resources.alloy", count = 20 }, { days = 120 }]
+requires-tech = ["technologies.hydroponics"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 5 },
 ]
-build_days = 120
-upkeep_resources = [
-    { resource = "resources.energy", count = 5 }
-]
-output_resources = [
-    { resource = "resources.food", count = 8 }
+outputs = [
+    { resource = "resources.food", count = 8 },
 ]
 
 [building.volatile-extractor]
-display_name = "Volatile Extractor"
-building_class = ["barren", "strategic"]
-requires_tech = ["technologies.xeno-geology"]
-build_cost = [
-    { resource = "resources.minerals", count = 200 },
-    { resource = "resources.alloy", count = 50 },
+display-name = "Volatile Extractor"
+building-tags = ["barren", "strategic"]
+build-cost = [{ resource = "resources.minerals", count = 200 }, { resource = "resources.alloy", count = 50 }, { days = 150 }]
+requires-tech = ["technologies.xeno-geology"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 4 },
 ]
-build_days = 150
-upkeep_resources = [
-    { resource = "resources.energy", count = 4 }
-]
-output_resources = [
-    { resource = "resources.volatile-motes", count = 1.5 }
+outputs = [
+    { resource = "resources.volatile-motes", count = 1.5 },
 ]
 
 [building.gas-siphon]
-display_name = "Gas Siphon"
-building_class = ["barren", "strategic"]
-requires_tech = ["technologies.xeno-geology"]
-build_cost = [
-    { resource = "resources.minerals", count = 200 },
-    { resource = "resources.alloy", count = 50 },
+display-name = "Gas Siphon"
+building-tags = ["barren", "strategic"]
+build-cost = [{ resource = "resources.minerals", count = 200 }, { resource = "resources.alloy", count = 50 }, { days = 150 }]
+requires-tech = ["technologies.xeno-geology"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 4 },
 ]
-build_days = 150
-upkeep_resources = [
-    { resource = "resources.energy", count = 4 }
-]
-output_resources = [
-    { resource = "resources.exotic-gases", count = 1.5 }
+outputs = [
+    { resource = "resources.exotic-gases", count = 1.5 },
 ]
 
 [building.crystal-harvester]
-display_name = "Crystal Harvester"
-building_class = ["barren", "strategic"]
-requires_tech = ["technologies.xeno-geology"]
-build_cost = [
-    { resource = "resources.minerals", count = 200 },
-    { resource = "resources.alloy", count = 50 },
+display-name = "Crystal Harvester"
+building-tags = ["barren", "strategic"]
+build-cost = [{ resource = "resources.minerals", count = 200 }, { resource = "resources.alloy", count = 50 }, { days = 150 }]
+requires-tech = ["technologies.xeno-geology"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 4 },
 ]
-build_days = 150
-upkeep_resources = [
-    { resource = "resources.energy", count = 4 }
-]
-output_resources = [
-    { resource = "resources.rare-crystals", count = 1.5 }
+outputs = [
+    { resource = "resources.rare-crystals", count = 1.5 },
 ]
 
 [building.deep-space-observatory]
-display_name = "Deep Space Observatory"
-building_class = ["barren", "research"]
-requires_tech = ["technologies.quantum-computing"]
-build_cost = [
-    { resource = "resources.minerals", count = 250 },
-    { resource = "resources.alloy", count = 80 },
+display-name = "Deep Space Observatory"
+building-tags = ["barren", "research"]
+build-cost = [{ resource = "resources.minerals", count = 250 }, { resource = "resources.alloy", count = 80 }, { days = 180 }]
+requires-tech = ["technologies.quantum-computing"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 6 },
 ]
-build_days = 180
-upkeep_resources = [
-    { resource = "resources.energy", count = 6 }
+outputs = [
+    { resource = "resources.research", count = 8 },
 ]
-output_resources = [
-    { resource = "resources.research", count = 8 }
-]
-
-# =============================================================================================
-# Water buildings
-# =============================================================================================
 
 [building.aquaculture-farm]
-display_name = "Aquaculture Farm"
+display-name = "Aquaculture Farm"
 description = "Kelp beds and fish pens in sheltered shallows."
-max_workers = 80
+max-workers = 80
 job = "jobs.farmer"
-building_class = ["agriculture", "water"]
-build_cost = [{ resource = "resources.minerals", count = 120 }]
-build_days = 60
-upkeep_resources = [
-    { resource = "resources.energy", count = 1 }
+building-tags = ["agriculture", "water"]
+build-cost = [{ resource = "resources.minerals", count = 120 }, { days = 60 }]
+upkeep-cost = [
+    { resource = "resources.energy", count = 1 },
 ]
-output_resources = [
-    { resource = "resources.food", count = 28 }
+outputs = [
+    { resource = "resources.food", count = 28 },
 ]
-adjacency_bonus = [
-    { building = "aquaculture-farm", output_mult = 1.05 },
-    { building = "kelp-forest", output_mult = 1.1 },
+adjacency-bonus = [
+    { buildings = ["aquaculture-farm"], output-mult = 1.05 },
+    { buildings = ["kelp-forest"], output-mult = 1.1 },
 ]
 
 [building.tidal-generator]
-display_name = "Tidal Generator"
-max_workers = 50
+display-name = "Tidal Generator"
+max-workers = 50
 job = "jobs.technician"
-building_class = ["power", "water"]
-build_cost = [{ resource = "resources.minerals", count = 150 }]
-build_days = 90
-output_resources = [
-    { resource = "resources.energy", count = 30 }
+building-tags = ["power", "water"]
+build-cost = [{ resource = "resources.minerals", count = 150 }, { days = 90 }]
+outputs = [
+    { resource = "resources.energy", count = 30 },
 ]
 
 [building.floating-city]
-display_name = "Floating City"
+display-name = "Floating City"
 description = "Buoyant districts anchored over the open sea."
+building-tags = ["housing", "water"]
 housing = 400
-amenities = 10
-building_class = ["housing", "water"]
-requires_tech = ["technologies.social-engineering"]
-build_cost = [
-    { resource = "resources.minerals", count = 300 },
-    { resource = "resources.alloy", count = 50 },
+build-cost = [{ resource = "resources.minerals", count = 300 }, { resource = "resources.alloy", count = 50 }, { days = 150 }]
+requires-tech = ["technologies.social-engineering"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 3 },
 ]
-build_days = 150
-upkeep_resources = [
-    { resource = "resources.energy", count = 3 }
-]
-
-# =============================================================================================
-# Natural blockers
-# =============================================================================================
-# Generated with planets, never built. The class decides where they appear: "barren" on
-# barren worlds, "water" on water tiles, otherwise on land.
+passive-outputs = [ { amenities = 10 } ]
 
 [building.wetlands]
-display_name = "Wetlands"
-building_class = [ "blocker" ]
-remove_cost = [
-    { resource = "resources.energy", count = 1000 }
-]
+display-name = "Wetlands"
+building-tags = ["blocker"]
+remove-cost = [{ resource = "resources.energy", count = 1000 }, { days = 150 }]
 
 [building.dense-jungle]
-display_name = "Dense Jungle"
-building_class = ["blocker"]
-remove_cost = [
-    { resource = "resources.energy", count = 400 },
-    { resource = "resources.minerals", count = 200 },
-]
+display-name = "Dense Jungle"
+building-tags = ["blocker"]
+remove-cost = [{ resource = "resources.energy", count = 400 }, { resource = "resources.minerals", count = 200 }, { days = 90 }]
 
 [building.mountain-range]
-display_name = "Mountain Range"
-building_class = ["blocker"]
-remove_cost = [
-    { resource = "resources.energy", count = 800 },
-    { resource = "resources.minerals", count = 400 },
-]
+display-name = "Mountain Range"
+building-tags = ["blocker"]
+remove-cost = [{ resource = "resources.energy", count = 800 }, { resource = "resources.minerals", count = 400 }, { days = 180 }]
 
 [building.ancient-ruins]
-display_name = "Ancient Ruins"
+display-name = "Ancient Ruins"
 description = "Overgrown remains of a forgotten people. Locals find them inspiring."
-building_class = ["blocker"]
-amenities = 10
-remove_cost = [
-    { resource = "resources.energy", count = 300 },
-    { resource = "resources.influence", count = 50 },
-]
+building-tags = ["blocker"]
+remove-cost = [{ resource = "resources.energy", count = 300 }, { resource = "resources.influence", count = 50 }, { days = 60 }]
+passive-outputs = [ { amenities = 10 } ]
 
 [building.coral-reef]
-display_name = "Coral Reef"
-building_class = ["blocker", "water"]
-remove_cost = [
-    { resource = "resources.energy", count = 600 }
-]
+display-name = "Coral Reef"
+building-tags = ["blocker", "water"]
+remove-cost = [{ resource = "resources.energy", count = 600 }, { days = 120 }]
 
 [building.kelp-forest]
-display_name = "Kelp Forest"
-building_class = ["blocker", "water"]
-remove_cost = [
-    { resource = "resources.energy", count = 300 }
-]
+display-name = "Kelp Forest"
+building-tags = ["blocker", "water"]
+remove-cost = [{ resource = "resources.energy", count = 300 }, { days = 60 }]
 
 [building.deep-trench]
-display_name = "Deep Trench"
-building_class = ["blocker", "water"]
-remove_cost = [
-    { resource = "resources.energy", count = 1200 },
-    { resource = "resources.alloy", count = 50 },
-]
+display-name = "Deep Trench"
+building-tags = ["blocker", "water"]
+remove-cost = [{ resource = "resources.energy", count = 1200 }, { resource = "resources.alloy", count = 50 }, { days = 180 }]
 
 [building.crater-field]
-display_name = "Crater Field"
-building_class = ["blocker", "barren"]
-remove_cost = [
-    { resource = "resources.energy", count = 200 },
-    { resource = "resources.minerals", count = 100 },
-]
+display-name = "Crater Field"
+building-tags = ["blocker", "barren"]
+remove-cost = [{ resource = "resources.energy", count = 200 }, { resource = "resources.minerals", count = 100 }, { days = 60 }]
 
 [building.lava-flows]
-display_name = "Lava Flows"
-building_class = ["blocker", "barren"]
-remove_cost = [
-    { resource = "resources.energy", count = 500 }
-]
+display-name = "Lava Flows"
+building-tags = ["blocker", "barren"]
+remove-cost = [{ resource = "resources.energy", count = 500 }, { days = 120 }]
 
 [building.ice-sheet]
-display_name = "Ice Sheet"
-building_class = ["blocker", "barren"]
-remove_cost = [
-    { resource = "resources.energy", count = 300 }
-]
+display-name = "Ice Sheet"
+building-tags = ["blocker", "barren"]
+remove-cost = [{ resource = "resources.energy", count = 300 }, { days = 90 }]
 
 [building.jagged-canyons]
-display_name = "Jagged Canyons"
-building_class = ["blocker", "barren"]
-remove_cost = [
-    { resource = "resources.energy", count = 250 },
-    { resource = "resources.minerals", count = 250 },
-]
-
-# =============================================================================================
-# Shipyards
-# =============================================================================================
+display-name = "Jagged Canyons"
+building-tags = ["blocker", "barren"]
+remove-cost = [{ resource = "resources.energy", count = 250 }, { resource = "resources.minerals", count = 250 }, { days = 90 }]
 
 [building.shipyard]
-display_name = "Shipyard"
+display-name = "Shipyard"
 description = "Slipways and assembly halls. Turns labour into shipbuilding while ships are queued."
-max_workers = 60
+max-workers = 60
 job = "jobs.shipwright"
-building_class = ["shipyard", "land"]
-max_per_planet = 1
+building-tags = ["shipyard"]
+build-cost = [{ resource = "resources.minerals", count = 300 }, { resource = "resources.alloy", count = 100 }, { days = 180 }]
+max-per-planet = 1
 hp = 2000
-build_cost = [
-    { resource = "resources.minerals", count = 300 },
-    { resource = "resources.alloy", count = 100 },
+upkeep-cost = [
+    { resource = "resources.energy", count = 3 },
 ]
-build_days = 180
-upkeep_resources = [
-    { resource = "resources.energy", count = 3 }
-]
-output_resources = [
-    { resource = "resources.shipbuilding", count = 30 }
+outputs = [
+    { resource = "resources.shipbuilding", count = 30 },
 ]
 
 [building.orbital-drydock]
-display_name = "Orbital Drydock"
+display-name = "Orbital Drydock"
 description = "An automated drydock in orbit of a lifeless world."
-building_class = ["barren", "shipyard"]
-requires_tech = ["technologies.orbital-drydocks"]
-max_per_planet = 1
-build_cost = [
-    { resource = "resources.minerals", count = 400 },
-    { resource = "resources.alloy", count = 200 },
+building-tags = ["barren", "shipyard"]
+build-cost = [{ resource = "resources.minerals", count = 400 }, { resource = "resources.alloy", count = 200 }, { days = 240 }]
+max-per-planet = 1
+requires-tech = ["technologies.orbital-drydocks"]
+upkeep-cost = [
+    { resource = "resources.energy", count = 6 },
 ]
-build_days = 240
-upkeep_resources = [
-    { resource = "resources.energy", count = 6 }
+outputs = [
+    { resource = "resources.shipbuilding", count = 20 },
 ]
-output_resources = [
-    { resource = "resources.shipbuilding", count = 20 }
-]
-
-# =============================================================================================
-# Upgrades
-# =============================================================================================
 
 [building-upgrade.faster-forge]
-display_name = "High-Throughput Smelters"
-apply_to = [ "alloy-forge" ]
-cost = [{ resource = "resources.minerals", count = 200 }]
-build_days = 60
-upkeep_mult = 1.1
-input_mult = 1.25
-output_mult = 1.25
+display-name = "High-Throughput Smelters"
+buildings = ["alloy-forge"]
+build-cost = [{ resource = "resources.minerals", count = 200 }, { days = 60 }]
+upkeep-cost-mult = 1.1
+input-mult = 1.25
+output-mult = 1.25
 
 [building-upgrade.superconducting-forge]
-display_name = "Superconducting Crucibles"
-apply_to = [ "alloy-forge" ]
-needs_upgrades = [ "faster-forge" ]
-requires_tech = ["technologies.advanced-alloys"]
-cost = [
-    { resource = "resources.alloy", count = 150 },
-    { resource = "resources.volatile-motes", count = 20 },
+display-name = "Superconducting Crucibles"
+buildings = ["alloy-forge"]
+after-upgrades = ["faster-forge"]
+requires-tech = ["technologies.advanced-alloys"]
+build-cost = [{ resource = "resources.alloy", count = 150 }, { resource = "resources.volatile-motes", count = 20 }, { days = 120 }]
+output-mult = 1.3
+input-add = [
+    { resource = "resources.volatile-motes", count = 0.5 },
 ]
-build_days = 120
-output_mult = 1.3
-input_resources = [ { resource = "resources.volatile-motes", count = 0.5 } ]
 
 [building-upgrade.deep-core-drills]
-display_name = "Deep Core Drills"
-apply_to = [ "mining" ]
-requires_tech = ["technologies.improved-mining"]
-cost = [{ resource = "resources.minerals", count = 150 }]
-build_days = 60
-output_mult = 1.25
-upkeep_mult = 1.5
+display-name = "Deep Core Drills"
+building-tags = ["mining"]
+requires-tech = ["technologies.improved-mining"]
+build-cost = [{ resource = "resources.minerals", count = 150 }, { days = 60 }]
+upkeep-cost-mult = 1.5
+output-mult = 1.25
 
 [building-upgrade.drone-swarms]
-display_name = "Drone Swarms"
-apply_to = [ "barren-mining" ]
-requires_tech = ["technologies.automated-mining"]
-cost = [
-    { resource = "resources.minerals", count = 100 },
-    { resource = "resources.alloy", count = 30 },
+display-name = "Drone Swarms"
+building-tags = ["barren-mining"]
+requires-tech = ["technologies.automated-mining"]
+build-cost = [{ resource = "resources.minerals", count = 100 }, { resource = "resources.alloy", count = 30 }, { days = 90 }]
+output-mult = 1.3
+upkeep-cost-add = [
+    { resource = "resources.energy", count = 1 },
 ]
-build_days = 90
-output_mult = 1.3
-upkeep_resources = [ { resource = "resources.energy", count = 1 } ]
 
 [building-upgrade.irrigation-network]
-display_name = "Irrigation Network"
-apply_to = [ "farm" ]
-cost = [{ resource = "resources.minerals", count = 100 }]
-build_days = 60
-output_mult = 1.15
+display-name = "Irrigation Network"
+buildings = ["farm"]
+build-cost = [{ resource = "resources.minerals", count = 100 }, { days = 60 }]
+output-mult = 1.15
 
 [building-upgrade.grid-capacitors]
-display_name = "Grid Capacitors"
-apply_to = [ "power" ]
-cost = [
-    { resource = "resources.minerals", count = 150 },
-    { resource = "resources.alloy", count = 20 },
+display-name = "Grid Capacitors"
+building-tags = ["power"]
+build-cost = [{ resource = "resources.minerals", count = 150 }, { resource = "resources.alloy", count = 20 }, { days = 90 }]
+output-mult = 1.2
+upkeep-cost-add = [
+    { resource = "resources.minerals", count = 1 },
 ]
-build_days = 90
-output_mult = 1.2
-upkeep_resources = [ { resource = "resources.minerals", count = 1 } ]
 
 [building-upgrade.nano-assemblers]
-display_name = "Nano-Assemblers"
-apply_to = [ "civilian-factory" ]
-requires_tech = ["technologies.nano-fabrication"]
-cost = [
-    { resource = "resources.alloy", count = 100 },
-    { resource = "resources.rare-crystals", count = 20 },
+display-name = "Nano-Assemblers"
+buildings = ["civilian-factory"]
+requires-tech = ["technologies.nano-fabrication"]
+build-cost = [{ resource = "resources.alloy", count = 100 }, { resource = "resources.rare-crystals", count = 20 }, { days = 120 }]
+input-mult = 0.9
+output-mult = 1.25
+input-add = [
+    { resource = "resources.rare-crystals", count = 0.3 },
 ]
-build_days = 120
-input_mult = 0.9
-output_mult = 1.25
-input_resources = [ { resource = "resources.rare-crystals", count = 0.3 } ]
 
 [building-upgrade.supercomputer-cluster]
-display_name = "Supercomputer Cluster"
-apply_to = [ "research-lab" ]
-requires_tech = ["technologies.quantum-computing"]
-cost = [
-    { resource = "resources.alloy", count = 100 },
-    { resource = "resources.exotic-gases", count = 20 },
+display-name = "Supercomputer Cluster"
+buildings = ["research-lab"]
+requires-tech = ["technologies.quantum-computing"]
+build-cost = [{ resource = "resources.alloy", count = 100 }, { resource = "resources.exotic-gases", count = 20 }, { days = 120 }]
+output-mult = 1.3
+upkeep-cost-add = [
+    { resource = "resources.exotic-gases", count = 0.2 },
 ]
-build_days = 120
-output_mult = 1.3
-upkeep_resources = [ { resource = "resources.exotic-gases", count = 0.2 } ]
 
 [building-upgrade.reinforced-habitation]
-display_name = "Reinforced Habitation Blocks"
-apply_to = [ "housing" ]
-cost = [
-    { resource = "resources.minerals", count = 200 },
-    { resource = "resources.alloy", count = 30 },
+display-name = "Reinforced Habitation Blocks"
+building-tags = ["housing"]
+build-cost = [{ resource = "resources.minerals", count = 200 }, { resource = "resources.alloy", count = 30 }, { days = 120 }]
+housing-mult = 1.25
+upkeep-cost-add = [
+    { resource = "resources.energy", count = 1 },
 ]
-build_days = 120
-housing_mult = 1.25
-upkeep_resources = [ { resource = "resources.energy", count = 1 } ]
 
 [building-upgrade.automated-slipways]
-display_name = "Automated Slipways"
-apply_to = [ "shipyard" ]
-requires_tech = ["technologies.orbital-drydocks"]
-cost = [
-    { resource = "resources.minerals", count = 200 },
-    { resource = "resources.alloy", count = 100 },
-]
-build_days = 120
-output_mult = 1.5
-upkeep_mult = 1.3
+display-name = "Automated Slipways"
+building-tags = ["shipyard"]
+requires-tech = ["technologies.orbital-drydocks"]
+build-cost = [{ resource = "resources.minerals", count = 200 }, { resource = "resources.alloy", count = 100 }, { days = 120 }]
+upkeep-cost-mult = 1.3
+output-mult = 1.5

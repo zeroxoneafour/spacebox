@@ -1,5 +1,6 @@
 [import]
 resources = "resources.toml"
+buildings = "buildings.toml"
 
 [technology.example-technology]
 display-name = "Example Technology 1"
@@ -25,8 +26,8 @@ growth-mult = 1.1
 
 [technology.example-technology-2.ships]
 fleet-size-add = 10
-fire-rate-mult = 1.1
+fire-rate-mult = 1.1 # any outfit spec can work here
 
 [technology.example-technology-2.buildings]
-# can leave out the "buildings" value to apply to all buildings, or specify specific building names as well along with/instead of tags
-output-mult = { value = 1.1, buildings = [ "example-building-tag" ] }
+# specify building-tags and/or buildings, if both are left out then applies to all buildings
+output-mult = { value = 1.1, buildings = [ "buildings.example-building" ], building-tags = [ "buildings.example-building-tag" ] }

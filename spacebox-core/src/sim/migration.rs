@@ -134,13 +134,16 @@ pub(crate) fn commit(world: &mut World) {
         .chain(empires.iter().flat_map(|e| e.moves.iter()))
         .chain(galaxy_moves.iter());
     for m in all {
-        let n = m.count.min(planets[m.from.idx()].pop);
+        // Migrants are drawn from every species in proportion to its numbers.
+        let moved = planets[m.from.idx()].remove_pops(m.count);
+        let n: u64 = moved.iter().map(|(_, c)| c).sum();
         if n == 0 {
             continue;
         }
-        planets[m.from.idx()].pop -= n;
-        let was_empty = planets[m.to.idx()].pop == 0;
-        planets[m.to.idx()].pop += n;
+        let was_empty = planets[m.to.idx()].pop() == 0;
+        for (s, c) in moved {
+            planets[m.to.idx()].add_pops(s, c);
+        }
         if was_empty {
             let p = &planets[m.to.idx()];
             let owner = p.owner;

@@ -4,6 +4,7 @@
 [import]
 resources = "resources.toml"
 jobs = "jobs.toml"
+species = "species.toml"
 buildings = "buildings.toml"
 technologies = "technologies.toml"
 ships = "ships.toml"

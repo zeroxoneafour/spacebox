@@ -44,6 +44,7 @@ Building on a planet in an unowned system costs 100 * 2^n influence, where n is 
 You cannot build in a system you do not own. Finishing a building automatically claims the system.
 It takes 30 * 2^(n/2) additional days to build a building in an unowned system.
 Successfully finishing a building automatically cancels all other empire's claims/building sites in the system and refunds their materials.
+Note that you can claim a system but still have planets unclaimed within it. Even though these planets cannot be claimed by other empires, if another empire seizes your claimed planets, they can claim the system even if they don't seize your unclaimed planets.
 
 Empires can also build fleets and target buildings with their fleets.
 This will cause destruction, lower amenities, and disable/eventually destroy those buildings.
@@ -52,6 +53,8 @@ Empire fleets will always prioritize fighting enemy fleets over targeting buildi
 
 Fleets should hyper jump in a set amount of time (given by a game rule, and modifiable per-ship by hyper jump multipliers), and should wait for the entire fleet to be ready to hyper jump before jumping to an adjacent system.
 Fleet combat may run on a sub-tick basis. The calculation for fleet combat should be run once per tick (divided into subticks as necessar) before the calculations for planet economy (and thus before the calculations for any economy).
+
+Fleets can be merged if they are in the same system. By default, when ships are created, they spawn as a new fleet in the system they were created in. You will have to move all the ships together and merge them into a fleet to make a larger fleet.
 
 ## resources
 

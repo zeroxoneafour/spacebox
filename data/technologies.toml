@@ -1,176 +1,188 @@
-# Technologies. Research points (the ruleset's research resource) flow into one technology at a
-# time; empires without an explicit choice research the cheapest available technology.
+# Technologies. Research costs are paid from `research-resources`: transient ones (research)
+# from daily output while the technology is being researched, normal ones from the stockpile.
 #
-# Technologies unlock buildings and upgrades (via their `requires_tech`), terraforming (via the
-# ruleset), and may grant empire-wide modifiers:
-#
-#   modifiers = [{ building_class = "agriculture", output_mult = 1.15 }]
-#
-# Modifier entries accept the same fields as upgrades and adjacency bonuses.
+# Effects: [technology.x.pop] growth-mult; [technology.x.ships] fleet-size-add and ship stat
+# multipliers; [technology.x.buildings] building modifiers as
+# { value, buildings = [...], building-tags = [...] } (omit both to affect every building).
 
 [import]
-buildings = "buildings.toml"
 resources = "resources.toml"
-
-# --- tier 1 ----------------------------------------------------------------------------------
+buildings = "buildings.toml"
 
 [technology.hydroponics]
-display_name = "Hydroponics"
+display-name = "Hydroponics"
 description = "Soil-free agriculture under artificial light."
-category = "society"
-cost = 400
+research-resources = [ { resource = "resources.research", count = 400 } ]
+research-tags = ["society"]
 
 [technology.improved-mining]
-display_name = "Improved Mining Techniques"
-category = "engineering"
-cost = 450
+display-name = "Improved Mining Techniques"
+research-resources = [ { resource = "resources.research", count = 450 } ]
+research-tags = ["engineering"]
 
 [technology.grid-optimization]
-display_name = "Grid Optimization"
-category = "physics"
-cost = 500
-modifiers = [{ building_class = "power", output_mult = 1.1 }]
+display-name = "Grid Optimization"
+research-resources = [ { resource = "resources.research", count = 500 } ]
+research-tags = ["physics"]
+
+[technology.grid-optimization.buildings]
+output-mult = { value = 1.1, building-tags = ["buildings.power"] }
 
 [technology.holographic-entertainment]
-display_name = "Holographic Entertainment"
-category = "society"
-cost = 600
+display-name = "Holographic Entertainment"
+research-resources = [ { resource = "resources.research", count = 600 } ]
+research-tags = ["society"]
 
 [technology.administrative-ai]
-display_name = "Administrative AI"
-category = "physics"
-cost = 700
-modifiers = [{ building_class = "administration", amenities_mult = 1.2, upkeep_mult = 0.8 }]
+display-name = "Administrative AI"
+research-resources = [ { resource = "resources.research", count = 700 } ]
+research-tags = ["physics"]
 
-# --- tier 2 ----------------------------------------------------------------------------------
+[technology.administrative-ai.buildings]
+upkeep-cost-mult = { value = 0.8, building-tags = ["buildings.administration"] }
+output-mult = { value = 1.2, building-tags = ["buildings.administration"] }
 
 [technology.automated-mining]
-display_name = "Automated Mining"
-category = "engineering"
-cost = 800
+display-name = "Automated Mining"
+research-resources = [ { resource = "resources.research", count = 800 } ]
+research-tags = ["engineering"]
 prerequisites = ["improved-mining"]
 
 [technology.gene-tailored-crops]
-display_name = "Gene-Tailored Crops"
-category = "society"
-cost = 900
+display-name = "Gene-Tailored Crops"
+research-resources = [ { resource = "resources.research", count = 900 } ]
+research-tags = ["society"]
 prerequisites = ["hydroponics"]
-modifiers = [{ building_class = "agriculture", output_mult = 1.15 }]
+
+[technology.gene-tailored-crops.buildings]
+output-mult = { value = 1.15, building-tags = ["buildings.agriculture"] }
 
 [technology.material-synthesis]
-display_name = "Material Synthesis"
-category = "engineering"
-cost = 1000
+display-name = "Material Synthesis"
+research-resources = [ { resource = "resources.research", count = 1000 } ]
+research-tags = ["engineering"]
 prerequisites = ["improved-mining"]
 
 [technology.xeno-geology]
-display_name = "Xeno-Geology"
+display-name = "Xeno-Geology"
 description = "Locating and extracting strategic deposits on lifeless worlds."
-category = "engineering"
-cost = 1000
+research-resources = [ { resource = "resources.research", count = 1000 } ]
+research-tags = ["engineering"]
 prerequisites = ["automated-mining"]
 
 [technology.social-engineering]
-display_name = "Social Engineering"
-category = "society"
-cost = 1100
+display-name = "Social Engineering"
+research-resources = [ { resource = "resources.research", count = 1100 } ]
+research-tags = ["society"]
 prerequisites = ["holographic-entertainment"]
-stability = 5
 
-# --- tier 3 ----------------------------------------------------------------------------------
+[technology.social-engineering.buildings]
+output-mult = { value = 1.25, building-tags = ["buildings.amenities"] }
 
 [technology.advanced-alloys]
-display_name = "Advanced Alloys"
-category = "engineering"
-cost = 1400
+display-name = "Advanced Alloys"
+research-resources = [ { resource = "resources.research", count = 1400 } ]
+research-tags = ["engineering"]
 prerequisites = ["material-synthesis"]
-modifiers = [{ building_class = "forge", output_mult = 1.1 }]
+
+[technology.advanced-alloys.buildings]
+output-mult = { value = 1.1, building-tags = ["buildings.forge"] }
 
 [technology.nano-fabrication]
-display_name = "Nano-Fabrication"
-category = "engineering"
-cost = 1500
+display-name = "Nano-Fabrication"
+research-resources = [ { resource = "resources.research", count = 1500 } ]
+research-tags = ["engineering"]
 prerequisites = ["material-synthesis"]
 
 [technology.quantum-computing]
-display_name = "Quantum Computing"
-category = "physics"
-cost = 1600
+display-name = "Quantum Computing"
+research-resources = [ { resource = "resources.research", count = 1600 } ]
+research-tags = ["physics"]
 prerequisites = ["grid-optimization"]
-modifiers = [{ building_class = "research", output_mult = 1.1 }]
+
+[technology.quantum-computing.buildings]
+output-mult = { value = 1.1, building-tags = ["buildings.research"] }
 
 [technology.gene-therapy]
-display_name = "Gene Therapy"
-category = "society"
-cost = 1500
+display-name = "Gene Therapy"
+research-resources = [ { resource = "resources.research", count = 1500 } ]
+research-tags = ["society"]
 prerequisites = ["gene-tailored-crops"]
-pop_growth_mult = 1.25
+
+[technology.gene-therapy.pop]
+growth-mult = 1.25
 
 [technology.fusion-power]
-display_name = "Fusion Power"
-category = "physics"
-cost = 1800
+display-name = "Fusion Power"
+research-resources = [ { resource = "resources.research", count = 1800 } ]
+research-tags = ["physics"]
 prerequisites = ["grid-optimization", "xeno-geology"]
 
-# --- tier 4 ----------------------------------------------------------------------------------
-
 [technology.atmospheric-engineering]
-display_name = "Atmospheric Engineering"
+display-name = "Atmospheric Engineering"
 description = "Makes it possible to terraform large barren worlds."
-category = "society"
-cost = 2500
+research-resources = [ { resource = "resources.research", count = 2500 } ]
+research-tags = ["society"]
 prerequisites = ["gene-tailored-crops", "xeno-geology"]
 
 [technology.arcology-project]
-display_name = "Arcology Project"
-category = "engineering"
-cost = 3000
+display-name = "Arcology Project"
+research-resources = [ { resource = "resources.research", count = 3000 } ]
+research-tags = ["engineering"]
 prerequisites = ["nano-fabrication", "social-engineering"]
 
-# --- military ----------------------------------------------------------------------------------
-
 [technology.naval-doctrine]
-display_name = "Naval Doctrine"
+display-name = "Naval Doctrine"
 description = "Fleet tactics that make destroyer-class warships practical."
-category = "military"
-cost = 600
+research-resources = [ { resource = "resources.research", count = 600 } ]
+research-tags = ["military"]
+
+[technology.naval-doctrine.ships]
+fleet-size-add = 5
 
 [technology.deflector-shields]
-display_name = "Deflector Shields"
-category = "military"
-cost = 900
+display-name = "Deflector Shields"
+research-resources = [ { resource = "resources.research", count = 900 } ]
+research-tags = ["military"]
 prerequisites = ["naval-doctrine", "grid-optimization"]
 
 [technology.plasma-weapons]
-display_name = "Plasma Weapons"
-category = "military"
-cost = 1400
+display-name = "Plasma Weapons"
+research-resources = [ { resource = "resources.research", count = 1400 } ]
+research-tags = ["military"]
 prerequisites = ["deflector-shields", "material-synthesis"]
 
+[technology.plasma-weapons.ships]
+fire-rate-mult = 1.1
+
 [technology.capital-ships]
-display_name = "Capital Ships"
+display-name = "Capital Ships"
 description = "Cruiser hulls with the keel strength to carry heavy weapons."
-category = "military"
-cost = 1800
+research-resources = [ { resource = "resources.research", count = 1800 } ]
+research-tags = ["military"]
 prerequisites = ["naval-doctrine", "advanced-alloys"]
 
+[technology.capital-ships.ships]
+fleet-size-add = 5
+
 [technology.orbital-drydocks]
-display_name = "Orbital Drydocks"
-category = "military"
-cost = 1200
+display-name = "Orbital Drydocks"
+research-resources = [ { resource = "resources.research", count = 1200 } ]
+research-tags = ["military"]
 prerequisites = ["naval-doctrine", "automated-mining"]
 
 [technology.titanic-hulls]
-display_name = "Titanic Hulls"
-category = "military"
-cost = 4000
+display-name = "Titanic Hulls"
+research-resources = [ { resource = "resources.research", count = 4000 } ]
+research-tags = ["military"]
 prerequisites = ["capital-ships", "plasma-weapons"]
 
-# --- tier 5 ----------------------------------------------------------------------------------
+[technology.titanic-hulls.ships]
+fleet-size-add = 10
 
 [technology.planetary-reconstruction]
-display_name = "Planetary Reconstruction"
+display-name = "Planetary Reconstruction"
 description = "Rebuilds even small worlds and moons into habitable ones."
-category = "society"
-cost = 6000
+research-resources = [ { resource = "resources.research", count = 6000 } ]
+research-tags = ["society"]
 prerequisites = ["atmospheric-engineering", "arcology-project"]

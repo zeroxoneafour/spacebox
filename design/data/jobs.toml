@@ -2,7 +2,7 @@
 resources = "resources.toml"
 
 [job.example-job]
-display_name = "Example Job"
+display-name = "Example Job"
 appeal = 50 # 0 to 100 scale, more appealing jobs
 job-tags = [ "worker" ] # field not used right now but may be used later
 associated-resource = [ "resources.example-resource" ] # when this resource gets low, the job gets more appeal

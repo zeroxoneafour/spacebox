@@ -6,10 +6,11 @@
 //! barren-world buildings, the occasional upgrade and terraforming project. Decisions only read
 //! the world, so all empires decide in parallel.
 
-use crate::defs::BuildingDef;
+use crate::defs::{BuildingDef, ResourceAmount};
 use crate::ids::*;
 use crate::sim::commands::{Command, can_afford};
-use crate::world::{AiPersonality, Construction, FleetOrder, World};
+use crate::sim::economy::next_research;
+use crate::world::{AiPersonality, FleetOrder, ProjectKind, World};
 
 /// Needs, most pressing first.
 struct Needs {
@@ -23,22 +24,34 @@ struct Needs {
 fn used_by_unlocked(world: &World, empire: EmpireId, r: ResourceId) -> bool {
     let defs = &world.defs;
     let e = world.empire(empire);
-    let has = |list: &[crate::defs::ResourceAmount]| list.iter().any(|a| a.resource == r);
+    let has = |list: &[ResourceAmount]| list.iter().any(|a| a.resource == r);
     let known = |techs: &[TechId]| techs.iter().all(|t| e.knows(*t));
     defs.buildings.iter().any(|b| {
-        b.buildable
+        !b.blocker
             && known(&b.requires_tech)
-            && (has(&b.build_cost) || has(&b.inputs) || has(&b.upkeep))
+            && (has(&b.build_cost.resources) || has(&b.inputs) || has(&b.upkeep))
     }) || defs.upgrades.iter().any(|u| {
         known(&u.requires_tech)
-            && (has(&u.cost) || has(&u.modifier.inputs) || has(&u.modifier.upkeep))
+            && (has(&u.build_cost.resources)
+                || has(&u.modifier.input_add)
+                || has(&u.modifier.upkeep_add))
     }) || [
         &world.rules().terraform_large,
         &world.rules().terraform_small,
     ]
     .into_iter()
     .flatten()
-    .any(|t| t.requires_tech.is_none_or(|t| e.knows(t)) && has(&t.cost))
+    .any(|t| t.requires_tech.is_none_or(|t| e.knows(t)) && has(&t.cost.resources))
+}
+
+/// Whether some project of the empire still needs transient resource `r`.
+fn projects_need(world: &World, empire: EmpireId, r: ResourceId) -> bool {
+    let e = world.empire(empire);
+    e.research
+        .iter()
+        .map(|p| &p.remaining)
+        .chain(e.shipbuilding.iter().map(|p| &p.remaining))
+        .any(|c| c.get(r) > 0.0)
 }
 
 fn rank_needs(
@@ -56,15 +69,28 @@ fn rank_needs(
         if !defs
             .buildings
             .iter()
-            .any(|b| b.buildable && b.outputs.iter().any(|o| o.resource == r))
+            .any(|b| !b.blocker && output_of(b, r) > 0.0)
         {
             continue;
         }
         let income = e.income[i];
         let demand = pool.demand_full[i];
-        if !res.stockpile {
-            // Research and other flow resources: always wanted, scientific empires much more so.
-            rest.push((90.0 * (1.0 - traits.scientific) + 5.0, r));
+        if res.transient {
+            // Transient resources are only worth producing while projects use all of them.
+            // Research is always wanted, by scientific empires much more so.
+            let research = defs
+                .technologies
+                .iter()
+                .any(|t| t.cost.iter().any(|a| a.resource == r));
+            if e.wasted[i] > 1e-6 || !projects_need(world, empire, r) {
+                continue;
+            }
+            let days = if research {
+                90.0 * (1.0 - traits.scientific) + 5.0
+            } else {
+                60.0 * (1.0 - traits.militant) + 5.0
+            };
+            rest.push((days, r));
             continue;
         }
         let stock = e.storage[i];
@@ -90,11 +116,16 @@ fn rank_needs(
 }
 
 fn output_of(def: &BuildingDef, r: ResourceId) -> f64 {
-    def.outputs
-        .iter()
-        .filter(|o| o.resource == r)
-        .map(|o| o.count)
-        .sum()
+    def.outputs.get(r) + def.passive_outputs.get(r)
+}
+
+fn has_jobs(def: &BuildingDef) -> bool {
+    def.max_workers.is_some_and(|w| w > 0)
+}
+
+/// Amenities a building provides (from workers and passively).
+fn amenities_of(def: &BuildingDef) -> f64 {
+    def.outputs.amenities + def.passive_outputs.amenities
 }
 
 /// Picks the best free tile where the building may stand (land/water rules): highest tile
@@ -122,7 +153,7 @@ fn best_tile(
                     .filter(|nb| {
                         def.adjacency
                             .iter()
-                            .any(|a| defs.target_matches(a.target, nb.def))
+                            .any(|a| defs.targets(&a.targets, nb.def))
                     })
                     .count();
                 mult + adj as f64 * 0.05
@@ -151,12 +182,12 @@ fn pick_building(
         .map(|(i, d)| (BuildingId::from_idx(i), d))
         .filter(|(_, d)| filter(d) && score(d) > 0.0)
         .filter(|(id, d)| {
-            let tile = if d.water {
-                sea
-            } else if d.land {
+            let tile = if d.land && land.is_some() {
                 land
+            } else if d.water {
+                sea
             } else {
-                land.or(sea)
+                None
             };
             tile.is_some_and(|t| world.can_build(empire, pid, t, *id, budget).is_ok())
         })
@@ -183,7 +214,7 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
                  b: BuildingId,
                  r: Option<ResourceId>| {
         if let Some(tile) = best_tile(world, empire, pid, b, r) {
-            for a in &defs.building(b).build_cost {
+            for a in &defs.building(b).build_cost.resources {
                 budget[a.resource.idx()] -= a.count;
             }
             cmds.push(Command::Build {
@@ -201,8 +232,14 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
     let mut underway: Vec<ResourceId> = Vec::new();
     for &pid in &planets {
         for t in &world.planet(pid).tiles {
-            if let Some(Construction::Building { def, .. }) = &t.construction {
-                underway.extend(defs.building(*def).outputs.iter().map(|o| o.resource));
+            if let Some(def) = t.construction.as_ref().and_then(|c| c.building()) {
+                underway.extend(
+                    defs.building(def)
+                        .outputs
+                        .resources
+                        .iter()
+                        .map(|o| o.resource),
+                );
             }
         }
     }
@@ -213,7 +250,7 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
         .copied()
         .filter(|p| world.planet(*p).habitable)
         .collect();
-    habitable.sort_by_key(|p| std::cmp::Reverse(world.planet(*p).pop));
+    habitable.sort_by_key(|p| std::cmp::Reverse(world.planet(*p).pop()));
     for &pid in &habitable {
         if cmds.len() >= max_builds {
             break;
@@ -223,31 +260,21 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
             continue;
         }
         let s = &p.stats;
-        let crowded =
-            s.homeless > 0 || (p.pop > 0 && s.housing - (p.pop as f64) < s.housing * 0.05 + 5.0);
+        let pop = p.pop();
+        // Worlds have no housing until it is built, and pops can't settle without it.
+        let crowded = s.homeless > 0
+            || s.housing <= 0.0
+            || (pop > 0 && s.housing - (pop as f64) < s.housing * 0.05 + 5.0);
         if crowded
-            && let Some(b) = pick_building(
-                world,
-                empire,
-                pid,
-                &budget,
-                |d| d.max_workers == 0,
-                |d| d.housing,
-            )
+            && let Some(b) =
+                pick_building(world, empire, pid, &budget, |d| !has_jobs(d), |d| d.housing)
         {
             build(&mut cmds, &mut budget, pid, b, None);
             continue;
         }
         if s.amenities < s.amenities_needed * 0.9
-            && p.pop > 0
-            && let Some(b) = pick_building(
-                world,
-                empire,
-                pid,
-                &budget,
-                |d| d.max_workers > 0,
-                |d| d.amenities,
-            )
+            && pop > 0
+            && let Some(b) = pick_building(world, empire, pid, &budget, has_jobs, amenities_of)
         {
             build(&mut cmds, &mut budget, pid, b, None);
             continue;
@@ -258,7 +285,7 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
         let wants_jobs = s.unemployed > 0 || (s.jobs == 0 && s.free_jobs == 0);
         let list: Vec<ResourceId> = if wants_jobs {
             needs.all.clone()
-        } else if p.pop > 0 {
+        } else if pop > 0 {
             needs
                 .urgent
                 .iter()
@@ -269,16 +296,17 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
             Vec::new()
         };
         for r in list {
-            if let Some(b) = pick_building(
-                world,
-                empire,
-                pid,
-                &budget,
-                |d| d.max_workers > 0,
-                |d| output_of(d, r),
-            ) {
+            if let Some(b) =
+                pick_building(world, empire, pid, &budget, has_jobs, |d| output_of(d, r))
+            {
                 build(&mut cmds, &mut budget, pid, b, Some(r));
-                underway.extend(defs.building(b).outputs.iter().map(|o| o.resource));
+                underway.extend(
+                    defs.building(b)
+                        .outputs
+                        .resources
+                        .iter()
+                        .map(|o| o.resource),
+                );
                 break;
             }
         }
@@ -290,7 +318,7 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
             break;
         }
         let p = world.planet(pid);
-        if p.is_constructing() || p.terraform_days_left.is_some() {
+        if p.is_constructing() || p.terraform.is_some() {
             continue;
         }
         for &r in needs.all.iter().take(3) {
@@ -314,9 +342,9 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
         for (tile, t) in p.tiles.iter().enumerate() {
             let Some(inst) = &t.building else { continue };
             for &u in &defs.building(inst.def).available_upgrades {
-                let cost = &defs.upgrade(u).cost;
+                let cost = &defs.upgrade(u).build_cost.resources;
                 let rich: Vec<f64> = budget.iter().map(|b| b / 3.0).collect();
-                if can_afford(&rich, cost) && world.can_upgrade(pid, tile, u, &budget).is_ok() {
+                if can_afford(defs, &rich, cost) && world.can_upgrade(pid, tile, u).is_ok() {
                     for a in cost {
                         budget[a.resource.idx()] -= a.count;
                     }
@@ -332,9 +360,7 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
     }
 
     // One terraforming project at a time, large worlds first.
-    let terraforming = planets
-        .iter()
-        .any(|p| world.planet(*p).terraform_days_left.is_some());
+    let terraforming = planets.iter().any(|p| world.planet(*p).terraform.is_some());
     if !terraforming {
         let mut candidates: Vec<PlanetId> = planets
             .iter()
@@ -343,9 +369,15 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
             .collect();
         candidates.sort_by_key(|p| std::cmp::Reverse(world.planet(*p).tiles.len()));
         let rich: Vec<f64> = budget.iter().map(|b| b / 2.0).collect();
+        let affordable = |p: PlanetId| {
+            world
+                .rules()
+                .terraform(world.planet(p).size)
+                .is_some_and(|r| can_afford(defs, &rich, &r.cost.resources))
+        };
         if let Some(&pid) = candidates
             .iter()
-            .find(|p| world.can_terraform(**p, &rich).is_ok())
+            .find(|p| world.can_terraform(**p).is_ok() && affordable(**p))
         {
             cmds.push(Command::Terraform { planet: pid });
         }
@@ -364,7 +396,84 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
         &mut budget,
         &mut cmds,
     );
+    toggle_transient(world, empire, &planets, &mut cmds);
     cmds
+}
+
+/// Transient output that no project uses is wasted, so buildings that only produce transient
+/// resources (research labs, shipyards) are switched off while nothing needs what they make,
+/// and back on once something does (including projects started by this decision).
+fn toggle_transient(
+    world: &World,
+    empire: EmpireId,
+    planets: &[PlanetId],
+    cmds: &mut Vec<Command>,
+) {
+    let defs = &world.defs;
+    let e = world.empire(empire);
+    // Research uses the empire's transient output; ships only that of their own planet.
+    let mut needed = vec![false; defs.resource_count()];
+    let mut local: Vec<(PlanetId, ResourceId)> = Vec::new();
+    let mut need = |c: &[ResourceAmount]| {
+        for a in c.iter().filter(|a| a.count > 0.0) {
+            needed[a.resource.idx()] = true;
+        }
+    };
+    for p in &e.research {
+        need(&p.remaining.resources);
+    }
+    for c in cmds.iter() {
+        if let Command::Research { tech, .. } = c {
+            need(&defs.tech(*tech).cost);
+        }
+    }
+    let mut ship_need = |planet: PlanetId, c: &[ResourceAmount]| {
+        for a in c.iter().filter(|a| a.count > 0.0) {
+            local.push((planet, a.resource));
+        }
+    };
+    for p in &e.shipbuilding {
+        ship_need(p.planet, &p.remaining.resources);
+    }
+    for c in cmds.iter() {
+        if let Command::BuildShip { planet, ship } = c {
+            ship_need(*planet, &defs.ship(*ship).build_cost.resources);
+        }
+    }
+    let mut toggles = Vec::new();
+    for &pid in planets {
+        for (tile, t) in world.planet(pid).tiles.iter().enumerate() {
+            let Some(b) = &t.building else { continue };
+            let d = defs.building(b.def);
+            let outputs: Vec<ResourceId> = d
+                .outputs
+                .resources
+                .iter()
+                .chain(&d.passive_outputs.resources)
+                .filter(|a| a.count > 0.0)
+                .map(|a| a.resource)
+                .collect();
+            let only_transient = !outputs.is_empty()
+                && d.outputs.amenities == 0.0
+                && d.passive_outputs.amenities == 0.0
+                && d.housing == 0.0
+                && outputs.iter().all(|r| defs.is_transient(*r));
+            if !only_transient {
+                continue;
+            }
+            let wanted = outputs
+                .iter()
+                .any(|r| needed[r.idx()] || local.contains(&(pid, *r)));
+            if b.enabled != wanted {
+                toggles.push(Command::SetEnabled {
+                    planet: pid,
+                    tile,
+                    enabled: wanted,
+                });
+            }
+        }
+    }
+    cmds.extend(toggles);
 }
 
 /// Clears one natural blocker on a crowded world (no free tile left), most populous first,
@@ -375,7 +484,7 @@ fn clear_blocker(world: &World, planets: &[PlanetId], budget: &mut [f64], cmds: 
         .copied()
         .filter(|p| world.planet(*p).free_tiles().next().is_none())
         .collect();
-    crowded.sort_by_key(|p| (std::cmp::Reverse(world.planet(*p).pop), *p));
+    crowded.sort_by_key(|p| (std::cmp::Reverse(world.planet(*p).pop()), *p));
     let half: Vec<f64> = budget.iter().map(|b| b / 2.0).collect();
     for pid in crowded {
         let p = world.planet(pid);
@@ -389,8 +498,13 @@ fn clear_blocker(world: &World, planets: &[PlanetId], budget: &mut [f64], cmds: 
                         .as_ref()
                         .is_some_and(|b| world.defs.building(b.def).blocker)
             })
-            .filter_map(|(i, _)| world.demolish_plan(pid, i).ok().map(|(_, cost)| (i, cost)))
-            .filter(|(_, cost)| can_afford(&half, cost))
+            .filter_map(|(i, _)| {
+                world
+                    .demolish_plan(pid, i)
+                    .ok()
+                    .map(|(_, cost)| (i, cost.map(|c| c.resources).unwrap_or_default()))
+            })
+            .filter(|(_, cost)| can_afford(&world.defs, &half, cost))
             .min_by(|a, b| {
                 cost_value(world, &a.1)
                     .total_cmp(&cost_value(world, &b.1))
@@ -407,7 +521,7 @@ fn clear_blocker(world: &World, planets: &[PlanetId], budget: &mut [f64], cmds: 
 }
 
 /// Total cost of a resource list, weighted by market value (for picking cheap options).
-fn cost_value(world: &World, cost: &[crate::defs::ResourceAmount]) -> f64 {
+fn cost_value(world: &World, cost: &[ResourceAmount]) -> f64 {
     cost.iter()
         .map(|a| a.count * world.defs.resource(a.resource).base_value)
         .sum()
@@ -444,7 +558,9 @@ fn expand(
         let mut score = 0i64;
         for p in s.planet_ids().map(|p| world.planet(p)) {
             staked |= p.tiles.iter().any(|t| {
-                matches!(t.construction, Some(Construction::Building { empire: Some(e), .. }) if e == empire)
+                t.construction.as_ref().is_some_and(|c| {
+                    c.empire == Some(empire) && matches!(c.kind, ProjectKind::Building(_))
+                })
             });
             score += if p.habitable { 6 } else { 1 };
         }
@@ -483,13 +599,13 @@ fn expand(
                         .map(|plan| (tile, b, plan))
                 })
                 .min_by(|a, b| {
-                    cost_value(world, &a.2.cost)
-                        .total_cmp(&cost_value(world, &b.2.cost))
+                    cost_value(world, &a.2.cost.resources)
+                        .total_cmp(&cost_value(world, &b.2.cost.resources))
                         .then(a.0.cmp(&b.0))
                         .then(a.1.cmp(&b.1))
                 });
             if let Some((tile, b, plan)) = best {
-                for a in &plan.cost {
+                for a in &plan.cost.resources {
                     budget[a.resource.idx()] -= a.count;
                 }
                 cmds.push(Command::Build {
@@ -504,8 +620,10 @@ fn expand(
     }
 }
 
-/// Picks the next technology when nothing is being researched: cheapest first, with military
-/// research discounted for militant empires and everything else for scientific ones.
+/// Keeps enough technologies in research that the empire's research output is not wasted
+/// before the next decision (and a few more for scientific empires), picking the cheapest
+/// available, with military research discounted for militant empires and everything else for
+/// scientific ones.
 fn choose_research(
     world: &World,
     empire: EmpireId,
@@ -513,38 +631,63 @@ fn choose_research(
     cmds: &mut Vec<Command>,
 ) {
     let e = world.empire(empire);
-    if e.researching.is_some() && e.research_progress > 0.0 {
-        return;
-    }
     let defs = &world.defs;
+    let wanted = 1 + (traits.scientific * 2.0).round() as usize;
+    // Transient output that research could use over the next two decision intervals.
+    let horizon = 2.0 * world.rules().ai_interval_days as f64;
+    let research_resources: Vec<ResourceId> = defs
+        .technologies
+        .iter()
+        .flat_map(|t| t.cost.iter().map(|a| a.resource))
+        .filter(|r| defs.is_transient(*r))
+        .collect();
+    let output: f64 = research_resources
+        .iter()
+        .map(|r| e.income[r.idx()] * world.rules().research_speed_mult)
+        .sum::<f64>()
+        * horizon;
+    let queued = |e: &crate::world::Empire| -> f64 {
+        e.research
+            .iter()
+            .flat_map(|p| p.remaining.resources.iter())
+            .filter(|a| research_resources.contains(&a.resource))
+            .map(|a| a.count)
+            .sum()
+    };
     let weight = |t: TechId| {
-        let tech = defs.tech(t);
-        let military = tech.category.as_deref() == Some("military");
-        let w = if military {
+        if defs
+            .tech(t)
+            .tags
+            .iter()
+            .any(|g| defs.tag_name(*g) == "military")
+        {
             1.0 + 2.0 * traits.militant
         } else {
             1.0 + traits.scientific
-        };
-        tech.cost / w
+        }
     };
-    let pick = (0..defs.technologies.len())
-        .map(TechId::from_idx)
-        .filter(|t| defs.tech_available(*t, &e.techs))
-        .min_by(|a, b| weight(*a).total_cmp(&weight(*b)).then(a.cmp(b)));
-    if pick.is_some() && pick != e.researching {
-        cmds.push(Command::SetResearch { empire, tech: pick });
+    // Plan on a copy so several technologies can be picked at once.
+    let mut plan = e.clone();
+    while plan.research.len() < wanted || queued(&plan) < output {
+        let Some(tech) = next_research(&plan, defs, weight) else {
+            break;
+        };
+        plan.research.push(crate::world::ResearchProject {
+            tech,
+            remaining: defs.research_cost(tech),
+        });
+        cmds.push(Command::Research { empire, tech });
+        if plan.research.len() >= 8 {
+            break;
+        }
     }
 }
 
 /// Deterministic pseudo-random number in `[0, 1)` for a decision, so runs are reproducible.
 fn roll(world: &World, salt: &[u64]) -> f64 {
-    let mut x = world.seed ^ world.day.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    for s in salt {
-        x = (x ^ s.wrapping_mul(0xBF58_476D_1CE4_E5B9)).rotate_left(29);
-        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-    }
-    x ^= x >> 31;
-    (x >> 11) as f64 / (1u64 << 53) as f64
+    let mut all = vec![world.day];
+    all.extend_from_slice(salt);
+    crate::rng::hash01(world.seed, &all)
 }
 
 /// Current fighting strength of an empire's fleets (damaged ships count for less).
@@ -554,7 +697,10 @@ fn fleet_power(world: &World, empire: EmpireId) -> f64 {
         .iter()
         .filter(|f| f.owner == empire)
         .flat_map(|f| &f.ships)
-        .map(|s| ship_power(world, s.def) * (0.3 + 0.7 * s.hull / world.defs.ship(s.def).max_hull))
+        .map(|s| {
+            let max = world.ship_stats(empire, s.def).max_hull;
+            ship_power(world, empire, s.def) * (0.3 + 0.7 * s.hull / max)
+        })
         .sum()
 }
 
@@ -608,9 +754,9 @@ fn diplomacy(
     None
 }
 
-/// A rough measure of a ship's fighting strength.
-fn ship_power(world: &World, ship: ShipId) -> f64 {
-    let d = world.defs.ship(ship);
+/// A rough measure of a ship's fighting strength for an empire.
+fn ship_power(world: &World, empire: EmpireId, ship: ShipId) -> f64 {
+    let d = world.ship_stats(empire, ship);
     let dps: f64 = d
         .armament
         .iter()
@@ -637,30 +783,44 @@ fn military(
     let at_war = !e.wars.is_empty() || declared.is_some();
     let own_fleets: Vec<&crate::world::Fleet> =
         world.fleets.iter().filter(|f| f.owner == empire).collect();
-    let ships: usize = own_fleets.iter().map(|f| f.ships.len()).sum::<usize>() + e.ship_queue.len();
+    let ships: usize =
+        own_fleets.iter().map(|f| f.ships.len()).sum::<usize>() + e.shipbuilding.len();
+    let defs = &world.defs;
 
-    // A shipyard on the most populous world once the empire can afford to arm itself.
-    let shipyard = planets.iter().copied().find(|p| world.has_shipyard(*p));
-    if shipyard.is_none() {
+    // Shipbuilding is transient: shipyards (buildings producing what ship designs need) must
+    // be working while ships are under construction. One goes on the most populous world once
+    // the empire can afford to arm itself.
+    let ship_inputs: Vec<ResourceId> = defs
+        .ships
+        .iter()
+        .flat_map(|s| s.build_cost.resources.iter())
+        .map(|a| a.resource)
+        .filter(|r| defs.is_transient(*r))
+        .collect();
+    let shipyard_like = |d: &BuildingDef| ship_inputs.iter().any(|r| output_of(d, *r) > 0.0);
+    // Any shipyard counts, even one switched off while idle (see `toggle_transient`).
+    let shipyard = planets.iter().copied().find(|p| {
+        world.planet(*p).tiles.iter().any(|t| {
+            t.building
+                .as_ref()
+                .is_some_and(|b| shipyard_like(defs.building(b.def)))
+        })
+    });
+    if shipyard.is_none() && !ship_inputs.is_empty() {
         let mut habitable: Vec<PlanetId> = planets
             .iter()
             .copied()
             .filter(|p| world.planet(*p).habitable)
             .collect();
-        habitable.sort_by_key(|p| std::cmp::Reverse(world.planet(*p).pop));
+        habitable.sort_by_key(|p| std::cmp::Reverse(world.planet(*p).pop()));
         for pid in habitable.into_iter().take(1) {
             if world.planet(pid).is_constructing() {
                 continue;
             }
-            let shipyard_like = |d: &BuildingDef| {
-                d.outputs
-                    .iter()
-                    .any(|o| world.defs.resource(o.resource).on_demand)
-            };
             if let Some(b) = pick_building(world, empire, pid, budget, shipyard_like, |_| 1.0)
                 && let Some(tile) = best_tile(world, empire, pid, b, None)
             {
-                for a in &world.defs.building(b).build_cost {
+                for a in &defs.building(b).build_cost.resources {
                     budget[a.resource.idx()] -= a.count;
                 }
                 cmds.push(Command::Build {
@@ -674,34 +834,33 @@ fn military(
     }
 
     // Ship production: the strongest design affordable with half the budget. Militant empires
-    // keep bigger fleets and a deeper queue; everyone doubles up in wartime.
+    // keep bigger fleets and more ships in production; everyone doubles up in wartime.
     let base = (3 + 2 * world.empire_systems(empire).len()) as f64 * (0.4 + 1.2 * traits.militant);
     let wanted = (base.round() as usize).clamp(2, 40) * if at_war { 2 } else { 1 };
-    let queue_depth = 1 + usize::from(traits.militant > 0.6 || at_war);
+    let in_production = 1 + usize::from(traits.militant > 0.6 || at_war);
     if let Some(yard) = shipyard
-        && e.ship_queue.len() < queue_depth
+        && e.shipbuilding.len() < in_production
         && ships < wanted
     {
         let half: Vec<f64> = budget.iter().map(|b| b / 2.0).collect();
-        let best = (0..world.defs.ships.len())
+        let best = (0..defs.ships.len())
             .map(ShipId::from_idx)
-            .filter(|s| world.can_build_ship(yard, *s, &half).is_ok())
+            .filter(|s| {
+                world.can_build_ship(yard, *s).is_ok()
+                    && can_afford(defs, &half, &defs.ship(*s).build_cost.resources)
+            })
             .max_by(|a, b| {
-                ship_power(world, *a)
-                    .total_cmp(&ship_power(world, *b))
+                ship_power(world, empire, *a)
+                    .total_cmp(&ship_power(world, empire, *b))
                     .then(b.cmp(a))
             });
         if let Some(ship) = best {
-            if let Ok(upfront) = world.can_build_ship(yard, ship, budget) {
-                for a in upfront {
+            for a in &defs.ship(ship).build_cost.resources {
+                if !defs.is_transient(a.resource) {
                     budget[a.resource.idx()] -= a.count;
                 }
             }
-            cmds.push(Command::BuildShip {
-                planet: yard,
-                ship,
-                fleet: None,
-            });
+            cmds.push(Command::BuildShip { planet: yard, ship });
         }
     }
 
@@ -715,19 +874,16 @@ fn military(
         .filter(|s| world.system(*s).owner == Some(empire))
         .collect();
     for sys in threatened {
-        if own_fleets.iter().any(|f| {
-            f.system == sys || matches!(f.order, FleetOrder::Move { system, .. } if system == sys)
-        }) {
+        if own_fleets
+            .iter()
+            .any(|f| f.system == sys || f.destination() == sys)
+        {
             continue;
         }
         let dist = world.distances_from([sys]);
         if let Some(f) = own_fleets
             .iter()
-            .filter(|f| {
-                f.order == FleetOrder::Idle
-                    && !busy.contains(&f.id)
-                    && dist[f.system.idx()] != u32::MAX
-            })
+            .filter(|f| f.is_idle() && !busy.contains(&f.id) && dist[f.system.idx()] != u32::MAX)
             .min_by_key(|f| (dist[f.system.idx()], f.id))
         {
             busy.push(f.id);
@@ -739,23 +895,45 @@ fn military(
         }
     }
 
-    if !at_war {
-        return;
-    }
+    // New ships start as fleets of their own: idle fleets gather at the capital and merge,
+    // in peace as in war.
     let idle: Vec<&&crate::world::Fleet> = own_fleets
         .iter()
-        .filter(|f| f.order == FleetOrder::Idle && !busy.contains(&f.id))
+        .filter(|f| f.is_idle() && !busy.contains(&f.id))
         .collect();
 
-    // Merge idle fleets that share a system into the largest one.
+    // Merge idle fleets that share a system into the largest one with room.
+    let limit = e.max_fleet_size(world.rules());
+    let mut sizes: Vec<(FleetId, usize)> =
+        idle.iter().map(|f| (f.id, f.size(&world.defs))).collect();
+    let size = |id: FleetId, sizes: &[(FleetId, usize)]| {
+        sizes.iter().find(|(i, _)| *i == id).map_or(0, |(_, n)| *n)
+    };
     for f in &idle {
+        let mine = size(f.id, &sizes);
+        if mine == 0 || busy.contains(&f.id) {
+            continue;
+        }
         if let Some(big) = idle
             .iter()
-            .filter(|o| o.system == f.system)
-            .max_by_key(|o| (o.ships.len(), std::cmp::Reverse(o.id)))
-            && big.id != f.id
+            .filter(|o| {
+                o.system == f.system
+                    && o.id != f.id
+                    && !busy.contains(&o.id)
+                    && size(o.id, &sizes) >= mine
+                    && size(o.id, &sizes) + mine <= limit
+            })
+            .max_by_key(|o| (size(o.id, &sizes), std::cmp::Reverse(o.id)))
         {
             busy.push(f.id);
+            let total = size(big.id, &sizes) + mine;
+            for s in sizes.iter_mut() {
+                if s.0 == big.id {
+                    s.1 = total;
+                } else if s.0 == f.id {
+                    s.1 = 0;
+                }
+            }
             cmds.push(Command::MergeFleets {
                 into: big.id,
                 from: f.id,
@@ -764,18 +942,21 @@ fn military(
     }
 
     // Offence: the largest idle fleet bombards the nearest enemy world once big enough.
-    let attacking = own_fleets
-        .iter()
-        .any(|f| matches!(f.order, FleetOrder::Bombard { .. }));
+    let attacking = own_fleets.iter().any(|f| {
+        f.orders
+            .iter()
+            .any(|o| matches!(o, FleetOrder::Bombard { .. }))
+    });
     let threshold = (6.0 - 4.0 * traits.militant).round().max(2.0) as usize;
     let main = idle
         .iter()
         .filter(|f| !busy.contains(&f.id))
         .max_by_key(|f| (f.ships.len(), std::cmp::Reverse(f.id)));
-    if !attacking
+    if at_war
+        && !attacking
         && let Some(fleet) = main
-        && fleet.ships.len() >= threshold
-        && fleet.max_range(&world.defs) > 0.0
+        && fleet.size(&world.defs) >= threshold.min(limit)
+        && fleet.max_range(&e.ship_stats) > 0.0
     {
         let dist = world.distances_from([fleet.system]);
         let target = world
@@ -785,15 +966,17 @@ fn military(
             .filter(|(_, p)| p.owner.is_some_and(hostile))
             .filter(|(_, p)| dist[p.system.idx()] != u32::MAX)
             .min_by_key(|(i, p)| {
-                // Finish off systems where we already hold a planet before moving on.
+                // Finish off systems where we already hold a planet before moving on, and go
+                // for populated worlds (the ones that matter) over empty outposts nearby.
                 let foothold = world
                     .system(p.system)
                     .planet_ids()
                     .any(|q| world.planet(q).owner == Some(empire));
+                let populated_bonus = if p.pop() > 0 { 2 } else { 0 };
                 (
-                    dist[p.system.idx()],
+                    dist[p.system.idx()].saturating_sub(populated_bonus),
                     !foothold,
-                    std::cmp::Reverse(p.pop),
+                    std::cmp::Reverse(p.pop()),
                     *i,
                 )
             })

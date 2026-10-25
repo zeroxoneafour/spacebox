@@ -2,18 +2,32 @@
 //!
 //! Commands are queued with [`World::queue`] and applied serially at the start of the next tick,
 //! before the parallel phases run. Invalid commands are dropped with a `CommandRejected` event.
+//!
+//! Projects (constructions, removals, upgrades, terraforming, research, ships) do not need to
+//! be affordable up front: they draw what they need from the stockpile as it becomes
+//! available. Cancelling one refunds the normal resources already spent on it.
 
-use crate::defs::ResourceAmount;
+use crate::defs::{Cost, Defs, ResourceAmount, Ruleset};
 use crate::ids::*;
 use crate::sim::events::{Event, EventKind};
-use crate::world::{BuildingInstance, Construction, Fleet, FleetOrder, ShipOrder, World};
+use crate::world::{
+    BuildingInstance, Construction, Fleet, FleetOrder, ProjectKind, ResearchProject, ShipProject,
+    TerraformProject, World,
+};
 
 #[derive(Clone, Debug)]
 pub enum Command {
-    /// Relocate pops between any two planets.
+    /// Relocate pops between any two planets (spread over species by their numbers), as many
+    /// as the destination has free housing for.
     MovePops {
         from: PlanetId,
         to: PlanetId,
+        count: u64,
+    },
+    /// Set the number of pops of one species on a planet.
+    SetPopulation {
+        planet: PlanetId,
+        species: SpeciesId,
         count: u64,
     },
     /// Pin exactly `workers` pops to a building (filled before appeal-based assignment), or
@@ -43,9 +57,10 @@ pub enum Command {
         building: BuildingId,
         empire: Option<EmpireId>,
     },
-    /// Remove a building (paying its `remove_cost`, which is how natural blockers are
-    /// cleared) or cancel a construction site. The planet's owner pays, or the system's owner
-    /// for an unowned planet.
+    /// Cancel a tile's construction project (refunding what was spent), or else remove its
+    /// building: instantly if the building has no `remove-cost`, otherwise as a removal
+    /// project (which is how natural blockers are cleared). The planet's owner pays, or the
+    /// system's owner for an unowned planet.
     Demolish {
         planet: PlanetId,
         tile: usize,
@@ -58,9 +73,17 @@ pub enum Command {
     Terraform {
         planet: PlanetId,
     },
-    SetResearch {
+    CancelTerraform {
+        planet: PlanetId,
+    },
+    /// Add a technology to the empire's current research.
+    Research {
         empire: EmpireId,
-        tech: Option<TechId>,
+        tech: TechId,
+    },
+    CancelResearch {
+        empire: EmpireId,
+        tech: TechId,
     },
     SetOwner {
         system: SystemId,
@@ -89,35 +112,45 @@ pub enum Command {
         planet: PlanetId,
         owner: Option<EmpireId>,
     },
-    /// Queue a ship at a shipyard planet. Non-on-demand costs are paid now; on-demand costs
-    /// (shipbuilding) are supplied by the owner's shipyards over time.
+    /// Start building a ship at a planet of the owner's. It is funded like any project:
+    /// normal resources from the stockpile, shipbuilding from the empire's shipyards.
     BuildShip {
         planet: PlanetId,
         ship: ShipId,
-        fleet: Option<FleetId>,
     },
-    /// Remove a queued ship order, refunding what was paid up front.
-    CancelShipOrder {
+    /// Cancel a ship under construction (by its index in `shipbuilding`), refunding what was
+    /// spent on it.
+    CancelShip {
         empire: EmpireId,
         index: usize,
     },
-    /// Send a fleet to a system (hyperjumping along the shortest route), optionally to a point
-    /// within it.
+    /// Replace a fleet's order queue (or with `append`, add to it). Jumps must follow
+    /// hyperlanes, and bombardment targets must be in the system the fleet will be in.
+    SetOrders {
+        fleet: FleetId,
+        orders: Vec<FleetOrder>,
+        append: bool,
+    },
+    /// Convenience: replace a fleet's orders with jumps along the shortest route to `system`,
+    /// then optionally a move to a point within it.
     MoveFleet {
         fleet: FleetId,
         system: SystemId,
         coordinates: Option<[f64; 2]>,
     },
-    /// Send a fleet to bombard a planet of an empire it is at war with (or an unowned one).
+    /// Convenience: replace a fleet's orders with jumps along the shortest route to the
+    /// planet's system, then bombardment of the planet (a tile, or any building).
     Bombard {
         fleet: FleetId,
         planet: PlanetId,
         tile: Option<usize>,
     },
+    /// Clear a fleet's orders.
     StopFleet {
         fleet: FleetId,
     },
-    /// Move all ships of `from` into `into` (same owner, same system).
+    /// Move all ships of `from` into `into` (same owner, same system, within the fleet size
+    /// limit).
     MergeFleets {
         into: FleetId,
         from: FleetId,
@@ -144,39 +177,56 @@ pub enum Command {
     },
 }
 
-/// What starting a construction will cost and how long it will take.
+/// What starting a construction will cost.
 #[derive(Clone, Debug)]
 pub struct BuildPlan {
-    pub cost: Vec<ResourceAmount>,
-    pub days: u32,
+    /// The building's cost plus any expansion surcharge (influence and days).
+    pub cost: Cost,
     /// Hyperlane jumps beyond the builder's borders, when building in an unowned system.
     pub expansion_jumps: Option<u32>,
 }
 
 type CmdResult = Result<Option<Event>, String>;
 
-pub fn can_afford(storage: &[f64], cost: &[ResourceAmount]) -> bool {
+/// Whether `storage` covers every normal resource in `cost` (transient ones are ignored).
+pub fn can_afford(defs: &Defs, storage: &[f64], cost: &[ResourceAmount]) -> bool {
     cost.iter()
+        .filter(|a| !defs.is_transient(a.resource))
         .all(|a| storage[a.resource.idx()] + 1e-9 >= a.count)
 }
 
-fn pay(storage: &mut [f64], cost: &[ResourceAmount]) {
-    for a in cost {
-        storage[a.resource.idx()] -= a.count;
+/// The full cost of a tile project (`building` is the tile's current building).
+pub fn project_cost(defs: &Defs, kind: ProjectKind, building: Option<&BuildingInstance>) -> Cost {
+    match kind {
+        ProjectKind::Building(b) => defs.building(b).build_cost.clone(),
+        ProjectKind::Upgrade(u) => defs.upgrade(u).build_cost.clone(),
+        ProjectKind::Remove => building
+            .and_then(|b| defs.building(b.def).remove_cost.clone())
+            .unwrap_or_default(),
     }
 }
 
-fn describe_cost(world: &World, cost: &[ResourceAmount]) -> String {
-    cost.iter()
-        .map(|a| {
-            format!(
-                "{:.0} {}",
-                a.count,
-                world.defs.resource(a.resource).display_name
-            )
+/// Gives back what a cancelled project paid, except the expansion resource (influence),
+/// which is never refunded.
+pub(crate) fn refund(rules: &Ruleset, paid: &[ResourceAmount], storage: &mut [f64]) {
+    for a in paid {
+        if Some(a.resource) != rules.expansion_resource {
+            storage[a.resource.idx()] += a.count;
+        }
+    }
+}
+
+/// What a research project has paid: its cost minus what remains, normal resources only.
+fn research_paid(defs: &Defs, tech: TechId, remaining: &Cost) -> Vec<ResourceAmount> {
+    defs.tech(tech)
+        .cost
+        .iter()
+        .filter(|a| !defs.is_transient(a.resource))
+        .map(|a| ResourceAmount {
+            resource: a.resource,
+            count: (a.count - remaining.get(a.resource)).max(0.0),
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect()
 }
 
 impl World {
@@ -197,7 +247,7 @@ impl World {
     }
 
     /// Checks whether `empire` may build `building` on `planet`/`tile` (ownership, expansion,
-    /// barren rules, technology, limits) and returns the full cost and duration.
+    /// terrain, technology, limits) and returns the full cost.
     pub fn build_plan(
         &self,
         empire: EmpireId,
@@ -261,26 +311,18 @@ impl World {
                 def.display_name
             ));
         }
-        if def.space {
+        if def.space && !def.land && !def.water {
             return Err(format!(
                 "{} must be built on an orbital megastructure (not available yet)",
                 def.display_name
             ));
         }
-        if !def.buildable {
-            return Err(format!("{} cannot be constructed", def.display_name));
-        }
-        if def.land && t.water {
-            return Err(format!(
-                "{} must be built on land, not water",
-                def.display_name
-            ));
-        }
-        if def.water && !t.water {
-            return Err(format!(
-                "{} must be built on a water tile",
-                def.display_name
-            ));
+        if !def.fits_terrain(t.water) {
+            return Err(if t.water {
+                format!("{} cannot be built on water", def.display_name)
+            } else {
+                format!("{} must be built on a water tile", def.display_name)
+            });
         }
         if !p.habitable && !def.barren {
             return Err(format!(
@@ -305,7 +347,6 @@ impl World {
         }
         let mut plan = BuildPlan {
             cost: def.build_cost.clone(),
-            days: def.build_days,
             expansion_jumps: None,
         };
         if sys.owner.is_none() {
@@ -317,7 +358,7 @@ impl World {
                     &computed
                 }
             };
-            // Every owned system is at distance 0, so the minimum tells whether there are any.
+            // Every owned system is at distance 0.
             let owns_any = dist.contains(&0);
             let jumps = if owns_any {
                 dist[p.system.idx()]
@@ -330,21 +371,22 @@ impl World {
             let rules = self.rules();
             let (influence, days) = rules.expansion(jumps);
             if let Some(r) = rules.expansion_resource {
-                match plan.cost.iter_mut().find(|a| a.resource == r) {
-                    Some(a) => a.count += influence,
-                    None => plan.cost.push(ResourceAmount {
+                crate::defs::add_amounts(
+                    &mut plan.cost.resources,
+                    &[ResourceAmount {
                         resource: r,
                         count: influence,
-                    }),
-                }
+                    }],
+                );
             }
-            plan.days += days;
+            plan.cost.days += days;
             plan.expansion_jumps = Some(jumps);
         }
         Ok(plan)
     }
 
-    /// [`World::build_plan`] plus a check that `storage` covers the cost.
+    /// [`World::build_plan`] plus a check that `storage` already covers the cost (used by
+    /// governors to stay within budget).
     pub fn can_build(
         &self,
         empire: EmpireId,
@@ -366,7 +408,7 @@ impl World {
         borders: Option<&[u32]>,
     ) -> Result<BuildPlan, String> {
         let plan = self.build_plan_with(empire, planet, tile, building, borders)?;
-        if !can_afford(storage, &plan.cost) {
+        if !can_afford(&self.defs, storage, &plan.cost.resources) {
             return Err(format!(
                 "cannot afford {} ({})",
                 self.defs.building(building).display_name,
@@ -376,17 +418,25 @@ impl World {
         Ok(plan)
     }
 
-    /// Who would pay to demolish the building on `planet`/`tile`, and how much.
+    /// Who would pay to remove the building on `planet`/`tile`, and what it costs (`None`:
+    /// free and instant).
     pub fn demolish_plan(
         &self,
         planet: PlanetId,
         tile: usize,
-    ) -> Result<(EmpireId, Vec<ResourceAmount>), String> {
+    ) -> Result<(EmpireId, Option<Cost>), String> {
         self.check_tile(planet, tile)?;
         let p = self.planet(planet);
-        let Some(b) = &p.tiles[tile].building else {
+        let t = &p.tiles[tile];
+        let Some(b) = &t.building else {
             return Err(format!("tile {tile} of {} has no building", p.display_name));
         };
+        if t.construction.is_some() {
+            return Err(format!(
+                "tile {tile} of {} is under construction",
+                p.display_name
+            ));
+        }
         let payer = p
             .owner
             .or(self.system(p.system).owner)
@@ -394,24 +444,8 @@ impl World {
         Ok((payer, self.defs.building(b.def).remove_cost.clone()))
     }
 
-    /// Whether `planet` has a working building that produces an on-demand resource.
-    pub fn has_shipyard(&self, planet: PlanetId) -> bool {
-        let rules = self.rules();
-        self.planet(planet).tiles.iter().any(|t| {
-            t.building.as_ref().is_some_and(|b| {
-                b.enabled
-                    && b.damage < rules.building_disable_damage
-                    && self.defs.produces_on_demand(b.def)
-            })
-        })
-    }
-
-    pub fn can_build_ship(
-        &self,
-        planet: PlanetId,
-        ship: ShipId,
-        storage: &[f64],
-    ) -> Result<Vec<ResourceAmount>, String> {
+    /// Checks whether the owner of `planet` may start building `ship` there.
+    pub fn can_build_ship(&self, planet: PlanetId, ship: ShipId) -> Result<EmpireId, String> {
         self.check_planet(planet)?;
         let p = self.planet(planet);
         let Some(owner) = p.owner else {
@@ -421,9 +455,6 @@ impl World {
             return Err(format!("no ship design with id {}", ship.0));
         }
         let d = self.defs.ship(ship);
-        if !self.has_shipyard(planet) {
-            return Err(format!("{} has no working shipyard", p.display_name));
-        }
         if let Some(t) = d
             .requires_tech
             .iter()
@@ -435,20 +466,76 @@ impl World {
                 self.defs.tech(*t).display_name
             ));
         }
-        let upfront: Vec<ResourceAmount> = d
-            .build_cost
-            .iter()
-            .filter(|a| !self.defs.resource(a.resource).on_demand)
-            .copied()
-            .collect();
-        if !can_afford(storage, &upfront) {
-            return Err(format!(
-                "cannot afford a {} ({})",
-                d.display_name,
-                describe_cost(self, &upfront)
-            ));
+        Ok(owner)
+    }
+
+    /// Current housing on a planet, from its enabled buildings (no housing exists without
+    /// buildings).
+    pub fn housing(&self, planet: PlanetId) -> f64 {
+        let p = self.planet(planet);
+        let owner = p.owner.map(|o| self.empire(o));
+        (0..p.tiles.len())
+            .filter(|t| p.tiles[*t].building.as_ref().is_some_and(|b| b.enabled))
+            .filter_map(|t| crate::sim::planet::building_profile(&self.defs, p, t, owner))
+            .map(|prof| prof.housing)
+            .sum()
+    }
+
+    /// Checks one order for fleet `f`, carried out while the fleet is in system `at`.
+    pub fn check_order(&self, f: &Fleet, at: SystemId, o: &FleetOrder) -> Result<(), String> {
+        match o {
+            FleetOrder::Move { coordinates: c } => {
+                if !(c[0].is_finite() && c[1].is_finite()) {
+                    return Err("coordinates must be finite".into());
+                }
+            }
+            FleetOrder::Jump { system } => {
+                if system.idx() >= self.systems.len() {
+                    return Err("no such system".into());
+                }
+                if !self.system(at).links.contains(system) {
+                    return Err(format!(
+                        "no hyperlane from {} to {}",
+                        self.system(at).display_name,
+                        self.system(*system).display_name
+                    ));
+                }
+            }
+            FleetOrder::Bombard { planet, .. } => {
+                self.check_planet(*planet)?;
+                let p = self.planet(*planet);
+                if p.system != at {
+                    return Err(format!(
+                        "{} is not in {}",
+                        p.display_name,
+                        self.system(at).display_name
+                    ));
+                }
+                match p.owner {
+                    Some(o) if o == f.owner => {
+                        return Err("a fleet cannot bombard its own planet".into());
+                    }
+                    Some(o) if !self.at_war(f.owner, o) => {
+                        return Err(format!(
+                            "{} is not at war with {}",
+                            self.empire(f.owner).display_name,
+                            self.empire(o).display_name
+                        ));
+                    }
+                    None if self.system(at).owner.is_some_and(|o| o != f.owner) => {
+                        return Err(format!(
+                            "{} is an unclaimed planet in another empire's system",
+                            p.display_name
+                        ));
+                    }
+                    _ => {}
+                }
+                if f.max_range(&self.empire(f.owner).ship_stats) <= 0.0 {
+                    return Err(format!("{} has no weapons", f.display_name));
+                }
+            }
         }
-        Ok(upfront)
+        Ok(())
     }
 
     fn check_fleet(&self, fleet: FleetId) -> Result<&Fleet, String> {
@@ -456,15 +543,18 @@ impl World {
             .ok_or_else(|| format!("no fleet with id {}", fleet.0))
     }
 
+    /// Checks whether the owner of `planet` may install `upgrade` on `tile`.
     pub fn can_upgrade(
         &self,
         planet: PlanetId,
         tile: usize,
         upgrade: UpgradeId,
-        storage: &[f64],
     ) -> Result<(), String> {
         self.check_tile(planet, tile)?;
         let p = self.planet(planet);
+        if upgrade.idx() >= self.defs.upgrades.len() {
+            return Err(format!("no upgrade with id {}", upgrade.0));
+        }
         let up = self.defs.upgrade(upgrade);
         let Some(owner) = self.planet_owner(planet) else {
             return Err(format!("{} is not owned by any empire", p.display_name));
@@ -493,7 +583,7 @@ impl World {
             ));
         }
         if let Some(n) = up
-            .needs_upgrades
+            .after_upgrades
             .iter()
             .find(|n| !inst.upgrades.contains(n))
         {
@@ -514,17 +604,10 @@ impl World {
                 self.defs.tech(*t).display_name
             ));
         }
-        if !can_afford(storage, &up.cost) {
-            return Err(format!(
-                "cannot afford {} ({})",
-                up.display_name,
-                describe_cost(self, &up.cost)
-            ));
-        }
         Ok(())
     }
 
-    pub fn can_terraform(&self, planet: PlanetId, storage: &[f64]) -> Result<(), String> {
+    pub fn can_terraform(&self, planet: PlanetId) -> Result<(), String> {
         self.check_planet(planet)?;
         let p = self.planet(planet);
         let Some(owner) = self.planet_owner(planet) else {
@@ -533,7 +616,7 @@ impl World {
         if p.habitable {
             return Err(format!("{} is already habitable", p.display_name));
         }
-        if p.terraform_days_left.is_some() {
+        if p.terraform.is_some() {
             return Err(format!("{} is already being terraformed", p.display_name));
         }
         let Some(rule) = self.rules().terraform(p.size) else {
@@ -546,10 +629,32 @@ impl World {
                 self.defs.tech(t).display_name
             ));
         }
-        if !can_afford(storage, &rule.cost) {
+        Ok(())
+    }
+
+    /// Checks whether `empire` may start researching `tech`.
+    pub fn can_research(&self, empire: EmpireId, tech: TechId) -> Result<(), String> {
+        let e = self.empires.get(empire.idx()).ok_or("no such empire")?;
+        if tech.idx() >= self.defs.technologies.len() {
+            return Err(format!("no technology with id {}", tech.0));
+        }
+        let t = self.defs.tech(tech);
+        if e.knows(tech) {
+            return Err(format!("{} is already known", t.display_name));
+        }
+        if e.is_researching(tech) {
+            return Err(format!("{} is already being researched", t.display_name));
+        }
+        // Prerequisites may still be in research: the project waits until they are known.
+        if let Some(p) = t
+            .prerequisites
+            .iter()
+            .find(|p| !e.knows(**p) && !e.is_researching(**p))
+        {
             return Err(format!(
-                "cannot afford terraforming ({})",
-                describe_cost(self, &rule.cost)
+                "{} first needs {}",
+                t.display_name,
+                self.defs.tech(*p).display_name
             ));
         }
         Ok(())
@@ -563,21 +668,106 @@ impl World {
     }
 }
 
+pub fn describe_cost(world: &World, cost: &Cost) -> String {
+    let mut parts: Vec<String> = cost
+        .resources
+        .iter()
+        .map(|a| {
+            format!(
+                "{:.0} {}",
+                a.count,
+                world.defs.resource(a.resource).display_name
+            )
+        })
+        .collect();
+    if cost.days > 0 {
+        parts.push(format!("{} days", cost.days));
+    }
+    parts.join(", ")
+}
+
+/// Starts a tile project, or applies it at once if it costs nothing.
+fn start_project(world: &mut World, planet: PlanetId, tile: usize, c: Construction) {
+    let p = world.planet_mut(planet);
+    if c.remaining.is_done() {
+        let t = &mut p.tiles[tile];
+        match c.kind {
+            ProjectKind::Building(b) => {
+                t.building = Some(BuildingInstance::new(b));
+                if let Some(e) = c.empire.filter(|e| p.owner != Some(*e)) {
+                    p.claims.push(e);
+                }
+            }
+            ProjectKind::Upgrade(u) => {
+                if let Some(b) = &mut t.building {
+                    b.upgrades.push(u);
+                }
+            }
+            ProjectKind::Remove => t.building = None,
+        }
+    } else {
+        p.tiles[tile].construction = Some(c);
+    }
+    p.invalidate();
+}
+
+/// Replaces (or extends) a fleet's orders. A new queue starts the hyperdrives from scratch.
+fn set_orders(world: &mut World, fleet: FleetId, orders: Vec<FleetOrder>, append: bool) {
+    let f = world.fleet_mut(fleet).unwrap();
+    if append {
+        f.orders.extend(orders);
+    } else {
+        f.orders = orders;
+        for s in &mut f.ships {
+            s.jump_charge = 0.0;
+        }
+    }
+}
+
 pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
     let day = world.day;
     match cmd {
         Command::MovePops { from, to, count } => {
             world.check_planet(from)?;
             world.check_planet(to)?;
-            let n = count.min(world.planet(from).pop);
-            world.planet_mut(from).pop -= n;
-            world.planet_mut(to).pop += n;
+            // Pops can only go where there is housing for them.
+            let dest = world.planet(to);
+            let free = (world.housing(to) - dest.pop() as f64).floor().max(0.0) as u64;
+            if free == 0 {
+                return Err(format!(
+                    "{} has no free housing: build housing there first",
+                    dest.display_name
+                ));
+            }
+            let moved = world.planet_mut(from).remove_pops(count.min(free));
+            let n: u64 = moved.iter().map(|(_, c)| c).sum();
+            for (s, c) in moved {
+                world.planet_mut(to).add_pops(s, c);
+            }
             let msg = format!(
                 "{n} pops relocated from {} to {}",
                 world.planet(from).display_name,
                 world.planet(to).display_name
             );
             Ok(Some(Event::new(day, EventKind::Command, msg).planet(to)))
+        }
+        Command::SetPopulation {
+            planet,
+            species,
+            count,
+        } => {
+            world.check_planet(planet)?;
+            if species.idx() >= world.defs.species.len() {
+                return Err(format!("no species with id {}", species.0));
+            }
+            let p = world.planet_mut(planet);
+            let now = p.species_count(species);
+            if count > now {
+                p.add_pops(species, count - now);
+            } else {
+                p.remove_species(species, now - count);
+            }
+            Ok(None)
         }
         Command::AssignWorkers {
             planet,
@@ -629,42 +819,38 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
             empire,
         } => {
             world.check_planet(planet)?;
+            if building.idx() >= world.defs.buildings.len() {
+                return Err(format!("no building with id {}", building.0));
+            }
             let p = world.planet(planet);
             let owner = empire
                 .or(p.owner)
                 .or(world.system(p.system).owner)
                 .ok_or("nobody owns this system: specify which empire builds")?;
-            let plan =
-                world.can_build(owner, planet, tile, building, &world.empire(owner).storage)?;
-            let def = world.defs.building(building).clone();
-            pay(&mut world.empires[owner.idx()].storage, &plan.cost);
-            let p = world.planet_mut(planet);
-            if plan.days == 0 {
-                p.tiles[tile].building = Some(BuildingInstance::new(building));
-                if p.owner.is_none() {
-                    p.claims.push(owner);
-                }
-            } else {
-                p.tiles[tile].construction = Some(Construction::Building {
-                    def: building,
-                    days_left: plan.days,
-                    empire: Some(owner),
-                    paid: plan.cost.clone(),
-                });
-            }
-            p.dirty = true;
+            let plan = world.build_plan(owner, planet, tile, building)?;
+            let name = world.defs.building(building).display_name.clone();
+            let days = plan.cost.days;
+            let empire = (world.planet(planet).owner != Some(owner)).then_some(owner);
+            start_project(
+                world,
+                planet,
+                tile,
+                Construction {
+                    paid: Vec::new(),
+                    kind: ProjectKind::Building(building),
+                    remaining: plan.cost,
+                    empire,
+                },
+            );
             let msg = match plan.expansion_jumps {
                 Some(_) => format!(
-                    "{} stakes a claim on {}, building {} ({} days)",
+                    "{} stakes a claim on {}, building {name} ({days} days)",
                     world.empire(owner).display_name,
                     world.planet(planet).display_name,
-                    def.display_name,
-                    plan.days
                 ),
                 None => format!(
-                    "{} begins construction of {} on {}",
+                    "{} begins construction of {name} on {}",
                     world.empire(owner).display_name,
-                    def.display_name,
                     world.planet(planet).display_name
                 ),
             };
@@ -677,35 +863,63 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
         Command::Demolish { planet, tile } => {
             world.check_tile(planet, tile)?;
             let t = &world.planet(planet).tiles[tile];
-            if t.building.is_none() {
-                if t.construction.is_none() {
-                    return Err("nothing to demolish".into());
+            if let Some(c) = &t.construction {
+                // Cancel the project and refund what it has paid so far.
+                let payer = c.empire.or(world.planet(planet).owner);
+                let paid = c.paid.clone();
+                if let Some(payer) = payer {
+                    let defs = world.defs.clone();
+                    refund(
+                        defs.ruleset(world.ruleset),
+                        &paid,
+                        &mut world.empires[payer.idx()].storage,
+                    );
                 }
                 let p = world.planet_mut(planet);
                 p.tiles[tile].construction = None;
                 p.dirty = true;
                 return Ok(None);
             }
-            let (payer, cost) = world.demolish_plan(planet, tile)?;
-            if !can_afford(&world.empire(payer).storage, &cost) {
-                return Err(format!(
-                    "cannot afford to clear it ({})",
-                    describe_cost(world, &cost)
-                ));
+            if t.building.is_none() {
+                return Err("nothing to demolish".into());
             }
-            pay(&mut world.empires[payer.idx()].storage, &cost);
-            let p = world.planet_mut(planet);
-            let def = p.tiles[tile].building.take().unwrap().def;
-            p.tiles[tile].construction = None;
-            p.dirty = true;
+            let (payer, cost) = world.demolish_plan(planet, tile)?;
+            let def = world.planet(planet).tiles[tile]
+                .building
+                .as_ref()
+                .unwrap()
+                .def;
             let d = world.defs.building(def);
-            let verb = if d.blocker { "clears" } else { "demolishes" };
-            let msg = format!(
-                "{} {verb} the {} on {}",
-                world.empire(payer).display_name,
-                d.display_name,
-                world.planet(planet).display_name
+            let (verb, name) = (
+                if d.blocker { "clear" } else { "demolish" },
+                d.display_name.clone(),
             );
+            let empire = (world.planet(planet).owner != Some(payer)).then_some(payer);
+            let instant = cost.is_none();
+            start_project(
+                world,
+                planet,
+                tile,
+                Construction {
+                    paid: Vec::new(),
+                    kind: ProjectKind::Remove,
+                    remaining: cost.unwrap_or_default(),
+                    empire,
+                },
+            );
+            let msg = if instant {
+                format!(
+                    "{} {verb}s the {name} on {}",
+                    world.empire(payer).display_name,
+                    world.planet(planet).display_name
+                )
+            } else {
+                format!(
+                    "{} begins to {verb} the {name} on {}",
+                    world.empire(payer).display_name,
+                    world.planet(planet).display_name
+                )
+            };
             Ok(Some(
                 Event::new(day, EventKind::Command, msg)
                     .empire(Some(payer))
@@ -717,25 +931,20 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
             tile,
             upgrade,
         } => {
-            let owner = world.planet_owner(planet).ok_or("planet is unowned")?;
-            world.can_upgrade(planet, tile, upgrade, &world.empire(owner).storage)?;
+            world.can_upgrade(planet, tile, upgrade)?;
+            let owner = world.planet_owner(planet).unwrap();
             let up = world.defs.upgrade(upgrade).clone();
-            pay(&mut world.empires[owner.idx()].storage, &up.cost);
-            let p = world.planet_mut(planet);
-            if up.build_days == 0 {
-                p.tiles[tile]
-                    .building
-                    .as_mut()
-                    .unwrap()
-                    .upgrades
-                    .push(upgrade);
-            } else {
-                p.tiles[tile].construction = Some(Construction::Upgrade {
-                    upgrade,
-                    days_left: up.build_days,
-                });
-            }
-            p.dirty = true;
+            start_project(
+                world,
+                planet,
+                tile,
+                Construction {
+                    paid: Vec::new(),
+                    kind: ProjectKind::Upgrade(upgrade),
+                    remaining: up.build_cost.clone(),
+                    empire: None,
+                },
+            );
             let msg = format!(
                 "{} begins installing {} on {}",
                 world.empire(owner).display_name,
@@ -749,15 +958,19 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
             ))
         }
         Command::Terraform { planet } => {
-            let owner = world.planet_owner(planet).ok_or("planet is unowned")?;
-            world.can_terraform(planet, &world.empire(owner).storage)?;
-            let rule = world
+            world.can_terraform(planet)?;
+            let owner = world.planet_owner(planet).unwrap();
+            let mut cost = world
                 .rules()
                 .terraform(world.planet(planet).size)
                 .unwrap()
+                .cost
                 .clone();
-            pay(&mut world.empires[owner.idx()].storage, &rule.cost);
-            world.planet_mut(planet).terraform_days_left = Some(rule.days.max(1));
+            cost.days = cost.days.max(1);
+            world.planet_mut(planet).terraform = Some(TerraformProject {
+                paid: Vec::new(),
+                remaining: cost,
+            });
             let msg = format!(
                 "{} begins terraforming {}",
                 world.empire(owner).display_name,
@@ -769,20 +982,56 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
                     .planet(planet),
             ))
         }
-        Command::SetResearch { empire, tech } => {
+        Command::CancelTerraform { planet } => {
+            world.check_planet(planet)?;
+            let p = world.planet(planet);
+            let (Some(project), Some(owner)) = (p.terraform.clone(), p.owner) else {
+                return Err(format!("{} is not being terraformed", p.display_name));
+            };
+            let defs = world.defs.clone();
+            refund(
+                defs.ruleset(world.ruleset),
+                &project.paid,
+                &mut world.empires[owner.idx()].storage,
+            );
+            world.planet_mut(planet).terraform = None;
+            Ok(None)
+        }
+        Command::Research { empire, tech } => {
+            world.can_research(empire, tech)?;
+            let remaining = world.defs.research_cost(tech);
+            world.empires[empire.idx()]
+                .research
+                .push(ResearchProject { tech, remaining });
+            Ok(None)
+        }
+        Command::CancelResearch { empire, tech } => {
             let e = world.empires.get(empire.idx()).ok_or("no such empire")?;
-            if let Some(t) = tech
-                && !world.defs.tech_available(t, &e.techs)
-            {
-                return Err(format!(
-                    "{} is not available to research",
-                    world.defs.tech(t).display_name
-                ));
-            }
+            let i = e
+                .research
+                .iter()
+                .position(|p| p.tech == tech)
+                .ok_or("that technology is not being researched")?;
+            // Cancelling a technology also cancels anything queued behind it.
+            let defs = world.defs.clone();
             let e = &mut world.empires[empire.idx()];
-            if e.researching != tech {
-                e.researching = tech;
-                e.research_progress = 0.0;
+            let mut cancelled = vec![e.research.remove(i)];
+            loop {
+                let blocked = e.research.iter().position(|p| {
+                    defs.tech(p.tech)
+                        .prerequisites
+                        .iter()
+                        .any(|q| !e.techs[q.idx()] && !e.is_researching(*q))
+                });
+                match blocked {
+                    Some(j) => cancelled.push(e.research.remove(j)),
+                    None => break,
+                }
+            }
+            let rules = defs.ruleset(world.ruleset);
+            for project in cancelled {
+                let paid = research_paid(&defs, project.tech, &project.remaining);
+                refund(rules, &paid, &mut e.storage);
             }
             Ok(None)
         }
@@ -848,6 +1097,15 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
             resource,
             count,
         } => {
+            if resource.idx() >= world.defs.resource_count() {
+                return Err("no such resource".into());
+            }
+            if world.defs.is_transient(resource) {
+                return Err(format!(
+                    "{} is transient and cannot be stored",
+                    world.defs.resource(resource).display_name
+                ));
+            }
             let e = world
                 .empires
                 .get_mut(empire.idx())
@@ -877,39 +1135,45 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
                     .planet(planet),
             ))
         }
-        Command::BuildShip {
-            planet,
-            ship,
-            fleet,
-        } => {
-            world.check_planet(planet)?;
-            let owner = world.planet(planet).owner.ok_or("planet is unowned")?;
-            let upfront = world.can_build_ship(planet, ship, &world.empire(owner).storage)?;
-            pay(&mut world.empires[owner.idx()].storage, &upfront);
-            let remaining = crate::loader::on_demand_cost(&world.defs, ship);
-            world.empires[owner.idx()].ship_queue.push(ShipOrder {
+        Command::BuildShip { planet, ship } => {
+            let owner = world.can_build_ship(planet, ship)?;
+            let remaining = world.defs.ship(ship).build_cost.clone();
+            world.empires[owner.idx()].shipbuilding.push(ShipProject {
                 ship,
                 planet,
+                paid: Vec::new(),
                 remaining,
-                fleet,
             });
             Ok(None)
         }
-        Command::CancelShipOrder { empire, index } => {
+        Command::CancelShip { empire, index } => {
             let e = world.empires.get(empire.idx()).ok_or("no such empire")?;
-            if index >= e.ship_queue.len() {
-                return Err("no such ship order".into());
+            if index >= e.shipbuilding.len() {
+                return Err("no such ship under construction".into());
             }
-            let order = world.empires[empire.idx()].ship_queue.remove(index);
+            let project = world.empires[empire.idx()].shipbuilding.remove(index);
             let defs = world.defs.clone();
-            for a in defs
-                .ship(order.ship)
-                .build_cost
-                .iter()
-                .filter(|a| !defs.resource(a.resource).on_demand)
-            {
-                world.empires[empire.idx()].storage[a.resource.idx()] += a.count;
+            refund(
+                defs.ruleset(world.ruleset),
+                &project.paid,
+                &mut world.empires[empire.idx()].storage,
+            );
+            Ok(None)
+        }
+        Command::SetOrders {
+            fleet,
+            orders,
+            append,
+        } => {
+            let f = world.check_fleet(fleet)?;
+            let mut at = if append { f.destination() } else { f.system };
+            for o in &orders {
+                world.check_order(f, at, o)?;
+                if let FleetOrder::Jump { system } = o {
+                    at = *system;
+                }
             }
+            set_orders(world, fleet, orders, append);
             Ok(None)
         }
         Command::MoveFleet {
@@ -921,21 +1185,19 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
             if system.idx() >= world.systems.len() {
                 return Err("no such system".into());
             }
-            if f.system != system && world.next_hop(f.system, system).is_none() {
-                return Err(format!(
+            let mut orders = world.route_orders(f.system, system).ok_or_else(|| {
+                format!(
                     "no hyperlane route to {}",
                     world.system(system).display_name
-                ));
+                )
+            })?;
+            if let Some(c) = coordinates {
+                if !(c[0].is_finite() && c[1].is_finite()) {
+                    return Err("coordinates must be finite".into());
+                }
+                orders.push(FleetOrder::Move { coordinates: c });
             }
-            if let Some(c) = coordinates
-                && !(c[0].is_finite() && c[1].is_finite())
-            {
-                return Err("coordinates must be finite".into());
-            }
-            world.fleet_mut(fleet).unwrap().order = FleetOrder::Move {
-                system,
-                coordinates,
-            };
+            set_orders(world, fleet, orders, false);
             Ok(None)
         }
         Command::Bombard {
@@ -945,32 +1207,22 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
         } => {
             world.check_planet(planet)?;
             let f = world.check_fleet(fleet)?;
-            let p = world.planet(planet);
-            match p.owner {
-                Some(o) if o == f.owner => {
-                    return Err("a fleet cannot bombard its own planet".into());
-                }
-                Some(o) if !world.at_war(f.owner, o) => {
-                    return Err(format!(
-                        "{} is not at war with {}",
-                        world.empire(f.owner).display_name,
-                        world.empire(o).display_name
-                    ));
-                }
-                _ => {}
-            }
-            if f.system != p.system && world.next_hop(f.system, p.system).is_none() {
-                return Err(format!("no hyperlane route to {}", p.display_name));
-            }
-            if f.max_range(&world.defs) <= 0.0 {
-                return Err(format!("{} has no weapons", f.display_name));
-            }
-            world.fleet_mut(fleet).unwrap().order = FleetOrder::Bombard { planet, tile };
+            let target = world.planet(planet).system;
+            let mut orders = world.route_orders(f.system, target).ok_or_else(|| {
+                format!(
+                    "no hyperlane route to {}",
+                    world.planet(planet).display_name
+                )
+            })?;
+            let order = FleetOrder::Bombard { planet, tile };
+            world.check_order(f, target, &order)?;
+            orders.push(order);
+            set_orders(world, fleet, orders, false);
             Ok(None)
         }
         Command::StopFleet { fleet } => {
             world.check_fleet(fleet)?;
-            world.fleet_mut(fleet).unwrap().order = FleetOrder::Idle;
+            set_orders(world, fleet, Vec::new(), false);
             Ok(None)
         }
         Command::MergeFleets { into, from } => {
@@ -981,8 +1233,17 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
             if a.owner != b.owner || a.system != b.system {
                 return Err("fleets must share an owner and a system to merge".into());
             }
+            let limit = world.empire(a.owner).max_fleet_size(world.rules());
+            let (sa, sb) = (a.size(&world.defs), b.size(&world.defs));
+            if sa + sb > limit {
+                return Err(format!(
+                    "a fleet has at most {limit} slots ({sa} + {sb} would be needed)"
+                ));
+            }
             let ships = std::mem::take(&mut world.fleet_mut(from).unwrap().ships);
-            world.fleet_mut(into).unwrap().ships.extend(ships);
+            let f = world.fleet_mut(into).unwrap();
+            f.ships.extend(ships);
+            f.reform();
             world.remove_fleet(from);
             Ok(None)
         }
@@ -1007,7 +1268,9 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
             for i in ships.into_iter().rev() {
                 new.ships.push(src.ships.remove(i));
             }
+            src.reform();
             new.ships.reverse();
+            new.reform();
             world.add_fleet(new);
             Ok(None)
         }
@@ -1053,19 +1316,19 @@ fn set_war(world: &mut World, empire: EmpireId, target: EmpireId, war: bool) -> 
     let (kind, msg) = if war {
         (EventKind::WarDeclared, format!("{a} declares war on {b}"))
     } else {
-        // Peace stands down any bombardment of the former enemy.
         (EventKind::PeaceMade, format!("{a} makes peace with {b}"))
     };
     if !war {
+        // Peace stands down any bombardment of the former enemy.
         for f in &mut world.fleets {
-            if let FleetOrder::Bombard { planet, .. } = f.order {
+            f.orders.retain(|o| {
+                let FleetOrder::Bombard { planet, .. } = o else {
+                    return true;
+                };
                 let owner = world.planets.get(planet.idx()).and_then(|p| p.owner);
-                if (f.owner == empire && owner == Some(target))
-                    || (f.owner == target && owner == Some(empire))
-                {
-                    f.order = FleetOrder::Idle;
-                }
-            }
+                !((f.owner == empire && owner == Some(target))
+                    || (f.owner == target && owner == Some(empire)))
+            });
         }
     }
     Ok(Some(Event::new(world.day, kind, msg).empire(Some(empire))))

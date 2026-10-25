@@ -1,7 +1,7 @@
 // Spacebox admin client: panels, inspector, actions and the play loop.
 
 import { store, subscribe, loadAll, tick, api } from './api.js';
-import { Scene, buildingColor, empireColor, fleetDestination } from './scene.js';
+import { Scene, buildingColor, empireColor } from './scene.js';
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -23,6 +23,26 @@ const S = () => store.state;
 const D = () => store.defs;
 const resName = (id) => D().resources[id]?.display_name ?? `#${id}`;
 const costStr = (list) => (list.length ? list.map(([r, c]) => `${num(c)} ${resName(r)}`).join(', ') : 'free');
+/// A project cost (or what remains of one): `{ resources, days }`.
+const projStr = (c) => {
+  const parts = c.resources.filter(([, n]) => n > 0).map(([r, n]) => `${num(n)} ${resName(r)}`);
+  if (c.days) parts.push(`${c.days} days`);
+  return parts.length ? parts.join(', ') : 'nothing';
+};
+/// A production list: `{ resources, amenities }`.
+const yieldStr = (y) => {
+  const parts = y.resources.map(([r, n]) => `${num(n, 1)} ${resName(r)}`);
+  if (y.amenities) parts.push(`${num(y.amenities)} amenities`);
+  return parts.join(', ');
+};
+/// Fraction of a project done, counting resources and days alike.
+const progress = (total, left) => {
+  const sum = (c) => c.resources.reduce((a, [, n]) => a + n, 0) + c.days;
+  const t = sum(total);
+  return t > 0 ? 1 - sum(left) / t : 1;
+};
+const speciesName = (id) => D().species[id]?.display_name ?? `#${id}`;
+const popStr = (p) => p.population.map(([sp, n]) => `${num(n)} ${speciesName(sp)}`).join(', ');
 const planetOwner = (pid) => S().planets[pid].owner;
 const fleetById = (id) => S().fleets.find((f) => f.id === id);
 const shipName = (id) => D().ships[id]?.display_name ?? `#${id}`;
@@ -62,6 +82,34 @@ function expansionCost(empire, sys) {
   const n = Math.max(0, jumps - 1);
   return { jumps, influence: r.expansion_base_cost * 2 ** n, days: Math.round(r.expansion_base_days * 2 ** (n / 2)) };
 }
+/// Jump orders along a shortest hyperlane route (client-side BFS).
+function routeOrders(from, to) {
+  const s = S();
+  const prev = new Array(s.systems.length).fill(-1);
+  prev[from] = from;
+  const queue = [from];
+  for (let i = 0; i < queue.length && prev[to] === -1; i++) {
+    for (const n of s.systems[queue[i]].links) {
+      if (prev[n] === -1) {
+        prev[n] = queue[i];
+        queue.push(n);
+      }
+    }
+  }
+  if (prev[to] === -1) throw new Error(`no hyperlane route to ${s.systems[to].display_name}`);
+  const path = [];
+  for (let at = to; at !== from; at = prev[at]) path.unshift({ order: 'jump', system: at });
+  return path;
+}
+
+/// One order in words.
+function orderStr(o) {
+  const s = S();
+  if (o.order === 'move') return `move to (${o.coordinates.map((v) => num(v)).join(', ')})`;
+  if (o.order === 'jump') return `jump to ${s.systems[o.system].display_name}`;
+  return `bombard ${s.planets[o.planet].display_name}${o.tile != null ? ` (tile ${o.tile})` : ''}`;
+}
+
 const knows = (empire, tech) => empire != null && S().empires[empire].techs.includes(tech);
 const techsMet = (empire, list) => list.every((t) => knows(empire, t));
 
@@ -162,7 +210,7 @@ function empiresPanel() {
       <div class="name">${esc(e.display_name)}${e.ai ? '<span class="badge">AI</span>' : ''}${e.at_war.length ? '<span class="badge crisis">at war</span>' : ''}${e.crises.length ? `<span class="badge crisis">${e.crises.length} crisis</span>` : ''}</div>
       <div class="meta">${num(e.stats.pop)} pops · ${e.stats.systems} systems · ${e.stats.planets} planets</div>
       <div class="meta">${s.fleets.filter((f) => f.owner === e.id).reduce((a, f) => a + f.ships.length, 0)} ships · ${num(e.storage[D().rules.expansion_resource] ?? 0)} influence</div>
-      <div class="meta">research ${num(e.stats.research_income, 1)}/day${e.researching != null ? ` → ${esc(D().technologies[e.researching].display_name)}` : ''}</div>
+      <div class="meta">${transientLine(e)}${e.research.length ? ` → ${esc(D().technologies[e.research[0].tech].display_name)}` : ''}</div>
     </div>`).join('');
 }
 
@@ -176,9 +224,17 @@ function inspector() {
   }
 }
 
+/// Daily transient output (research, shipbuilding) and how much of it goes to waste.
+function transientLine(e) {
+  return D().resources.filter((r) => r.transient).map((r) => {
+    const waste = e.wasted[r.id] > 0.05 ? ` <span class="neg">(${num(e.wasted[r.id], 1)} wasted)</span>` : '';
+    return `${esc(r.display_name.toLowerCase())} ${num(e.income[r.id], 1)}/day${waste}`;
+  }).join(' · ');
+}
+
 function storageTable(e, editable) {
   const rows = D().resources.map((r) => {
-    if (!r.stockpile) return '';
+    if (r.transient) return '';
     return `<tr><td>${esc(r.display_name)}</td><td class="num">${num(e.storage[r.id])}</td><td class="num">${signed(e.income[r.id])}</td>
       ${editable ? `<td><input type="number" step="any" data-res="${r.id}" placeholder="set" style="width:70px"></td><td><button class="small" data-act="empire-set-storage" data-id="${e.id}" data-res="${r.id}">set</button></td>` : ''}</tr>`;
   }).join('');
@@ -213,8 +269,8 @@ function empireInspector(id) {
   const s = S();
   const e = s.empires[id];
   const d = D();
-  const available = d.technologies.filter((t) => !e.techs.includes(t.id) && t.prerequisites.every((p) => e.techs.includes(p)));
-  const cur = e.researching != null ? d.technologies[e.researching] : null;
+  const researching = e.research.map((r) => r.tech);
+  const available = d.technologies.filter((t) => !e.techs.includes(t.id) && !researching.includes(t.id) && t.prerequisites.every((p) => e.techs.includes(p) || researching.includes(p)));
   const systems = s.systems.filter((x) => x.owner === id);
   return `
     <h2><span class="swatch" style="background:${empireColor(s, id)}"></span>${esc(e.display_name)}</h2>
@@ -229,14 +285,24 @@ function empireInspector(id) {
       <input type="range" min="0" max="1" step="0.05" value="${e.ai[t]}" data-change="empire-trait" data-trait="${t}" data-id="${id}" style="flex:1">
       <span class="muted">${num(e.ai[t], 2)}</span></div>`).join('')}</div>` : ''}
     <div class="kv"><span>Population</span><span>${num(e.stats.pop)}</span><span>Planets</span><span>${e.stats.planets}</span>
+      <span>Species</span><span><select data-change="empire-species" data-id="${id}"><option value="">none</option>${d.species.map((sp) => `<option value="${sp.id}" ${sp.id === e.dominant_species ? 'selected' : ''}>${esc(sp.display_name)}</option>`).join('')}</select></span>
+      <span>Fleet size</span><span>up to ${e.max_fleet_size} slots</span>
       <span>Capital</span><span>${e.capital != null ? `<a class="list-item" data-act="goto-system" data-id="${e.capital}">${esc(s.systems[e.capital].display_name)}</a>` : '–'}</span></div>
     ${e.crises.length ? `<h3>Crises</h3>${e.crises.map((c) => `<div class="neg">${esc(resName(c.resource))}: ${num(c.severity * 100)}% unmet since day ${c.since_day}</div>`).join('')}` : ''}
     <h3>Storage</h3>${storageTable(e, true)}
-    <h3>Research (${num(e.stats.research_income, 1)}/day)</h3>
-    ${cur ? `<div>${esc(cur.display_name)} — ${num(e.research_progress)}/${num(cur.cost)}</div><div class="bar"><div style="width:${Math.min(100, (e.research_progress / cur.cost) * 100)}%"></div></div>` : '<div class="muted">Nothing (auto-picks cheapest)</div>'}
-    <div class="row"><select data-change="empire-research" data-id="${id}"><option value="">— choose research —</option>${available.map((t) => `<option value="${t.id}" ${t.id === e.researching ? 'selected' : ''}>${esc(t.display_name)} (${num(t.cost)})</option>`).join('')}</select></div>
+    <h3>Transient output</h3>
+    <div>${transientLine(e)}</div>
+    <div class="muted">Transient resources are never stored: what no project uses is wasted.</div>
+    <h3>Research</h3>
+    ${e.research.map((r) => {
+      const t = d.technologies[r.tech];
+      const waiting = t.prerequisites.some((p) => !e.techs.includes(p));
+      return `<div class="row">${esc(t.display_name)} <span class="muted">${waiting ? 'waiting for prerequisites' : `${esc(projStr(r.remaining))} left`}</span>
+        <button class="small" data-act="research-cancel" data-id="${id}" data-tech="${r.tech}">cancel</button></div>${bar(progress({ resources: t.cost, days: 0 }, r.remaining))}`;
+    }).join('') || '<div class="muted">Nothing is being researched.</div>'}
+    <div class="row"><select data-change="empire-research" data-id="${id}"><option value="">— add research —</option>${available.map((t) => `<option value="${t.id}">${esc(t.display_name)} (${esc(costStr(t.cost))})</option>`).join('')}</select></div>
     <h3>Technologies (admin grant/revoke)</h3>
-    <div class="techs">${d.technologies.map((t) => `<div><label><input type="checkbox" data-change="empire-tech" data-id="${id}" data-tech="${t.id}" ${e.techs.includes(t.id) ? 'checked' : ''}>${esc(t.display_name)}</label> <span class="muted">${esc(t.category ?? '')}</span></div>`).join('')}</div>
+    <div class="techs">${d.technologies.map((t) => `<div><label><input type="checkbox" data-change="empire-tech" data-id="${id}" data-tech="${t.id}" ${e.techs.includes(t.id) ? 'checked' : ''}>${esc(t.display_name)}</label> <span class="muted">${esc(t.tags.join(', '))}</span></div>`).join('')}</div>
     <h3>Diplomacy</h3>
     ${s.empires.filter((o) => o.id !== id).map((o) => {
       const war = e.wars.find((w) => w.enemy === o.id);
@@ -248,11 +314,7 @@ function empireInspector(id) {
     }).join('') || '<p class="muted">No other empires.</p>'}
     <h3>Fleets</h3>
     ${s.fleets.filter((f) => f.owner === id).map((f) => `<div class="list-item" data-act="select-fleet" data-id="${f.id}">${esc(f.display_name)} <span class="muted">${f.ships.length} ships @ ${esc(s.systems[f.system].display_name)}${f.in_combat ? ' · <span class="neg">in combat</span>' : ''}</span></div>`).join('') || '<p class="muted">None</p>'}
-    ${e.ship_queue.length ? `<h3>Ship queue</h3>${e.ship_queue.map((o, i) => {
-      const total = D().ships[o.ship].build_cost.filter(([r]) => D().resources[r].on_demand).reduce((a, [, c]) => a + c, 0);
-      const left = o.remaining.reduce((a, [, c]) => a + c, 0);
-      return `<div class="row">${esc(shipName(o.ship))} at ${esc(s.planets[o.planet].display_name)}<button class="small" data-act="cancel-ship" data-id="${id}" data-index="${i}">cancel</button></div>${bar(total ? 1 - left / total : 1)}`;
-    }).join('')}` : ''}
+    ${e.shipbuilding.length ? `<h3>Ships under construction</h3>${e.shipbuilding.map((o, i) => `<div class="row">${esc(shipName(o.ship))} at ${esc(s.planets[o.planet].display_name)} <span class="muted">${esc(projStr(o.remaining))} left</span><button class="small" data-act="cancel-ship" data-id="${id}" data-index="${i}">cancel</button></div>${bar(progress(D().ships[o.ship].build_cost, o.remaining))}`).join('')}` : ''}
     <h3>Spawn fleet (admin)</h3>
     <div class="box">
       <div class="row"><label>System</label><select id="sf-system">${s.systems.map((x) => `<option value="${x.id}" ${x.id === e.capital ? 'selected' : ''}>${esc(x.display_name)}</option>`).join('')}</select></div>
@@ -276,12 +338,11 @@ function fleetInspector(id) {
   const f = fleetById(id);
   const owner = s.empires[f.owner];
   const sys = s.systems[f.system];
-  const dest = fleetDestination(s, f);
-  let order = 'Idle';
-  if (f.order.type === 'move') order = `Moving to ${esc(s.systems[f.order.system].display_name)}${f.order.coordinates ? ` (${f.order.coordinates.map((v) => num(v)).join(', ')})` : ''}`;
-  if (f.order.type === 'bombard') order = `Bombarding ${esc(s.planets[f.order.planet].display_name)}${f.order.tile != null ? ` (tile ${f.order.tile})` : ''}`;
-  const enemies = (p) => p.owner == null || owner.at_war.includes(p.owner);
-  const targets = s.planets.filter((p) => p.owner !== f.owner && enemies(p));
+  const orders = f.orders.map((o, i) => `<div class="${i === 0 ? '' : 'muted'}">${i + 1}. ${esc(orderStr(o))}</div>`).join('') || '<div class="muted">Idle</div>';
+  // Enemy planets, or unclaimed ones in systems nobody else owns.
+  const targets = s.planets.filter((p) => (p.owner == null
+    ? s.systems[p.system].owner == null || s.systems[p.system].owner === f.owner
+    : p.owner !== f.owner && owner.at_war.includes(p.owner)));
   const mates = s.fleets.filter((o) => o.id !== id && o.owner === f.owner && o.system === f.system);
   const power = f.ships.reduce((a, [def]) => a + d.ships[def].dps, 0);
   return `
@@ -290,12 +351,14 @@ function fleetInspector(id) {
     <div class="kv">
       <span>Owner</span><span><a class="list-item" data-act="select-empire" data-id="${f.owner}">${esc(owner.display_name)}</a></span>
       <span>Location</span><span><a class="list-item" data-act="goto-system" data-id="${f.system}">${esc(sys.display_name)}</a> (${f.coordinates.map((v) => num(v)).join(', ')})</span>
-      <span>Order</span><span>${order}</span>
-      <span>Status</span><span>${f.in_combat ? '<span class="neg">in combat</span>' : 'quiet'}</span>
+      <span>Status</span><span>${f.in_combat ? '<span class="neg">in combat (orders wait)</span>' : 'quiet'}</span>
       <span>Firepower</span><span>${num(power)} dmg/day</span>
+      <span>Size</span><span>${f.size} / ${owner.max_fleet_size} slots</span>
     </div>
-    ${dest != null && dest !== f.system ? `<div>Hyperdrive charge ${num(f.jump_charge, 1)} / ${num(f.jump_time, 1)} days</div>${bar(f.jump_time ? f.jump_charge / f.jump_time : 1)}` : ''}
-    <h3>Orders</h3>
+    <h3>Order queue</h3>
+    ${orders}
+    ${f.orders[0]?.order === 'jump' ? `<div>Hyperdrive charge (slowest ship)</div>${bar(f.jump_progress)}` : ''}
+    <div class="row"><label><input type="checkbox" id="fl-append">add to the end of the queue</label></div>
     <div class="row"><select id="fl-dest">${s.systems.map((x) => `<option value="${x.id}" ${x.id === f.system ? 'selected' : ''}>${esc(x.display_name)}</option>`).join('')}</select>
       <button class="small primary" data-act="fleet-move" data-id="${id}">move</button></div>
     <div class="row"><select id="fl-target">${targets.map((p) => `<option value="${p.id}">${esc(p.display_name)} (${p.owner != null ? esc(s.empires[p.owner].display_name) : 'unowned'})</option>`).join('')}</select>
@@ -307,7 +370,8 @@ function fleetInspector(id) {
     <table><tr><th>Design</th><th>Hull</th><th>Shield</th></tr>
     ${f.ships.map(([def, hull, shield]) => {
       const sd = d.ships[def];
-      return `<tr><td>${esc(sd.display_name)}</td><td>${bar(hull / sd.hull, '#6bd68a')}</td><td>${sd.shield ? bar(shield / sd.shield, '#6fb3ff') : ''}</td></tr>`;
+      const st = owner.ship_stats[def];
+      return `<tr><td>${esc(sd.display_name)}</td><td>${bar(hull / st.hull, '#6bd68a')}</td><td>${st.shield ? bar(shield / st.shield, '#6fb3ff') : ''}</td></tr>`;
     }).join('')}</table>
     <h3>Admin</h3>
     <div class="row"><button class="small" data-act="fleet-repair" data-id="${id}">repair</button>
@@ -338,7 +402,7 @@ function systemInspector(id) {
     ${sys.planets.map((pid) => {
       const p = s.planets[pid];
       const own = p.owner != null ? `<span class="swatch" style="background:${empireColor(s, p.owner)}"></span>` : '';
-      return `<div class="list-item" data-act="select-planet" data-id="${pid}">${own}${esc(p.display_name)} <span class="muted">${p.size} ${p.habitable ? 'habitable' : 'barren'}${p.pop ? ` · ${num(p.pop)} pops` : ''}${p.moon_of ? ` · moon of ${esc(p.moon_of)}` : ''}${p.siege > 0 ? ' · <span class="neg">under siege</span>' : ''}</span></div>`;
+      return `<div class="list-item" data-act="select-planet" data-id="${pid}">${own}${esc(p.display_name)} <span class="muted">${p.size} ${p.habitable ? 'habitable' : 'barren'}${p.pop ? ` · ${num(p.pop)} pops` : ''}${p.siege > 0 ? ' · <span class="neg">under siege</span>' : ''}</span></div>`;
     }).join('') || '<p class="muted">No planets</p>'}
     <h3>Fleets here</h3>
     ${s.fleets.filter((f) => f.system === id).map((f) => `<div class="list-item" data-act="select-fleet" data-id="${f.id}"><span class="swatch" style="background:${empireColor(s, f.owner)}"></span>${esc(f.display_name)} <span class="muted">${f.ships.length} ships${f.in_combat ? ' · <span class="neg">fighting</span>' : ''}</span></div>`).join('') || '<p class="muted">None</p>'}
@@ -347,7 +411,8 @@ function systemInspector(id) {
       <div class="row"><input type="text" id="np-name" placeholder="Name"></div>
       <div class="row"><select id="np-size"><option value="large">large (32 tiles)</option><option value="small">small (12 tiles)</option></select>
         <label><input type="checkbox" id="np-hab">habitable</label></div>
-      <div class="row"><label>Pops</label><input type="number" id="np-pop" value="0" min="0"><input type="text" id="np-moon" placeholder="moon of (optional)" style="width:120px"></div>
+      <div class="row"><label>Pops</label><input type="number" id="np-pop" value="0" min="0">
+        <select id="np-species">${D().species.map((sp) => `<option value="${sp.id}">${esc(sp.display_name)}</option>`).join('')}</select></div>
       <div class="row"><button class="primary" data-act="system-add-planet" data-id="${id}">Add planet</button></div>
     </div>`;
 }
@@ -372,8 +437,9 @@ function planetInspector(id, tile) {
       <span>System</span><span><a class="list-item" data-act="select-system" data-id="${p.system}">${esc(s.systems[p.system].display_name)}</a></span>
       <span>Owner</span><span><select data-change="planet-owner" data-id="${id}"><option value="">unowned</option>${s.empires.map((e) => `<option value="${e.id}" ${e.id === owner ? 'selected' : ''}>${esc(e.display_name)}</option>`).join('')}</select></span>
       <span>Coordinates</span><span>${p.coordinates.map((v) => num(v, 1)).join(', ')}</span>
-      <span>Type</span><span>${p.size}, ${p.habitable ? 'habitable' : 'barren'}${p.terraform_days_left ? ` (terraforming, ${p.terraform_days_left} days)` : ''}</span>
+      <span>Type</span><span>${p.size}, ${p.habitable ? 'habitable' : 'barren'}${p.terraform ? ` (terraforming, ${esc(projStr(p.terraform.remaining))} left)` : ''}</span>
       <span>Population</span><span>${num(p.pop)} / ${num(st.housing)} housing</span>
+      ${p.population.length ? `<span>Species</span><span>${esc(popStr(p))}</span>` : ''}
       <span>Jobs</span><span>${num(st.employed)} filled of ${num(st.jobs)} (${num(st.free_jobs)} free)</span>
       <span>Unemployed</span><span>${num(st.unemployed)}${st.homeless ? `, ${num(st.homeless)} homeless` : ''}</span>
       <span>Amenities</span><span>${num(st.amenities)} / ${num(st.amenities_needed)}</span>
@@ -388,37 +454,38 @@ function planetInspector(id, tile) {
       <button class="small" data-act="pop-add" data-id="${id}" data-n="-10">−10</button>
       <button class="small" data-act="pop-add" data-id="${id}" data-n="10">+10</button>
       <button class="small" data-act="pop-add" data-id="${id}" data-n="100">+100</button>
-      <input type="number" id="pl-pop" min="0" placeholder="set"><button class="small" data-act="pop-set" data-id="${id}">set</button>
     </div>
+    <div class="row"><select id="pl-species">${d.species.map((sp) => `<option value="${sp.id}">${esc(sp.display_name)}</option>`).join('')}</select>
+      <input type="number" id="pl-pop" min="0" placeholder="count"><button class="small" data-act="pop-set" data-id="${id}">set</button></div>
     <div class="row"><label>Move</label><input type="number" id="mv-count" min="1" value="50">
       <select id="mv-to">${others.map((x) => `<option value="${x.id}">${esc(x.display_name)}</option>`).join('')}</select>
       <button class="small" data-act="move-pops" data-id="${id}">move</button></div>
     <h3>World</h3>
     <div class="row">
       <label><input type="checkbox" data-change="planet-habitable" data-id="${id}" ${p.habitable ? 'checked' : ''}>habitable (admin)</label>
-      ${!p.habitable && tf ? `<button class="small" data-act="terraform" data-id="${id}" title="${esc(costStr(tf.cost))}, ${tf.days} days">Terraform</button>` : ''}
-      ${p.terraform_days_left ? `<button class="small" data-act="terraform-instant" data-id="${id}">finish now</button>` : ''}
+      ${!p.habitable && tf && !p.terraform ? `<button class="small" data-act="terraform" data-id="${id}" title="${esc(projStr(tf.cost))}">Terraform</button>` : ''}
+      ${p.terraform ? `<button class="small" data-act="terraform-cancel" data-id="${id}">cancel terraforming</button><button class="small" data-act="terraform-instant" data-id="${id}">finish now</button>` : ''}
     </div>
     ${flows ? `<h3>Net production / day</h3><table>${flows}</table>` : ''}
     ${tile != null ? tileInspector(id, tile) : `<p class="muted">${ui.view.mode === 'planet' ? 'Click a tile to manage it.' : 'Open the surface to manage tiles.'}</p>`}`;
 }
 
+/// Ships can be built at any owned planet; shipbuilding comes from all of the empire's shipyards.
 function shipyardPanel(pid) {
   const s = S();
   const d = D();
   const p = s.planets[pid];
-  const yard = p.tiles.some((t) => t.b != null && d.buildings[t.b].shipyard && !t.off && (t.dmg ?? 0) < d.rules.building_disable_damage);
-  if (!yard || p.owner == null) return '';
+  if (p.owner == null) return '';
   const owner = p.owner;
   const designs = d.ships.map((sh) => {
     const ok = techsMet(owner, sh.requires_tech);
-    return `<option value="${sh.id}" ${ok ? '' : 'disabled'}>${ok ? '' : '✕ '}${esc(sh.display_name)} — ${esc(costStr(sh.build_cost))}</option>`;
+    return `<option value="${sh.id}" ${ok ? '' : 'disabled'}>${ok ? '' : '✕ '}${esc(sh.display_name)} — ${esc(projStr(sh.build_cost))}</option>`;
   }).join('');
-  const queued = s.empires[owner].ship_queue.filter((o) => o.planet === pid);
-  return `<h3>Shipyard</h3>
+  const queued = s.empires[owner].shipbuilding.filter((o) => o.planet === pid);
+  return `<h3>Shipbuilding</h3>
     <div class="row"><select id="ship-design">${designs}</select></div>
-    <div class="row"><button class="small primary" data-act="build-ship" data-id="${pid}">order ship</button>
-      <span class="muted">${queued.length ? `${queued.length} queued here` : 'idle (no workers until ships are ordered)'}</span></div>`;
+    <div class="row"><button class="small primary" data-act="build-ship" data-id="${pid}">build ship here</button>
+      <span class="muted">${queued.length ? `${queued.length} under construction here` : ''}</span></div>`;
 }
 
 function tileInspector(pid, i) {
@@ -433,10 +500,13 @@ function tileInspector(pid, i) {
   if (mults) html += `<div>Resources: ${mults}</div>`;
 
   if (t.c) {
-    const what = t.c.building != null ? d.buildings[t.c.building].display_name : d.upgrades[t.c.upgrade].display_name;
-    const who = t.c.empire != null && t.c.empire !== p.owner ? ` (claim by ${esc(s.empires[t.c.empire].display_name)})` : '';
-    html += `<div class="box">Constructing <b>${esc(what)}</b>${who}: ${t.c.days} days left
-      <div class="row"><button class="small" data-act="tile-cancel" data-id="${pid}" data-tile="${i}">cancel (admin)</button></div></div>`;
+    const what = t.c.kind === 'building' ? `Constructing <b>${esc(d.buildings[t.c.building].display_name)}</b>`
+      : t.c.kind === 'upgrade' ? `Installing <b>${esc(d.upgrades[t.c.upgrade].display_name)}</b>`
+        : `Removing <b>${esc(d.buildings[t.b]?.display_name ?? 'building')}</b>`;
+    const who = t.c.empire != null && t.c.empire !== p.owner ? ` (by ${esc(s.empires[t.c.empire].display_name)})` : '';
+    html += `<div class="box">${what}${who}: ${esc(projStr(t.c.remaining))} left${t.c.paid.length ? ` <span class="muted">(paid ${esc(costStr(t.c.paid))})</span>` : ''}
+      <div class="row"><button class="small" data-act="tile-demolish" data-id="${pid}" data-tile="${i}">cancel (refund)</button>
+        <button class="small" data-act="tile-cancel" data-id="${pid}" data-tile="${i}">discard (admin)</button></div></div>`;
   }
   if (t.b != null && d.buildings[t.b].blocker) {
     const b = d.buildings[t.b];
@@ -444,24 +514,26 @@ function tileInspector(pid, i) {
     html += `<div class="box">
       <div><b>${esc(b.display_name)}</b> <span class="muted">natural blocker</span></div>
       ${b.description ? `<div class="muted">${esc(b.description)}</div>` : ''}
-      ${b.amenities ? `<div>Amenities: ${num(b.amenities)}</div>` : ''}
-      <div>Clearing costs ${esc(costStr(b.remove_cost))}${payer == null ? ' <span class="muted">(claim the system first)</span>' : ''}</div>
-      <div class="row"><button class="small" data-act="tile-demolish" data-id="${pid}" data-tile="${i}" ${payer == null ? 'disabled' : ''}>clear</button>
+      ${b.passive_outputs.amenities || b.outputs.amenities ? `<div>Amenities: ${num(b.passive_outputs.amenities + b.outputs.amenities)}</div>` : ''}
+      <div>Clearing ${b.remove_cost ? `costs ${esc(projStr(b.remove_cost))}` : 'is free and instant'}${payer == null ? ' <span class="muted">(claim the system first)</span>' : ''}</div>
+      <div class="row"><button class="small" data-act="tile-demolish" data-id="${pid}" data-tile="${i}" ${payer == null || t.c ? 'disabled' : ''}>clear</button>
         <button class="small" data-act="tile-clear" data-id="${pid}" data-tile="${i}">remove now (admin)</button></div></div>`;
   } else if (t.b != null) {
     const b = d.buildings[t.b];
     const installed = t.u || [];
     const upOpts = b.upgrades.filter((u) => !installed.includes(u)).map((u) => {
       const up = d.upgrades[u];
-      const ready = up.needs.every((n) => installed.includes(n)) && techsMet(owner, up.requires_tech);
-      return `<option value="${u}">${esc(up.display_name)}${ready ? '' : ' (locked)'} — ${esc(costStr(up.cost))}</option>`;
+      const ready = up.after_upgrades.every((n) => installed.includes(n)) && techsMet(owner, up.requires_tech);
+      return `<option value="${u}">${esc(up.display_name)}${ready ? '' : ' (locked)'} — ${esc(projStr(up.build_cost))}</option>`;
     }).join('');
     html += `<div class="box">
       <div><span class="swatch" style="background:${buildingColor(d, t.b)}"></span><b>${esc(b.display_name)}</b>${t.off ? ' <span class="badge crisis">disabled</span>' : ''}</div>
       ${b.description ? `<div class="muted">${esc(b.description)}</div>` : ''}
       ${t.dmg ? `<div class="neg">Damage ${pct(t.dmg)}${t.dmg >= d.rules.building_disable_damage ? ' (out of action)' : ''}</div>${bar(1 - t.dmg, '#ff6b6b')}` : ''}
       ${b.max_workers ? `<div>Workers: ${t.w || 0}/${b.max_workers} ${b.job != null ? `(${esc(d.jobs[b.job].display_name)}, appeal ${d.jobs[b.job].appeal})` : ''}${t.cap != null ? ` · cap ${t.cap}${t.pin ? ' pinned' : ''}` : ''}</div>` : '<div class="muted">Automated (no workers)</div>'}
-      <div>Out: ${esc(costStr(b.outputs) === 'free' ? '–' : costStr(b.outputs))}</div>
+      <div>Out: ${esc(yieldStr(b.outputs) || '–')}${b.max_workers ? ' <span class="muted">(at full employment)</span>' : ''}</div>
+      ${b.passive_outputs.resources.length || b.passive_outputs.amenities ? `<div>Passive: ${esc(yieldStr(b.passive_outputs))}</div>` : ''}
+      ${b.housing ? `<div>Housing: ${num(b.housing)}</div>` : ''}
       ${b.inputs.length ? `<div>In: ${esc(costStr(b.inputs))}</div>` : ''}
       ${b.upkeep.length ? `<div>Upkeep: ${esc(costStr(b.upkeep))}</div>` : ''}
       ${installed.length ? `<div>Upgrades: ${installed.map((u) => esc(d.upgrades[u].display_name)).join(', ')}</div>` : ''}
@@ -470,7 +542,7 @@ function tileInspector(pid, i) {
         <button class="small" data-act="tile-pin" data-id="${pid}" data-tile="${i}" title="Assign exactly this many workers first">pin</button>
         <button class="small" data-act="tile-unpin" data-id="${pid}" data-tile="${i}">clear</button></div>` : ''}
       <div class="row"><button class="small" data-act="tile-toggle" data-id="${pid}" data-tile="${i}" data-on="${t.off ? 1 : 0}">${t.off ? 'enable' : 'disable'}</button>
-        <button class="small danger" data-act="tile-demolish" data-id="${pid}" data-tile="${i}" title="${b.remove_cost.length ? esc(costStr(b.remove_cost)) : 'free'}">demolish</button></div>
+        <button class="small danger" data-act="tile-demolish" data-id="${pid}" data-tile="${i}" title="${b.remove_cost ? esc(projStr(b.remove_cost)) : 'free and instant'}" ${t.c ? 'disabled' : ''}>demolish</button></div>
       ${upOpts ? `<div class="row"><select id="tile-upgrade">${upOpts}</select></div>
         <div class="row"><button class="small" data-act="tile-upgrade" data-id="${pid}" data-tile="${i}">order upgrade</button>
         <button class="small" data-act="tile-upgrade-instant" data-id="${pid}" data-tile="${i}">install now (admin)</button></div>` : ''}
@@ -485,11 +557,11 @@ function tileInspector(pid, i) {
     const counts = {};
     p.tiles.forEach((x) => x.b != null && (counts[x.b] = (counts[x.b] || 0) + 1));
     const opts = d.buildings.map((b) => {
-      const terrain = !b.space && !(b.land && t.wa) && !(b.water && !t.wa);
-      const legal = b.buildable && terrain && (p.habitable || b.barren) && techsMet(builder, b.requires_tech) && (b.max_per_planet == null || (counts[b.id] || 0) < b.max_per_planet);
+      const terrain = t.wa ? b.water : b.land;
+      const legal = !b.blocker && terrain && (p.habitable || b.barren) && techsMet(builder, b.requires_tech) && (b.max_per_planet == null || (counts[b.id] || 0) < b.max_per_planet);
       return { b, legal };
     }).sort((x, y) => y.legal - x.legal || x.b.display_name.localeCompare(y.b.display_name))
-      .map(({ b, legal }) => `<option value="${b.id}">${legal ? '' : '✕ '}${esc(b.display_name)} — ${esc(costStr(b.build_cost))}, ${b.build_days}d</option>`).join('');
+      .map(({ b, legal }) => `<option value="${b.id}">${legal ? '' : '✕ '}${esc(b.display_name)} — ${esc(projStr(b.build_cost))}</option>`).join('');
     const expText = !exp ? '' : exp.unreachable
       ? '<div class="neg">No hyperlane route from that empire\'s borders.</div>'
       : `<div class="pos">Expansion claim: +${num(exp.influence)} influence, +${exp.days} days (${exp.jumps} jump${exp.jumps === 1 ? '' : 's'} from the border). Finishing claims the system.</div>`;
@@ -558,7 +630,7 @@ const actions = {
       size: $('#np-size').value,
       habitable: $('#np-hab').checked,
       pop: +$('#np-pop').value || 0,
-      moon_of: $('#np-moon').value || null,
+      species: +$('#np-species').value,
     });
     ui.sel = { kind: 'planet', id: r.id, tile: null };
   },
@@ -573,16 +645,21 @@ const actions = {
     await api.deletePlanet(id);
   },
   'pop-add': (el) => api.patchPlanet(+el.dataset.id, { add_pops: +el.dataset.n }),
-  'pop-set': (el) => { const v = $('#pl-pop').value; if (v !== '') return api.patchPlanet(+el.dataset.id, { pop: +v }); },
+  'pop-set': (el) => {
+    const v = $('#pl-pop').value;
+    if (v !== '') return api.command({ type: 'set_population', planet: +el.dataset.id, species: +$('#pl-species').value, count: +v });
+  },
   'move-pops': (el) => api.command({ type: 'move_pops', from: +el.dataset.id, to: +$('#mv-to').value, count: +$('#mv-count').value }),
   terraform: (el) => api.command({ type: 'terraform', planet: +el.dataset.id }),
   'terraform-instant': (el) => api.patchPlanet(+el.dataset.id, { terraform_days_left: 0 }),
+  'terraform-cancel': (el) => api.command({ type: 'cancel_terraform', planet: +el.dataset.id }),
+  'research-cancel': (el) => api.command({ type: 'cancel_research', empire: +el.dataset.id, tech: +el.dataset.tech }),
 
   'tile-build': (el) => api.command({ type: 'build', planet: +el.dataset.id, tile: +el.dataset.tile, building: +$('#tile-building').value, empire: intOr(el.dataset.empire) }),
   'select-fleet': (el) => { ui.sel = { kind: 'fleet', id: +el.dataset.id }; },
   'declare-war': (el) => api.command({ type: 'declare_war', empire: +el.dataset.id, target: +el.dataset.other }),
   'make-peace': (el) => api.command({ type: 'make_peace', empire: +el.dataset.id, target: +el.dataset.other }),
-  'cancel-ship': (el) => api.command({ type: 'cancel_ship_order', empire: +el.dataset.id, index: +el.dataset.index }),
+  'cancel-ship': (el) => api.command({ type: 'cancel_ship', empire: +el.dataset.id, index: +el.dataset.index }),
   'spawn-fleet': async (el) => {
     const r = await api.createFleet({
       empire: +el.dataset.id,
@@ -594,8 +671,19 @@ const actions = {
   'build-ship': (el) => api.command({ type: 'build_ship', planet: +el.dataset.id, ship: +$('#ship-design').value }),
   'planet-repair': (el) => api.patchPlanet(+el.dataset.id, { repair: true }),
   'fleet-rename': (el) => api.command({ type: 'rename_fleet', fleet: +el.dataset.id, display_name: $('#fl-name').value }),
-  'fleet-move': (el) => api.command({ type: 'move_fleet', fleet: +el.dataset.id, system: +$('#fl-dest').value }),
-  'fleet-bombard': (el) => api.command({ type: 'bombard', fleet: +el.dataset.id, planet: +$('#fl-target').value }),
+  'fleet-move': (el) => {
+    const f = fleetById(+el.dataset.id);
+    const to = +$('#fl-dest').value;
+    if (!$('#fl-append').checked) return api.command({ type: 'move_fleet', fleet: f.id, system: to });
+    return api.command({ type: 'set_orders', fleet: f.id, append: true, orders: routeOrders(f.destination, to) });
+  },
+  'fleet-bombard': (el) => {
+    const f = fleetById(+el.dataset.id);
+    const planet = +$('#fl-target').value;
+    if (!$('#fl-append').checked) return api.command({ type: 'bombard', fleet: f.id, planet });
+    const orders = [...routeOrders(f.destination, S().planets[planet].system), { order: 'bombard', planet }];
+    return api.command({ type: 'set_orders', fleet: f.id, append: true, orders });
+  },
   'fleet-stop': (el) => api.command({ type: 'stop_fleet', fleet: +el.dataset.id }),
   'fleet-merge': (el) => api.command({ type: 'merge_fleets', into: +el.dataset.id, from: +$('#fl-merge').value }),
   'fleet-split': (el) => {
@@ -629,7 +717,7 @@ const actions = {
     const u = +$('#tile-upgrade').value;
     // Admin install also pulls in any upgrades it depends on.
     const want = new Set(t.u || []);
-    const add = (id) => { D().upgrades[id].needs.forEach(add); want.add(id); };
+    const add = (id) => { D().upgrades[id].after_upgrades.forEach(add); want.add(id); };
     add(u);
     return api.editTile(+el.dataset.id, +el.dataset.tile, { upgrades: [...want] });
   },
@@ -667,6 +755,7 @@ const actions = {
       ai: $('#ne-ai').checked ? Object.fromEntries(TRAITS.map((t) => [t, +$(`#ne-${t}`).value])) : null,
       capital: intOr($('#ne-capital').value),
       starting_resources: $('#ne-stock').checked,
+      dominant_species: intOr($('#ne-species').value),
     });
     closeModal();
     ui.sel = { kind: 'empire', id: r.id };
@@ -686,7 +775,8 @@ const changes = {
   builder: (el) => { ui.builder = intOr(el.value); },
   'empire-flag': (el) => api.patchEmpire(+el.dataset.id, { [el.dataset.field]: el.checked }),
   'empire-color': (el) => api.patchEmpire(+el.dataset.id, { color: el.value }),
-  'empire-research': (el) => api.command({ type: 'set_research', empire: +el.dataset.id, tech: intOr(el.value) }),
+  'empire-research': (el) => { if (el.value !== '') return api.command({ type: 'research', empire: +el.dataset.id, tech: +el.value }); },
+  'empire-species': (el) => api.patchEmpire(+el.dataset.id, { dominant_species: intOr(el.value) }),
   'empire-tech': (el) => api.setTech(+el.dataset.id, +el.dataset.tech, el.checked),
   'system-owner': (el) => api.command({ type: 'set_owner', system: +el.dataset.id, owner: intOr(el.value) }),
   'planet-habitable': (el) => api.patchPlanet(+el.dataset.id, { habitable: el.checked }),
@@ -757,6 +847,7 @@ $('#new-empire').addEventListener('click', () => {
     <div class="row"><label>Color</label><input type="color" id="ne-color" value="${hslHex(hue)}"></div>
     <div class="row"><label>Capital</label><select id="ne-capital"><option value="">none (no territory)</option>
       ${free.map((x) => `<option value="${x.id}" ${ui.sel.kind === 'system' && ui.sel.id === x.id ? 'selected' : ''}>${esc(x.display_name)} (${x.planets.length} planets)</option>`).join('')}</select></div>
+    <div class="row"><label>Species</label><select id="ne-species">${D().species.map((sp) => `<option value="${sp.id}">${esc(sp.display_name)}</option>`).join('')}</select></div>
     <div class="row"><label><input type="checkbox" id="ne-ai" checked>AI governor</label><label><input type="checkbox" id="ne-stock" checked>starting stockpile</label></div>
     ${TRAITS.map((t) => `<div class="row"><label>${t}</label><input type="range" id="ne-${t}" min="0" max="1" step="0.05" value="0.5" style="flex:1"></div>`).join('')}
     <div class="row" style="justify-content:flex-end"><button data-act="modal-close">Cancel</button><button class="primary" data-act="empire-create">Create</button></div>`);
@@ -786,7 +877,7 @@ function describe(pick) {
   if (pick.kind === 'planet') {
     const p = s.planets[pick.id];
     const owner = p.owner != null ? s.empires[p.owner].display_name : 'unowned';
-    return `${p.display_name} (${owner})\n${p.size} ${p.habitable ? 'habitable' : 'barren'}${p.moon_of ? `, moon of ${p.moon_of}` : ''}\n${num(p.pop)} pops · stability ${num(p.stats.stability)}${p.siege > 0 ? `\nunder siege ${pct(p.siege / p.siege_threshold)}` : ''}`;
+    return `${p.display_name} (${owner})\n${p.size} ${p.habitable ? 'habitable' : 'barren'}\n${num(p.pop)} pops${p.population.length > 1 ? ` (${popStr(p)})` : ''} · stability ${num(p.stats.stability)}${p.siege > 0 ? `\nunder siege ${pct(p.siege / p.siege_threshold)}` : ''}`;
   }
   if (pick.kind === 'fleet') {
     const f = fleetById(pick.id);
@@ -800,14 +891,15 @@ function describe(pick) {
     const t = s.planets[pick.planet].tiles[pick.tile] || {};
     const lines = [`Tile ${pick.tile}${t.wa ? ' (water)' : ''}`];
     if (t.b != null && d.buildings[t.b].blocker) {
-      lines.push(`${d.buildings[t.b].display_name} (natural)`, `clear: ${costStr(d.buildings[t.b].remove_cost)}`);
+      const rc = d.buildings[t.b].remove_cost;
+      lines.push(`${d.buildings[t.b].display_name} (natural)`, `clear: ${rc ? projStr(rc) : 'free'}`);
     } else if (t.b != null) {
       const b = d.buildings[t.b];
       lines.push(b.display_name + (b.max_workers ? ` (${t.w || 0}/${b.max_workers})` : ''));
       if (t.dmg) lines.push(`  damaged ${pct(t.dmg)}`);
       for (const u of t.u || []) lines.push(`  + ${d.upgrades[u].display_name}`);
     }
-    if (t.c) lines.push(`constructing (${t.c.days}d)`);
+    if (t.c) lines.push(`${t.c.kind === 'remove' ? 'removing' : t.c.kind === 'upgrade' ? 'upgrading' : 'constructing'} (${projStr(t.c.remaining)} left)`);
     for (const [r, m] of t.m || []) lines.push(`${resName(r)} ×${m}`);
     return lines.join('\n');
   }
@@ -898,6 +990,9 @@ document.addEventListener('keydown', (ev) => {
   }
   if (ev.code === 'Escape') closeModal();
 });
+
+// Console access for debugging: `spacebox.ui`, `spacebox.inspector()`.
+window.spacebox = { ui, store, render, inspector };
 
 scene = new Scene($('#view'), { onPick, onOpen, onContext, describe, tooltip: $('#tooltip') });
 subscribe(() => render());

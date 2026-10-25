@@ -1,27 +1,28 @@
-//! TOML loading, import handling and reference resolution.
+//! TOML loading, import handling and reference resolution (see `design/data/readme.md`).
 //!
 //! # Files and imports
 //!
 //! A file may start with a single `[import]` table mapping aliases to paths relative to the
-//! importing file. Imports are loaded transitively (each file once, deduplicated by canonical
-//! path, cycles allowed), but *names* do not leak through: a file can only reference its own
-//! definitions (`"name"`) and those of files it imports directly (`"alias.name"`).
+//! importing file. Imported files are loaded (each once, deduplicated by canonical path) so
+//! their own references can be resolved, but imports do not recurse for *names*: a file can
+//! only reference its own definitions (`"name"`) and those of files it imports directly
+//! (`"alias.name"`).
 //!
 //! # Typed references
 //!
 //! The slot a reference appears in determines which table it is looked up in. For example
-//! `output_resources = [{ resource = "res.alloy", count = 1 }]` looks for `[resource.alloy]` in
-//! the file imported as `res`, and `job = "jobs.metallurgist"` looks for `[job.metallurgist]`.
+//! `outputs = [{ resource = "res.alloy", count = 1 }]` looks for `[resource.alloy]` in the
+//! file imported as `res`, and `job = "jobs.metallurgist"` looks for `[job.metallurgist]`.
 //!
-//! Building upgrade names in a tile (`upgrades = ["faster-forge"]`) are resolved relative to the
-//! file that defines the building when unqualified, matching how `apply_to` is written.
+//! Tags (on buildings, jobs and technologies) are scoped the same way: `"forge"` is the
+//! `forge` tag of the current file and `"base.forge"` that of the file imported as `base`. The
+//! reserved building tags (`barren`, `blocker`, `land`, `water`, `space`) are global.
 //!
 //! # Assets vs. state
 //!
-//! Asset tables (`resource`, `job`, `building`, `building-upgrade`, `technology`, `ruleset`) are
-//! collected from every loaded file. Game state (`game`, `empire`, `system`) is only read from
-//! the root file, so a save can import a scenario file to reuse its assets without duplicating
-//! the scenario's systems.
+//! Asset tables are collected from every loaded file. Game state (`game`, `empire`, `system`)
+//! is only read from the root file, so a save can import a scenario file to reuse its assets
+//! without duplicating the scenario's systems.
 
 use std::collections::HashMap;
 use std::fs;
@@ -39,13 +40,27 @@ use crate::world::*;
 
 const STATE_TABLES: [&str; 3] = ["game", "empire", "system"];
 
+/// Top-level asset tables, in parse order. Buildings and upgrades share `[building.*]`.
+const ASSET_TABLES: [&str; 10] = [
+    "resource",
+    "job",
+    "species",
+    "building",
+    "building-upgrade",
+    "technology",
+    "ruleset",
+    "ship-weapon",
+    "ship-outfit",
+    "ship",
+];
+
 /// Loads only the asset definitions reachable from `path`.
 pub fn load_assets(path: impl AsRef<Path>) -> Result<(Arc<Defs>, Vec<String>)> {
     let mut loader = Loader::default();
     let root = loader.load_file(path.as_ref())?;
     let (mut defs, _state) = loader.build_defs(root)?;
     if defs.rulesets.is_empty() {
-        defs.rulesets.push(Ruleset::builtin());
+        defs.rulesets.push(Ruleset::builtin(defs.resource_count()));
     }
     Ok((Arc::new(defs), loader.warnings))
 }
@@ -121,9 +136,7 @@ impl Loader {
         }
 
         for key in table.keys() {
-            let known =
-                Kind::ALL.iter().any(|k| k.table() == key) || STATE_TABLES.contains(&key.as_str());
-            if !known {
+            if !ASSET_TABLES.contains(&key.as_str()) && !STATE_TABLES.contains(&key.as_str()) {
                 return Err(Error::invalid(
                     &canon,
                     format!("unknown top-level table [{key}]"),
@@ -145,20 +158,31 @@ impl Loader {
         for (fi, table) in self.tables.iter_mut().enumerate() {
             let file = FileId::from_idx(fi);
             let path = &self.files[fi].path;
-            for kind in Kind::ALL {
-                let Some(value) = table.remove(kind.table()) else {
+            for top in ASSET_TABLES {
+                let Some(value) = table.remove(top) else {
                     continue;
                 };
                 let Value::Table(entries) = value else {
                     return Err(Error::invalid(
                         path,
-                        format!("[{}] must be a table of definitions", kind.table()),
+                        format!("[{top}] must be a table of definitions"),
                     ));
                 };
                 for (name, def) in entries {
-                    validate_name(&name).map_err(|m| {
-                        Error::invalid(path, format!("[{}.{name}]: {m}", kind.table()))
-                    })?;
+                    validate_name(&name)
+                        .map_err(|m| Error::invalid(path, format!("[{top}.{name}]: {m}")))?;
+                    let kind = match top {
+                        "resource" => Kind::Resource,
+                        "job" => Kind::Job,
+                        "species" => Kind::Species,
+                        "building" => Kind::Building,
+                        "building-upgrade" => Kind::Upgrade,
+                        "technology" => Kind::Technology,
+                        "ruleset" => Kind::Ruleset,
+                        "ship-weapon" => Kind::Weapon,
+                        "ship-outfit" => Kind::Outfit,
+                        _ => Kind::Ship,
+                    };
                     let list = &mut decls[kind as usize];
                     names[fi][kind as usize].insert(name.clone(), list.len() as u32);
                     list.push((file, name, def));
@@ -179,6 +203,7 @@ impl Loader {
             files: self.files.clone(),
             resources: Vec::new(),
             jobs: Vec::new(),
+            species: Vec::new(),
             buildings: Vec::new(),
             upgrades: Vec::new(),
             technologies: Vec::new(),
@@ -186,12 +211,13 @@ impl Loader {
             ships: Vec::new(),
             weapons: Vec::new(),
             outfits: Vec::new(),
-            classes: Vec::new(),
+            tags: Vec::new(),
             names,
         };
         let [
             resources,
             jobs,
+            species,
             buildings,
             upgrades,
             techs,
@@ -204,30 +230,58 @@ impl Loader {
         for (file, name, value) in resources {
             let ctx = Ctx::new(&defs, file, Kind::Resource, &name);
             let raw: RawResource = ctx.de(value)?;
-            let def = ResourceDef {
+            defs.resources.push(ResourceDef {
                 key: DefKey { file, name },
                 display_name: raw.display_name,
                 description: raw.description,
-                image: raw.image.map(|i| ctx.relative(&i)),
-                base_value: raw.base_value,
+                transient: raw.transient,
                 tradeable: raw.tradeable,
-                stockpile: raw.stockpile,
-                storage_cap: raw.storage_cap,
-                on_demand: raw.on_demand,
-            };
-            defs.resources.push(def);
+                base_value: raw.base_value,
+            });
         }
         for (file, name, value) in jobs {
-            let ctx = Ctx::new(&defs, file, Kind::Job, &name);
-            let raw: RawJob = ctx.de(value)?;
-            let upkeep = ctx.amounts(&raw.upkeep)?;
+            let (raw, associated_resources) = {
+                let ctx = Ctx::new(&defs, file, Kind::Job, &name);
+                let raw: RawJob = ctx.de(value)?;
+                if !(0..=100).contains(&raw.appeal) {
+                    return Err(ctx.err("appeal must be between 0 and 100"));
+                }
+                let associated: Vec<ResourceId> = raw
+                    .associated_resource
+                    .iter()
+                    .map(|r| ctx.resource(r))
+                    .collect::<Result<_>>()?;
+                (raw, associated)
+            };
+            let header = format!("[job.{name}]");
+            let tags = resolve_tags(&mut defs, file, &header, &raw.job_tags)?;
             defs.jobs.push(JobDef {
                 key: DefKey { file, name },
                 display_name: raw.display_name,
                 description: raw.description,
                 appeal: raw.appeal,
-                upkeep,
+                tags,
+                associated_resources,
             });
+        }
+        for (file, name, value) in species {
+            let ctx = Ctx::new(&defs, file, Kind::Species, &name);
+            let raw: RawSpecies = ctx.de(value)?;
+            let opt = |r: &Option<String>| r.as_deref().map(|r| ctx.resource(r)).transpose();
+            let g = &raw.growth;
+            let def = SpeciesDef {
+                display_name: raw.display_name.clone(),
+                description: raw.description.clone(),
+                upkeep: ctx.amounts(&raw.upkeep.upkeep_cost)?,
+                starvation_resource: opt(&raw.upkeep.starvation_resource)?,
+                comfort_resource: opt(&raw.upkeep.comfort_resource)?,
+                growth_rate: g.growth_rate.unwrap_or(0.003),
+                min_growth: g.min_growth.unwrap_or(0.05),
+                starvation_rate: g.starvation_rate.unwrap_or(0.01),
+                migration_rate: g.migration_rate.unwrap_or(0.05),
+                key: DefKey { file, name },
+            };
+            defs.species.push(def);
         }
         for (file, name, value) in buildings {
             let def = parse_building(&mut defs, file, name, value)?;
@@ -245,15 +299,15 @@ impl Loader {
             let def = parse_ruleset(&defs, file, name, value)?;
             defs.rulesets.push(def);
         }
-        // Ships derive their stats from weapons and outfits, so those come first.
+        // Ships combine the stats of their weapons and outfits, so those come first.
         for (file, name, value) in weapons {
             let ctx = Ctx::new(&defs, file, Kind::Weapon, &name);
             let raw: RawWeapon = ctx.de(value)?;
             if raw.fire_rate <= 0.0 || raw.range < 0.0 {
-                return Err(ctx.err("fire_rate must be positive and range non-negative"));
+                return Err(ctx.err("fire-rate must be positive and range non-negative"));
             }
             let def = WeaponDef {
-                display_name: raw.display_name.unwrap_or_else(|| name.clone()),
+                display_name: raw.display_name,
                 description: raw.description,
                 build_cost: ctx.amounts(&raw.build_cost)?,
                 shield_damage: raw.shield_damage,
@@ -266,26 +320,16 @@ impl Loader {
         }
         for (file, name, value) in outfits {
             let ctx = Ctx::new(&defs, file, Kind::Outfit, &name);
-            let raw: RawOutfit = ctx.de(value)?;
-            if raw.fire_rate_mult <= 0.0 {
-                return Err(ctx.err("fire_rate_mult must be positive"));
-            }
+            let mut table = ctx.table(value)?;
+            let head: RawOutfitHead =
+                ctx.de(Value::Table(take_keys(&mut table, OUTFIT_HEAD_KEYS)))?;
+            let mods = ship_mods(&ctx, ctx.de(Value::Table(table))?)?;
             let def = OutfitDef {
-                display_name: raw.display_name.unwrap_or_else(|| name.clone()),
-                description: raw.description,
-                build_cost: ctx.amounts(&raw.build_cost)?,
-                upkeep: ctx.amounts(&raw.upkeep_cost)?,
-                hull: raw.hull,
-                shield: raw.shield,
-                shield_regen: raw.shield_regen,
-                hull_mult: raw.hull_mult,
-                shield_mult: raw.shield_mult,
-                shield_regen_mult: raw.shield_regen_mult,
-                speed_mult: raw.speed_mult,
-                hyperjump_mult: raw.hyperjump_mult,
-                fire_rate_mult: raw.fire_rate_mult,
-                damage_mult: raw.damage_mult,
-                range_mult: raw.range_mult,
+                display_name: head.display_name,
+                description: head.description,
+                build_cost: ctx.amounts(&head.build_cost)?,
+                upkeep: ctx.amounts(&head.upkeep_cost)?,
+                mods,
                 key: DefKey { file, name },
             };
             defs.outfits.push(def);
@@ -296,7 +340,46 @@ impl Loader {
         }
 
         compute_upgrade_availability(&mut defs)?;
+        self.warn_unused_tags(&defs);
         Ok((defs, root_state))
+    }
+
+    /// Tags need no declaration, so a misspelt one silently matches nothing: warn about tags
+    /// that upgrades, adjacency bonuses or technologies target but no building carries.
+    fn warn_unused_tags(&mut self, defs: &Defs) {
+        let mut targeted: Vec<(TagId, String)> = Vec::new();
+        for u in &defs.upgrades {
+            for t in &u.applies_to.tags {
+                targeted.push((*t, format!("[building-upgrade.{}]", u.key.name)));
+            }
+        }
+        for t in &defs.technologies {
+            for m in &t.buildings {
+                for tag in &m.targets.tags {
+                    targeted.push((*tag, format!("[technology.{}]", t.key.name)));
+                }
+            }
+        }
+        for b in &defs.buildings {
+            for m in &b.adjacency {
+                for tag in &m.targets.tags {
+                    targeted.push((*tag, format!("[building.{}]", b.key.name)));
+                }
+            }
+        }
+        for (tag, header) in targeted {
+            if !defs.buildings.iter().any(|b| b.has_tag(tag)) {
+                let t = defs.tag(tag);
+                let file = t
+                    .file
+                    .map(|f| defs.files[f.idx()].path.display().to_string())
+                    .unwrap_or_default();
+                self.warnings.push(format!(
+                    "{header}: no building has the tag '{}' of {file}",
+                    t.name
+                ));
+            }
+        }
     }
 }
 
@@ -373,9 +456,11 @@ impl<'a> Ctx<'a> {
             .map_err(|e: toml::de::Error| self.err(e.message()))
     }
 
-    fn relative(&self, p: &str) -> PathBuf {
-        let path = &self.defs.files[self.file.idx()].path;
-        path.parent().unwrap_or(Path::new(".")).join(p)
+    fn table(&self, value: Value) -> Result<Table> {
+        match value {
+            Value::Table(t) => Ok(t),
+            _ => Err(self.err("must be a table")),
+        }
     }
 
     fn lookup(&self, kind: Kind, reference: &str) -> Result<u32> {
@@ -396,34 +481,127 @@ impl<'a> Ctx<'a> {
         list.iter().map(|t| self.tech(t)).collect()
     }
 
+    fn amount(&self, resource: &str, count: f64) -> Result<ResourceAmount> {
+        if !count.is_finite() {
+            return Err(self.err(format!("count for '{resource}' must be finite")));
+        }
+        Ok(ResourceAmount {
+            resource: self.resource(resource)?,
+            count,
+        })
+    }
+
     fn amounts(&self, raw: &[RawAmount]) -> Result<Vec<ResourceAmount>> {
         raw.iter()
-            .map(|a| {
-                if !a.count.is_finite() {
-                    return Err(self.err(format!("count for '{}' must be finite", a.resource)));
-                }
-                Ok(ResourceAmount {
-                    resource: self.resource(&a.resource)?,
-                    count: a.count,
-                })
-            })
+            .map(|a| self.amount(&a.resource, a.count))
             .collect()
     }
 
-    fn modifier(&self, raw: RawModifier) -> Result<Modifier> {
-        Ok(Modifier {
-            input_mult: raw.input_mult,
-            output_mult: raw.output_mult,
-            upkeep_mult: raw.upkeep_mult,
-            housing_mult: raw.housing_mult,
-            amenities_mult: raw.amenities_mult,
-            inputs: self.amounts(&raw.input_resources)?,
-            outputs: self.amounts(&raw.output_resources)?,
-            upkeep: self.amounts(&raw.upkeep_resources)?,
-            housing: raw.housing,
-            amenities: raw.amenities,
+    /// Reads a list mixing `{ resource, count }` entries with one special entry kind
+    /// (`days` or `amenities`), whose values are summed and returned separately.
+    fn mixed_list(
+        &self,
+        what: &str,
+        special: &str,
+        values: &[Value],
+    ) -> Result<(Vec<ResourceAmount>, f64)> {
+        let mut resources: Vec<ResourceAmount> = Vec::new();
+        let mut extra = 0.0;
+        for v in values {
+            let Some(t) = v.as_table() else {
+                return Err(self.err(format!("{what} entries must be tables")));
+            };
+            if let Some(x) = t.get(special) {
+                let n = match x {
+                    Value::Integer(i) => *i as f64,
+                    Value::Float(f) => *f,
+                    _ => return Err(self.err(format!("`{special}` in {what} must be a number"))),
+                };
+                if t.len() != 1 || !n.is_finite() || n < 0.0 {
+                    return Err(self.err(format!(
+                        "{what}: `{{ {special} = N }}` takes a single non-negative number"
+                    )));
+                }
+                extra += n;
+                continue;
+            }
+            let a: RawAmount = self.de(v.clone()).map_err(|_| {
+                self.err(format!(
+                    "{what} entries must be {{ resource, count }} or {{ {special} }}"
+                ))
+            })?;
+            add_amounts(&mut resources, &[self.amount(&a.resource, a.count)?]);
+        }
+        Ok((resources, extra))
+    }
+
+    /// A project cost: resources plus `{ days }`.
+    fn cost(&self, what: &str, values: &[Value]) -> Result<Cost> {
+        let (resources, days) = self.mixed_list(what, "days", values)?;
+        if days.fract() != 0.0 {
+            return Err(self.err(format!("{what}: days must be a whole number")));
+        }
+        Ok(Cost {
+            resources,
+            days: days as u32,
         })
     }
+
+    /// A production list: resources plus `{ amenities }`.
+    fn yields(&self, what: &str, values: &[Value]) -> Result<Yield> {
+        let (resources, amenities) = self.mixed_list(what, "amenities", values)?;
+        Ok(Yield {
+            resources,
+            amenities,
+        })
+    }
+
+    fn modifier(&self, raw: RawModifier, allow_job: bool) -> Result<Modifier> {
+        if raw.job.is_some() && !allow_job {
+            return Err(self.err("only upgrades can replace a building's `job`"));
+        }
+        Ok(Modifier {
+            upkeep_add: self.amounts(&raw.upkeep_cost_add)?,
+            upkeep_mult: raw.upkeep_cost_mult.unwrap_or(1.0),
+            input_add: self.amounts(&raw.input_add)?,
+            input_mult: raw.input_mult.unwrap_or(1.0),
+            output_add: self.yields("output-add", &raw.output_add)?,
+            output_mult: raw.output_mult.unwrap_or(1.0),
+            passive_add: self.yields("passive-output-add", &raw.passive_output_add)?,
+            passive_mult: raw.passive_output_mult.unwrap_or(1.0),
+            max_workers_add: raw.max_workers_add.unwrap_or(0.0),
+            max_workers_mult: raw.max_workers_mult.unwrap_or(1.0),
+            housing_add: raw.housing_add.unwrap_or(0.0),
+            housing_mult: raw.housing_mult.unwrap_or(1.0),
+            job: raw
+                .job
+                .as_deref()
+                .map(|j| self.lookup(Kind::Job, j).map(JobId))
+                .transpose()?,
+        })
+    }
+}
+
+fn ship_mods(ctx: &Ctx, raw: RawShipMods) -> Result<ShipMods> {
+    let d = ShipMods::default();
+    let m = ShipMods {
+        hull_add: raw.hull_add.unwrap_or(d.hull_add),
+        shield_add: raw.shield_add.unwrap_or(d.shield_add),
+        shield_regen_add: raw.shield_regen_add.unwrap_or(d.shield_regen_add),
+        base_speed_add: raw.base_speed_add.unwrap_or(d.base_speed_add),
+        hull_mult: raw.hull_mult.unwrap_or(d.hull_mult),
+        shield_mult: raw.shield_mult.unwrap_or(d.shield_mult),
+        shield_regen_mult: raw.shield_regen_mult.unwrap_or(d.shield_regen_mult),
+        base_speed_mult: raw.base_speed_mult.unwrap_or(d.base_speed_mult),
+        hyperjump_mult: raw.hyperjump_mult.unwrap_or(d.hyperjump_mult),
+        fire_rate_mult: raw.fire_rate_mult.unwrap_or(d.fire_rate_mult),
+        damage_mult: raw.damage_mult.unwrap_or(d.damage_mult),
+        range_mult: raw.range_mult.unwrap_or(d.range_mult),
+    };
+    if m.fire_rate_mult <= 0.0 {
+        return Err(ctx.err("fire-rate-mult must be positive"));
+    }
+    Ok(m)
 }
 
 fn take_keys(table: &mut Table, keys: &[&str]) -> Table {
@@ -436,48 +614,101 @@ fn take_keys(table: &mut Table, keys: &[&str]) -> Table {
     out
 }
 
-fn intern_class(defs: &mut Defs, name: &str) -> ClassId {
-    match defs.class_id(name) {
+/// Resolves a tag reference: a reserved tag, `"tag"` in the current file or `"alias.tag"` in
+/// an imported one. Tags need no declaration; any name can be used.
+fn resolve_tag(defs: &mut Defs, file: FileId, header: &str, s: &str) -> Result<TagId> {
+    let tag = if RESERVED_TAGS.contains(&s) {
+        Tag {
+            file: None,
+            name: s.to_string(),
+        }
+    } else {
+        match s.split_once('.') {
+            Some((alias, name)) => {
+                let target = defs.files[file.idx()].import(alias).ok_or_else(|| {
+                    Ctx::with_header(defs, file, header.to_string())
+                        .err(format!("unknown import alias '{alias}' in tag '{s}'"))
+                })?;
+                Tag {
+                    file: Some(target),
+                    name: name.to_string(),
+                }
+            }
+            None => Tag {
+                file: Some(file),
+                name: s.to_string(),
+            },
+        }
+    };
+    Ok(match defs.tag_id(&tag) {
         Some(id) => id,
         None => {
-            defs.classes.push(name.to_string());
-            ClassId::from_idx(defs.classes.len() - 1)
+            defs.tags.push(tag);
+            TagId::from_idx(defs.tags.len() - 1)
         }
-    }
+    })
 }
 
-/// Resolves an `apply_to`/adjacency entry: a building reference if one exists, otherwise a
-/// building class name.
-fn resolve_target(defs: &mut Defs, file: FileId, header: &str, s: &str) -> Result<BuildingTarget> {
-    match defs.lookup(file, Kind::Building, s) {
-        Ok(id) => Ok(BuildingTarget::Building(BuildingId(id))),
-        Err(_) if !s.contains('.') => Ok(BuildingTarget::Class(intern_class(defs, s))),
-        Err(m) => Err(Ctx::with_header(defs, file, header.to_string()).err(m)),
-    }
+fn resolve_tags(
+    defs: &mut Defs,
+    file: FileId,
+    header: &str,
+    list: &[String],
+) -> Result<Vec<TagId>> {
+    list.iter()
+        .map(|t| resolve_tag(defs, file, header, t))
+        .collect()
 }
 
-fn parse_targeted(
+/// Resolves `buildings` and `building-tags` lists into [`Targets`].
+fn resolve_targets(
+    defs: &mut Defs,
+    file: FileId,
+    header: &str,
+    buildings: &[String],
+    tags: &[String],
+) -> Result<Targets> {
+    let ctx = Ctx::with_header(defs, file, header.to_string());
+    let buildings = buildings
+        .iter()
+        .map(|b| ctx.lookup(Kind::Building, b).map(BuildingId))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Targets {
+        buildings,
+        tags: resolve_tags(defs, file, header, tags)?,
+    })
+}
+
+/// Parses an `adjacency-bonus` entry: `buildings` and/or `building-tags` plus modifier
+/// fields.
+fn parse_adjacency(
     defs: &mut Defs,
     file: FileId,
     header: &str,
     mut table: Table,
 ) -> Result<TargetedModifier> {
-    let head = take_keys(&mut table, TARGET_KEYS);
-    let (target_raw, modifier) = {
-        let ctx = Ctx::with_header(defs, file, header.to_string());
-        let target: RawTarget = ctx.de(Value::Table(head))?;
-        let raw: RawModifier = ctx.de(Value::Table(table))?;
-        (target, ctx.modifier(raw)?)
+    let header = format!("{header} adjacency-bonus");
+    let (names, tags) = {
+        let ctx = Ctx::with_header(defs, file, header.clone());
+        let list = |t: &mut Table, k: &str| -> Result<Vec<String>> {
+            match t.remove(k) {
+                None => Ok(Vec::new()),
+                Some(v) => ctx.de(v),
+            }
+        };
+        (
+            list(&mut table, "buildings")?,
+            list(&mut table, "building-tags")?,
+        )
     };
-    let target = match (target_raw.building, target_raw.building_class) {
-        (Some(b), None) => resolve_target(defs, file, header, &b)?,
-        (None, Some(c)) => BuildingTarget::Class(intern_class(defs, &c)),
-        _ => {
-            return Err(Ctx::with_header(defs, file, header.to_string())
-                .err("modifier needs exactly one of `building` or `building_class`"));
-        }
-    };
-    Ok(TargetedModifier { target, modifier })
+    if names.is_empty() && tags.is_empty() {
+        return Err(Ctx::with_header(defs, file, header)
+            .err("needs `buildings` and/or `building-tags` to say which neighbours count"));
+    }
+    let targets = resolve_targets(defs, file, &header, &names, &tags)?;
+    let ctx = Ctx::with_header(defs, file, header);
+    let modifier = ctx.modifier(ctx.de(Value::Table(table))?, false)?;
+    Ok(TargetedModifier { targets, modifier })
 }
 
 fn parse_building(
@@ -488,64 +719,58 @@ fn parse_building(
 ) -> Result<BuildingDef> {
     let header = format!("[building.{name}]");
     let raw: RawBuilding = Ctx::with_header(defs, file, header.clone()).de(value)?;
-    let classes: Vec<ClassId> = raw
-        .building_class
-        .iter()
-        .map(|c| intern_class(defs, c))
-        .collect();
-    let has = |class: &str| raw.building_class.iter().any(|c| c == class);
-    let (barren, blocker, land, water, space) = (
-        has(BARREN_CLASS),
-        has(BLOCKER_CLASS),
-        has(LAND_CLASS),
-        has(WATER_CLASS),
-        has(SPACE_CLASS),
+    let tags = resolve_tags(defs, file, &header, &raw.building_tags)?;
+    let has = |tag: &str| raw.building_tags.iter().any(|c| c == tag);
+    let (barren, blocker, water, space) = (
+        has(BARREN_TAG),
+        has(BLOCKER_TAG),
+        has(WATER_TAG),
+        has(SPACE_TAG),
     );
+    // Land is implicit unless the building is tagged water or space.
+    let land = has(LAND_TAG) || (!water && !space);
     let mut adjacency = Vec::new();
     for t in raw.adjacency_bonus {
-        adjacency.push(parse_targeted(defs, file, &header, t)?);
+        adjacency.push(parse_adjacency(defs, file, &header, t)?);
     }
     let ctx = Ctx::with_header(defs, file, header);
-    if barren && raw.max_workers > 0 {
-        return Err(ctx.err("buildings with the \"barren\" class must have max_workers = 0"));
-    }
-    if land && water {
-        return Err(ctx.err("a building cannot have both the \"land\" and \"water\" classes"));
-    }
     let job = raw
         .job
         .as_deref()
         .map(|j| ctx.lookup(Kind::Job, j).map(JobId))
         .transpose()?;
-    if raw.max_workers > 0 && job.is_none() {
-        return Err(ctx.err("buildings with max_workers > 0 need a `job`"));
+    if raw.max_workers.is_some_and(|w| w > 0) && job.is_none() {
+        return Err(ctx.err("buildings with max-workers need a `job`"));
+    }
+    if job.is_some() && raw.max_workers.is_none() {
+        return Err(ctx.err("buildings with a `job` need max-workers"));
     }
     Ok(BuildingDef {
-        display_name: raw.display_name.unwrap_or_else(|| name.clone()),
+        display_name: raw.display_name,
         description: raw.description,
-        image: raw.image.map(|i| ctx.relative(&i)),
         max_workers: raw.max_workers,
         job,
-        classes,
+        tags,
         barren,
         blocker,
         land,
         water,
         space,
-        upkeep: ctx.amounts(&raw.upkeep_resources)?,
-        inputs: ctx.amounts(&raw.input_resources)?,
-        outputs: ctx.amounts(&raw.output_resources)?,
         housing: raw.housing,
-        amenities: raw.amenities,
-        adjacency,
-        build_cost: ctx.amounts(&raw.build_cost)?,
-        build_days: raw.build_days,
-        requires_tech: ctx.techs(&raw.requires_tech)?,
-        // Blockers occur naturally; they are never constructed.
-        buildable: raw.buildable && !blocker,
+        build_cost: ctx.cost("build-cost", &raw.build_cost)?,
+        remove_cost: raw
+            .remove_cost
+            .as_deref()
+            .map(|c| ctx.cost("remove-cost", c))
+            .transpose()?,
         max_per_planet: raw.max_per_planet,
         hp: raw.hp,
-        remove_cost: ctx.amounts(&raw.remove_cost)?,
+        requires_tech: ctx.techs(&raw.requires_tech)?,
+        upkeep: ctx.amounts(&raw.upkeep_cost)?,
+        inputs: ctx.amounts(&raw.inputs)?,
+        outputs: ctx.yields("outputs", &raw.outputs)?,
+        passive_outputs: ctx.yields("passive-outputs", &raw.passive_outputs)?,
+        adjacency,
         available_upgrades: Vec::new(),
         key: DefKey { file, name },
     })
@@ -553,35 +778,38 @@ fn parse_building(
 
 fn parse_upgrade(defs: &mut Defs, file: FileId, name: String, value: Value) -> Result<UpgradeDef> {
     let header = format!("[building-upgrade.{name}]");
-    let ctx = Ctx::with_header(defs, file, header.clone());
-    let Value::Table(mut table) = value else {
-        return Err(ctx.err("must be a table"));
+    let (head, modifier) = {
+        let ctx = Ctx::with_header(defs, file, header.clone());
+        let mut table = ctx.table(value)?;
+        let head: RawUpgradeHead =
+            ctx.de(Value::Table(take_keys(&mut table, UPGRADE_HEAD_KEYS)))?;
+        let raw: RawModifier = ctx.de(Value::Table(table)).map_err(|e| {
+            ctx.err(format!(
+                "{e} (upgrades take display-name, description, buildings, building-tags, \
+                 after-upgrades, requires-tech, build-cost and modifier fields)"
+            ))
+        })?;
+        (head, ctx.modifier(raw, true)?)
     };
-    let head: RawUpgradeHead = ctx.de(Value::Table(take_keys(&mut table, UPGRADE_HEAD_KEYS)))?;
-    let modifier = ctx.modifier(ctx.de(Value::Table(table))?)?;
-    let cost = ctx.amounts(&head.cost)?;
-    let requires_tech = ctx.techs(&head.requires_tech)?;
-    let needs_upgrades = head
-        .needs_upgrades
+    if head.buildings.is_empty() && head.building_tags.is_empty() {
+        return Err(Ctx::with_header(defs, file, header)
+            .err("an upgrade needs `buildings` and/or `building-tags` to apply to"));
+    }
+    let applies_to = resolve_targets(defs, file, &header, &head.buildings, &head.building_tags)?;
+    let ctx = Ctx::with_header(defs, file, header);
+    let after_upgrades = head
+        .after_upgrades
         .iter()
         .map(|u| ctx.lookup(Kind::Upgrade, u).map(UpgradeId))
         .collect::<Result<Vec<_>>>()?;
-    if head.apply_to.is_empty() {
-        return Err(ctx.err("`apply_to` must list at least one building or building class"));
-    }
-    let mut apply_to = Vec::new();
-    for t in &head.apply_to {
-        apply_to.push(resolve_target(defs, file, &header, t)?);
-    }
     Ok(UpgradeDef {
-        display_name: head.display_name.unwrap_or_else(|| name.clone()),
+        display_name: head.display_name,
         description: head.description,
-        apply_to,
-        needs_upgrades,
+        applies_to,
+        after_upgrades,
         modifier,
-        cost,
-        build_days: head.build_days,
-        requires_tech,
+        build_cost: ctx.cost("build-cost", &head.build_cost)?,
+        requires_tech: ctx.techs(&head.requires_tech)?,
         key: DefKey { file, name },
     })
 }
@@ -589,23 +817,65 @@ fn parse_upgrade(defs: &mut Defs, file: FileId, name: String, value: Value) -> R
 fn parse_tech(defs: &mut Defs, file: FileId, name: String, value: Value) -> Result<TechDef> {
     let header = format!("[technology.{name}]");
     let raw: RawTech = Ctx::with_header(defs, file, header.clone()).de(value)?;
-    let mut modifiers = Vec::new();
-    for m in raw.modifiers {
-        modifiers.push(parse_targeted(defs, file, &header, m)?);
+
+    // `[technology.x.buildings]`: one modifier per field, each with its own targets.
+    let mut buildings = Vec::new();
+    for (field, v) in raw.buildings.clone().unwrap_or_default() {
+        let fctx = Ctx::with_header(defs, file, format!("{header}.buildings.{field}"));
+        let Value::Table(mut t) = v else {
+            return Err(
+                fctx.err("must be { value = ..., buildings = [...], building-tags = [...] }")
+            );
+        };
+        let Some(value) = t.remove("value") else {
+            return Err(fctx.err("missing `value`"));
+        };
+        let list = |t: &mut Table, k: &str| -> Result<Vec<String>> {
+            match t.remove(k) {
+                None => Ok(Vec::new()),
+                Some(b) => fctx.de(b),
+            }
+        };
+        let (names, tags) = (list(&mut t, "buildings")?, list(&mut t, "building-tags")?);
+        if let Some(k) = t.keys().next() {
+            return Err(fctx.err(format!(
+                "unknown field `{k}` (expected value, buildings and building-tags)"
+            )));
+        }
+        let mut one = Table::new();
+        one.insert(field.clone(), value);
+        let modifier = fctx.modifier(fctx.de(Value::Table(one))?, false)?;
+        let targets = resolve_targets(defs, file, &header, &names, &tags)?;
+        buildings.push(TargetedModifier { targets, modifier });
     }
+
+    let tags = resolve_tags(defs, file, &header, &raw.research_tags)?;
     let ctx = Ctx::with_header(defs, file, header);
-    if raw.cost.is_nan() || raw.cost < 0.0 {
-        return Err(ctx.err("cost must be non-negative"));
+    let (fleet_size_add, ships) = match raw.ships.clone() {
+        None => (0, ShipMods::default()),
+        Some(mut t) => {
+            let add = match t.remove("fleet-size-add") {
+                None => 0,
+                Some(Value::Integer(n)) if n >= 0 => n as u32,
+                Some(_) => return Err(ctx.err("ships.fleet-size-add must be a whole number")),
+            };
+            (add, ship_mods(&ctx, ctx.de(Value::Table(t))?)?)
+        }
+    };
+    let cost = ctx.amounts(&raw.research_resources)?;
+    if cost.iter().any(|a| a.count < 0.0) {
+        return Err(ctx.err("research-resources must be non-negative"));
     }
     Ok(TechDef {
         display_name: raw.display_name,
         description: raw.description,
-        category: raw.category,
-        cost: raw.cost,
+        cost,
+        tags,
         prerequisites: ctx.techs(&raw.prerequisites)?,
-        modifiers,
-        pop_growth_mult: raw.pop_growth_mult,
-        stability: raw.stability,
+        pop_growth_mult: raw.pop.growth_mult.unwrap_or(1.0),
+        fleet_size_add,
+        ships,
+        buildings,
         key: DefKey { file, name },
     })
 }
@@ -613,7 +883,16 @@ fn parse_tech(defs: &mut Defs, file: FileId, name: String, value: Value) -> Resu
 fn parse_ruleset(defs: &Defs, file: FileId, name: String, value: Value) -> Result<Ruleset> {
     let ctx = Ctx::new(defs, file, Kind::Ruleset, &name);
     let raw: RawRuleset = ctx.de(value)?;
-    let opt_res = |r: &Option<String>| r.as_deref().map(|r| ctx.resource(r)).transpose();
+    let normal = |r: &Option<String>, what: &str| -> Result<Option<ResourceId>> {
+        let Some(r) = r.as_deref() else {
+            return Ok(None);
+        };
+        let id = ctx.resource(r)?;
+        if defs.is_transient(id) {
+            return Err(ctx.err(format!("{what} cannot be a transient resource")));
+        }
+        Ok(Some(id))
+    };
     let terraform = |t: &Option<RawTerraform>| -> Result<Option<TerraformRule>> {
         t.as_ref()
             .map(|t| {
@@ -623,91 +902,95 @@ fn parse_ruleset(defs: &Defs, file: FileId, name: String, value: Value) -> Resul
                         .as_deref()
                         .map(|r| ctx.tech(r))
                         .transpose()?,
-                    days: t.days,
-                    cost: ctx.amounts(&t.cost)?,
+                    cost: Cost {
+                        resources: ctx.amounts(&t.cost)?,
+                        days: t.days,
+                    },
                 })
             })
             .transpose()
     };
-    let b = Ruleset::builtin();
+    let b = Ruleset::builtin(defs.resource_count());
+    let mut storage_caps = vec![None; defs.resource_count()];
+    for a in ctx.amounts(&raw.resources.storage_caps)? {
+        storage_caps[a.resource.idx()] = Some(a.count.max(0.0));
+    }
+    let (am, ec, ex, sh, inv) = (
+        &raw.amenities,
+        &raw.economy,
+        &raw.expansion,
+        &raw.ships,
+        &raw.invasion,
+    );
     Ok(Ruleset {
+        display_name: raw.display_name.clone(),
         builtin: false,
-        pop_upkeep: ctx.amounts(&raw.pop_upkeep)?,
-        starvation_resource: opt_res(&raw.starvation_resource)?,
-        comfort_resource: opt_res(&raw.comfort_resource)?,
-        research_resource: opt_res(&raw.research_resource)?,
-        currency: opt_res(&raw.currency)?,
-        pop_growth_rate: raw.pop_growth_rate.unwrap_or(b.pop_growth_rate),
-        min_pop_growth: raw.min_pop_growth.unwrap_or(b.min_pop_growth),
-        starvation_rate: raw.starvation_rate.unwrap_or(b.starvation_rate),
-        migration_rate: raw.migration_rate.unwrap_or(b.migration_rate),
-        base_housing_large: raw.base_housing_large.unwrap_or(b.base_housing_large),
-        base_housing_small: raw.base_housing_small.unwrap_or(b.base_housing_small),
-        base_amenities: raw.base_amenities.unwrap_or(b.base_amenities),
-        amenities_per_pop: raw.amenities_per_pop.unwrap_or(b.amenities_per_pop),
-        base_stability: raw.base_stability.unwrap_or(b.base_stability),
-        stability_output_factor: raw
+        starting_stores: ctx.amounts(&raw.resources.starting_stores)?,
+        storage_caps,
+        base_amenities: am.base_amenities.unwrap_or(b.base_amenities),
+        amenities_per_pop: am.amenities_per_pop.unwrap_or(b.amenities_per_pop),
+        base_stability: am.base_stability.unwrap_or(b.base_stability),
+        stability_output_factor: am
             .stability_output_factor
             .unwrap_or(b.stability_output_factor),
-        unemployment_stability_penalty: raw
+        unemployment_stability_penalty: am
             .unemployment_stability_penalty
             .unwrap_or(b.unemployment_stability_penalty),
-        homelessness_stability_penalty: raw
+        homelessness_stability_penalty: am
             .homelessness_stability_penalty
             .unwrap_or(b.homelessness_stability_penalty),
-        comfort_stability_penalty: raw
+        comfort_stability_penalty: am
             .comfort_stability_penalty
             .unwrap_or(b.comfort_stability_penalty),
-        crisis_stability_penalty: raw
+        crisis_stability_penalty: am
             .crisis_stability_penalty
             .unwrap_or(b.crisis_stability_penalty),
-        logistics_loss: raw.logistics_loss.unwrap_or(b.logistics_loss),
-        market_fee: raw.market_fee.unwrap_or(b.market_fee),
-        market_reserve: raw.market_reserve.unwrap_or(b.market_reserve),
-        scarcity_appeal: raw.scarcity_appeal.unwrap_or(b.scarcity_appeal),
-        scarcity_target_days: raw.scarcity_target_days.unwrap_or(b.scarcity_target_days),
-        ai_interval_days: raw.ai_interval_days.unwrap_or(b.ai_interval_days).max(1),
-        terraform_large: terraform(&raw.terraforming.large)?,
-        terraform_small: terraform(&raw.terraforming.small)?,
-        empire_income: ctx.amounts(&raw.empire_income)?,
-        expansion_resource: opt_res(&raw.expansion_resource)?,
-        expansion_base_cost: raw.expansion_base_cost.unwrap_or(b.expansion_base_cost),
-        expansion_base_days: raw.expansion_base_days.unwrap_or(b.expansion_base_days),
-        hyperjump_days: raw.hyperjump_days.unwrap_or(b.hyperjump_days).max(0.0),
-        combat_subticks: raw.combat_subticks.unwrap_or(b.combat_subticks).max(1),
-        arrival_radius: raw.arrival_radius.unwrap_or(b.arrival_radius),
-        ship_repair_rate: raw.ship_repair_rate.unwrap_or(b.ship_repair_rate),
-        building_hp: raw.building_hp.unwrap_or(b.building_hp).max(1.0),
-        building_disable_damage: raw
+        currency: normal(&ec.currency, "economy.currency")?,
+        logistics_loss: ec.logistics_loss.unwrap_or(b.logistics_loss),
+        market_fee: ec.market_fee.unwrap_or(b.market_fee),
+        market_reserve: ec.market_reserve.unwrap_or(b.market_reserve),
+        scarcity_appeal: ec.scarcity_appeal.unwrap_or(b.scarcity_appeal),
+        scarcity_target_days: ec.scarcity_target_days.unwrap_or(b.scarcity_target_days),
+        ai_interval_days: raw.ai.ai_interval_days.unwrap_or(b.ai_interval_days).max(1),
+        research_speed_mult: raw
+            .technology
+            .research_speed_mult
+            .unwrap_or(b.research_speed_mult)
+            .max(0.0),
+        expansion_resource: normal(&ex.expansion_resource, "expansion.expansion-resource")?,
+        expansion_resource_income: ex
+            .expansion_resource_income
+            .unwrap_or(b.expansion_resource_income),
+        expansion_base_cost: ex.expansion_base_cost.unwrap_or(b.expansion_base_cost),
+        expansion_base_days: ex.expansion_base_days.unwrap_or(b.expansion_base_days),
+        hyperjump_days: sh.hyperjump_days.unwrap_or(b.hyperjump_days).max(0.0),
+        combat_subticks: sh.combat_subticks.unwrap_or(b.combat_subticks).max(1),
+        arrival_radius: sh.arrival_radius.unwrap_or(b.arrival_radius),
+        ship_repair_rate: sh.ship_repair_rate.unwrap_or(b.ship_repair_rate),
+        base_fleet_size: sh.base_fleet_size.unwrap_or(b.base_fleet_size).max(1),
+        building_hp: inv.building_hp.unwrap_or(b.building_hp).max(1.0),
+        building_disable_damage: inv
             .building_disable_damage
             .unwrap_or(b.building_disable_damage),
-        building_repair_rate: raw.building_repair_rate.unwrap_or(b.building_repair_rate),
-        bombardment_amenities_penalty: raw
+        building_repair_rate: inv.building_repair_rate.unwrap_or(b.building_repair_rate),
+        bombardment_amenities_penalty: inv
             .bombardment_amenities_penalty
             .unwrap_or(b.bombardment_amenities_penalty),
-        surrender_resistance: raw.surrender_resistance.unwrap_or(b.surrender_resistance),
-        siege_decay: raw.siege_decay.unwrap_or(b.siege_decay),
-        truce_days: raw.truce_days.unwrap_or(b.truce_days),
+        surrender_resistance: inv.surrender_resistance.unwrap_or(b.surrender_resistance),
+        siege_decay: inv.siege_decay.unwrap_or(b.siege_decay),
+        truce_days: raw.diplomacy.truce_days.unwrap_or(b.truce_days),
+        terraform_large: terraform(&raw.terraforming.large)?,
+        terraform_small: terraform(&raw.terraforming.small)?,
         key: DefKey { file, name },
     })
 }
 
-/// Merges `items` into `list`, summing counts per resource.
-fn add_amounts(list: &mut Vec<ResourceAmount>, items: &[ResourceAmount]) {
-    for a in items {
-        match list.iter_mut().find(|x| x.resource == a.resource) {
-            Some(x) => x.count += a.count,
-            None => list.push(*a),
-        }
-    }
-}
-
-/// Parses a ship design and derives its combat stats from its weapons and outfits.
+/// Parses a ship design, combining its own cost and stats with its weapons and outfits.
 fn parse_ship(defs: &Defs, file: FileId, name: String, value: Value) -> Result<ShipDef> {
     let ctx = Ctx::new(defs, file, Kind::Ship, &name);
     let raw: RawShip = ctx.de(value)?;
     if raw.hull <= 0.0 || raw.base_speed < 0.0 {
-        return Err(ctx.err("hull must be positive and base_speed non-negative"));
+        return Err(ctx.err("hull must be positive and base-speed non-negative"));
     }
     let weapons = raw
         .weapons
@@ -720,65 +1003,50 @@ fn parse_ship(defs: &Defs, file: FileId, name: String, value: Value) -> Result<S
         .map(|o| ctx.lookup(Kind::Outfit, o).map(OutfitId))
         .collect::<Result<Vec<_>>>()?;
 
-    let mut build_cost = ctx.amounts(&raw.build_cost)?;
+    let mut build_cost = ctx.cost("build-cost", &raw.build_cost)?;
     let mut upkeep = ctx.amounts(&raw.upkeep_cost)?;
-    let (mut hull, mut shield, mut regen) = (raw.hull, raw.shield, raw.shield_regen);
-    let (mut hull_m, mut shield_m, mut regen_m, mut speed_m, mut jump_m) =
-        (1.0, 1.0, 1.0, 1.0, raw.hyperjump_mult);
-    let (mut rate_m, mut dmg_m, mut range_m) = (1.0, 1.0, 1.0);
+    let mut outfit_mods = ShipMods::default();
     for w in &weapons {
-        add_amounts(&mut build_cost, &defs.weapon(*w).build_cost);
+        add_amounts(&mut build_cost.resources, &defs.weapon(*w).build_cost);
     }
     for o in &outfits {
         let o = defs.outfit(*o);
-        add_amounts(&mut build_cost, &o.build_cost);
+        add_amounts(&mut build_cost.resources, &o.build_cost);
         add_amounts(&mut upkeep, &o.upkeep);
-        hull += o.hull;
-        shield += o.shield;
-        regen += o.shield_regen;
-        hull_m *= o.hull_mult;
-        shield_m *= o.shield_mult;
-        regen_m *= o.shield_regen_mult;
-        speed_m *= o.speed_mult;
-        jump_m *= o.hyperjump_mult;
-        rate_m *= o.fire_rate_mult;
-        dmg_m *= o.damage_mult;
-        range_m *= o.range_mult;
+        outfit_mods.combine(&o.mods);
     }
-    let armament: Vec<Armament> = weapons
-        .iter()
-        .map(|w| {
-            let d = defs.weapon(*w);
-            Armament {
-                weapon: *w,
-                shield_damage: d.shield_damage * dmg_m,
-                hull_damage: d.hull_damage * dmg_m,
-                cooldown: d.fire_rate / rate_m,
-                range: d.range * range_m,
-            }
-        })
-        .collect();
-    Ok(ShipDef {
-        display_name: raw.display_name.unwrap_or_else(|| name.clone()),
+    let mut def = ShipDef {
+        display_name: raw.display_name,
         description: raw.description,
         requires_tech: ctx.techs(&raw.requires_tech)?,
         build_cost,
         upkeep,
-        max_hull: hull * hull_m,
-        max_shield: shield * shield_m,
-        shield_regen: regen * regen_m,
-        speed: raw.base_speed * speed_m,
-        hyperjump_mult: jump_m,
-        max_range: armament.iter().map(|a| a.range).fold(0.0, f64::max),
-        armament,
+        hull: raw.hull,
+        shield: raw.shield,
+        shield_regen: raw.shield_regen,
+        base_speed: raw.base_speed,
+        hyperjump_mult: raw.hyperjump_mult,
+        fleet_size: raw.fleet_size.max(1),
+        outfit_mods,
+        base_stats: ShipStats {
+            max_hull: 0.0,
+            max_shield: 0.0,
+            shield_regen: 0.0,
+            speed: 0.0,
+            hyperjump_mult: 1.0,
+            armament: Vec::new(),
+            max_range: 0.0,
+        },
         weapons,
         outfits,
         key: DefKey { file, name },
-    })
+    };
+    def.base_stats = def.stats(defs, &ShipMods::default());
+    Ok(def)
 }
 
-/// An upgrade is available for a building if `apply_to` matches it and every upgrade in
-/// `needs_upgrades` is (recursively) available for it too.
+/// An upgrade is available for a building if `applies-to` matches it and every upgrade in
+/// `after-upgrades` is (recursively) available for it too.
 fn compute_upgrade_availability(defs: &mut Defs) -> Result<()> {
     #[derive(Clone, Copy, PartialEq)]
     enum State {
@@ -798,7 +1066,7 @@ fn compute_upgrade_availability(defs: &mut Defs) -> Result<()> {
             State::No => return Ok(false),
             State::Visiting => {
                 return Err(format!(
-                    "upgrade dependency cycle involving [building-upgrade.{}]",
+                    "upgrade dependency cycle involving [building.{}]",
                     defs.upgrades[u].key.name
                 ));
             }
@@ -806,8 +1074,8 @@ fn compute_upgrade_availability(defs: &mut Defs) -> Result<()> {
         }
         state[u] = State::Visiting;
         let up = &defs.upgrades[u];
-        let mut ok = up.apply_to.iter().any(|t| defs.target_matches(*t, b));
-        for dep in &up.needs_upgrades {
+        let mut ok = defs.targets(&up.applies_to, b);
+        for dep in &up.after_upgrades {
             // Evaluate every dependency so cycles are always detected.
             ok &= visit(defs, b, dep.idx(), state)?;
         }
@@ -837,6 +1105,14 @@ fn compute_upgrade_availability(defs: &mut Defs) -> Result<()> {
 // ---------------------------------------------------------------------------------------------
 // Game state
 // ---------------------------------------------------------------------------------------------
+
+/// Empire parts that refer to systems and planets, resolved once those exist.
+struct Deferred {
+    id: EmpireId,
+    name: String,
+    shipbuilding: Vec<RawShipbuilding>,
+    fleets: Table,
+}
 
 fn build_world(
     mut defs: Defs,
@@ -868,7 +1144,7 @@ fn build_world(
         None if defs.rulesets.len() == 1 => RulesetId(0),
         None if defs.rulesets.is_empty() => {
             warnings.push("no [ruleset.*] loaded; using built-in defaults".into());
-            defs.rulesets.push(Ruleset::builtin());
+            defs.rulesets.push(Ruleset::builtin(defs.resource_count()));
             RulesetId(0)
         }
         None => {
@@ -900,25 +1176,40 @@ fn build_world(
     world.seed = game.seed;
     world.root_file = Some(root);
 
-    // Fleets, wars and ship orders refer to systems and planets, so they are resolved after
-    // the systems are built.
     let mut deferred = Vec::new();
     for (name, value) in empire_tables {
         let ctx = Ctx::with_header(&defs, root, format!("[empire.{name}]"));
         let raw: RawEmpire = ctx.de(value)?;
         let mut e = Empire::new(name.clone(), raw.display_name, &defs);
         for a in ctx.amounts(&raw.resource_stores)? {
+            if defs.is_transient(a.resource) {
+                warnings.push(format!(
+                    "{}: {} is transient and cannot be stored; ignored",
+                    ctx.header,
+                    defs.resource(a.resource).key.name
+                ));
+                continue;
+            }
             e.storage[a.resource.idx()] += a.count;
         }
         for t in ctx.techs(&raw.technologies)? {
             e.techs[t.idx()] = true;
         }
-        e.researching = raw
-            .researching
-            .as_deref()
-            .map(|t| ctx.tech(t))
-            .transpose()?;
-        e.research_progress = raw.research_progress;
+        for r in &raw.current_research {
+            let tech = ctx.tech(&r.technology)?;
+            if e.techs[tech.idx()] || e.is_researching(tech) {
+                warnings.push(format!(
+                    "{}: {} is already known or listed; ignored",
+                    ctx.header, r.technology
+                ));
+                continue;
+            }
+            let remaining = match &r.remaining {
+                Some(list) => ctx.cost("current-research remaining", list)?,
+                None => defs.research_cost(tech),
+            };
+            e.research.push(ResearchProject { tech, remaining });
+        }
         e.capital = raw
             .capital
             .as_deref()
@@ -928,6 +1219,11 @@ fn build_world(
                     .copied()
                     .ok_or_else(|| ctx.err(format!("unknown capital system '{c}'")))
             })
+            .transpose()?;
+        e.dominant_species = raw
+            .dominant_species
+            .as_deref()
+            .map(|s| ctx.lookup(Kind::Species, s).map(SpeciesId))
             .transpose()?;
         e.ai = raw
             .ai
@@ -947,36 +1243,34 @@ fn build_world(
                 })
             })
             .transpose()?;
-        e.accepts_migrants = raw.accepts_migrants;
-        e.market_access = raw.market_access;
+        e.accepts_migrants = raw.policy.accepts_migrants;
+        e.market_access = raw.policy.market_access;
         e.color = raw.color;
-        for c in raw.crises {
-            e.crises.push(Crisis {
-                resource: ctx.resource(&c.resource)?,
-                since_day: c.since_day,
-                severity: c.severity,
-            });
-        }
         let empire = |name: &str, what: &str| {
             empire_ids
                 .get(name)
                 .copied()
                 .ok_or_else(|| ctx.err(format!("unknown empire '{name}' in {what}")))
         };
-        for w in &raw.wars {
+        for w in &raw.diplomacy.wars {
             e.wars.push(War {
                 enemy: empire(&w.empire, "wars")?,
                 since_day: w.since_day,
             });
         }
-        for t in &raw.truces {
+        for t in &raw.diplomacy.truces {
             e.truces.push(Truce {
                 with: empire(&t.empire, "truces")?,
                 until_day: t.until_day,
             });
         }
         let id = world.add_empire(e);
-        deferred.push((id, name, raw.ship_queue, raw.fleets));
+        deferred.push(Deferred {
+            id,
+            name,
+            shipbuilding: raw.current_shipbuilding,
+            fleets: raw.fleets,
+        });
     }
 
     let mut links = Vec::new();
@@ -986,15 +1280,15 @@ fn build_world(
         let mut sys = System::new(name.clone(), raw.display_name);
         sys.star_type = raw.star_type;
         sys.star_count = raw.star_count;
-        sys.coordinates = [raw.coordinates.x, raw.coordinates.y];
+        sys.coordinates = raw.coords;
         sys.owner = raw
-            .owned_by
+            .owner
             .as_deref()
             .map(|o| {
                 empire_ids
                     .get(o)
                     .copied()
-                    .ok_or_else(|| ctx.err(format!("unknown empire '{o}' in owned_by")))
+                    .ok_or_else(|| ctx.err(format!("unknown empire '{o}' in owner")))
             })
             .transpose()?;
         let id = system_ids[&name];
@@ -1006,12 +1300,10 @@ fn build_world(
             links.push((id, other));
         }
         let mut planets = Vec::new();
-        for (i, (pname, pvalue)) in raw.planets.into_iter().enumerate() {
+        for (pname, pvalue) in raw.planets {
             validate_name(&pname).map_err(|m| ctx.err(format!("planet '{pname}': {m}")))?;
             let pctx = PlanetCtx {
                 header: format!("[system.{name}.planets.{pname}]"),
-                index: i,
-                system_owner: sys.owner,
                 empires: &empire_ids,
             };
             planets.push(parse_planet(&defs, root, &pctx, pname, pvalue, warnings)?);
@@ -1022,66 +1314,80 @@ fn build_world(
         world.link(a, b);
     }
 
-    for (eid, ename, queue, fleets) in deferred {
-        let header = format!("[empire.{ename}]");
-        let ctx = Ctx::with_header(&defs, root, header.clone());
-        let mut fleet_ids = HashMap::new();
-        for (fname, fvalue) in fleets {
+    for d in deferred {
+        let ctx = Ctx::with_header(&defs, root, format!("[empire.{}]", d.name));
+        for (fname, fvalue) in d.fleets {
             validate_name(&fname).map_err(|m| ctx.err(format!("fleet '{fname}': {m}")))?;
-            let fctx = Ctx::with_header(&defs, root, format!("[empire.{ename}.fleets.{fname}]"));
+            let fctx = Ctx::with_header(&defs, root, format!("[empire.{}.fleets.{fname}]", d.name));
             let raw: RawFleet = fctx.de(fvalue)?;
-            let system = match raw.system.as_deref() {
-                Some(s) => *system_ids
-                    .get(s)
-                    .ok_or_else(|| fctx.err(format!("unknown system '{s}'")))?,
-                None => world.empire(eid).capital.ok_or_else(|| {
-                    fctx.err("fleet needs a `system` (the empire has no capital)")
-                })?,
-            };
-            let mut fleet = Fleet::new(fname.clone(), raw.display_name, eid, system);
-            fleet.coordinates = raw.coordinates.map_or([0.0, 0.0], |c| [c.x, c.y]);
-            fleet.jump_charge = raw.jump_charge;
+            let system = *system_ids
+                .get(&raw.system)
+                .ok_or_else(|| fctx.err(format!("unknown system '{}'", raw.system)))?;
+            let mut fleet = Fleet::new(fname.clone(), raw.display_name, d.id, system);
+            fleet.in_combat = raw.in_combat;
+            let n = raw.ships.len().max(1) as f64;
+            let centre = [
+                raw.ships.iter().map(|s| s.coords[0]).sum::<f64>() / n,
+                raw.ships.iter().map(|s| s.coords[1]).sum::<f64>() / n,
+            ];
+            fleet.coordinates = centre;
             for s in raw.ships {
                 let def = ShipId(fctx.lookup(Kind::Ship, &s.ship)?);
-                let mut ship = Ship::new(def, &defs);
-                let d = defs.ship(def);
-                ship.hull = s.hull.unwrap_or(d.max_hull).clamp(0.0, d.max_hull);
-                ship.shield = s.shield.unwrap_or(d.max_shield).clamp(0.0, d.max_shield);
+                let stats = world.ship_stats(d.id, def);
+                let mut ship = Ship::new(def, stats);
+                ship.hull = s.hull.unwrap_or(stats.max_hull).clamp(0.0, stats.max_hull);
+                ship.shield = s
+                    .shield
+                    .unwrap_or(stats.max_shield)
+                    .clamp(0.0, stats.max_shield);
+                ship.offset = [s.coords[0] - centre[0], s.coords[1] - centre[1]];
+                ship.jump_charge = s.jump_charge.clamp(0.0, 1.0);
                 fleet.ships.push(ship);
             }
-            if let Some(o) = raw.order {
-                fleet.order = parse_fleet_order(&fctx, &world, &system_ids, o)?;
+            let limit = world.empire(d.id).max_fleet_size(world.rules());
+            if fleet.size(&defs) > limit {
+                warnings.push(format!(
+                    "{}: {} fleet slots exceed the limit of {limit}",
+                    fctx.header,
+                    fleet.size(&defs)
+                ));
             }
-            let id = world.add_fleet(fleet);
-            fleet_ids.insert(fname, id);
+            // Orders other than jumps refer to the system the fleet will be in by then.
+            let mut at = system;
+            for o in raw.orders {
+                let order = parse_fleet_order(&fctx, &world, &system_ids, at, o)?;
+                if let FleetOrder::Jump { system } = order {
+                    at = system;
+                }
+                fleet.orders.push(order);
+            }
+            world.add_fleet(fleet);
         }
-        for o in queue {
+        for o in d.shipbuilding {
             let ship = ShipId(ctx.lookup(Kind::Ship, &o.ship)?);
             let planet = world
-                .planet_by_name(&o.planet)
-                .ok_or_else(|| ctx.err(format!("unknown shipyard planet '{}'", o.planet)))?;
-            let remaining = match o.remaining {
-                Some(list) => ctx
-                    .amounts(&list)?
-                    .into_iter()
-                    .map(|a| (a.resource, a.count))
-                    .collect(),
-                None => on_demand_cost(&defs, ship),
+                .planet_by_name(&format!("{}/{}", o.system, o.planet))
+                .ok_or_else(|| {
+                    ctx.err(format!(
+                        "current-shipbuilding: no planet '{}' in system '{}'",
+                        o.planet, o.system
+                    ))
+                })?;
+            let remaining = match &o.remaining {
+                Some(list) => ctx.cost("current-shipbuilding remaining", list)?,
+                None => defs.ship(ship).build_cost.clone(),
             };
-            let fleet = o
-                .fleet
-                .map(|f| {
-                    fleet_ids
-                        .get(&f)
-                        .copied()
-                        .ok_or_else(|| ctx.err(format!("unknown fleet '{f}' in ship_queue")))
-                })
-                .transpose()?;
-            world.empires[eid.idx()].ship_queue.push(ShipOrder {
+            if world.planet(planet).owner != Some(d.id) {
+                warnings.push(format!(
+                    "{}: ship under construction at {}/{}, which the empire does not own",
+                    ctx.header, o.system, o.planet
+                ));
+            }
+            world.empires[d.id.idx()].shipbuilding.push(ShipProject {
                 ship,
                 planet,
+                paid: paid_list(&ctx, &o.paid)?,
                 remaining,
-                fleet,
             });
         }
     }
@@ -1100,69 +1406,97 @@ fn build_world(
     Ok(world)
 }
 
-/// The on-demand part of a ship's cost (e.g. shipbuilding), which shipyards supply over time.
-pub(crate) fn on_demand_cost(defs: &Defs, ship: ShipId) -> Vec<(ResourceId, f64)> {
-    defs.ship(ship)
-        .build_cost
-        .iter()
-        .filter(|a| defs.resource(a.resource).on_demand)
-        .map(|a| (a.resource, a.count))
-        .collect()
+/// Normal resources already paid into a project (transient ones cannot be refunded, so they
+/// are not tracked).
+fn paid_list(ctx: &Ctx, raw: &[RawAmount]) -> Result<Vec<ResourceAmount>> {
+    let paid = ctx.amounts(raw)?;
+    if let Some(a) = paid.iter().find(|a| ctx.defs.is_transient(a.resource)) {
+        return Err(ctx.err(format!(
+            "`paid` only tracks normal resources, not {}",
+            ctx.defs.resource(a.resource).key.name
+        )));
+    }
+    Ok(paid)
 }
 
+/// Parses one fleet order; `at` is the system the fleet will be in when it carries it out.
 fn parse_fleet_order(
     ctx: &Ctx,
     world: &World,
     system_ids: &HashMap<String, SystemId>,
+    at: SystemId,
     o: RawFleetOrder,
 ) -> Result<FleetOrder> {
-    let system = |s: &Option<String>| -> Result<SystemId> {
-        let s = s
-            .as_deref()
-            .ok_or_else(|| ctx.err("move orders need a `system`"))?;
-        system_ids
-            .get(s)
-            .copied()
-            .ok_or_else(|| ctx.err(format!("unknown system '{s}' in order")))
+    let unexpected = |what: bool, field: &str| -> Result<()> {
+        if what {
+            Err(ctx.err(format!("`{field}` is not used by {} orders", o.order)))
+        } else {
+            Ok(())
+        }
     };
-    Ok(match o.kind.as_str() {
-        "idle" => FleetOrder::Idle,
-        "move" => FleetOrder::Move {
-            system: system(&o.system)?,
-            coordinates: o.coordinates.map(|c| [c.x, c.y]),
-        },
+    Ok(match o.order.as_str() {
+        "move" => {
+            unexpected(o.system.is_some(), "system")?;
+            unexpected(o.planet.is_some(), "planet")?;
+            unexpected(o.tile.is_some(), "tile")?;
+            FleetOrder::Move {
+                coordinates: o
+                    .coords
+                    .ok_or_else(|| ctx.err("move orders need `coords`"))?,
+            }
+        }
+        "jump" => {
+            unexpected(o.coords.is_some(), "coords")?;
+            unexpected(o.planet.is_some(), "planet")?;
+            unexpected(o.tile.is_some(), "tile")?;
+            let s = o
+                .system
+                .as_deref()
+                .ok_or_else(|| ctx.err("jump orders need a `system`"))?;
+            let system = *system_ids
+                .get(s)
+                .ok_or_else(|| ctx.err(format!("unknown system '{s}' in jump order")))?;
+            if !world.system(at).links.contains(&system) {
+                return Err(ctx.err(format!(
+                    "jump order to '{s}', which has no hyperlane to '{}'",
+                    world.system(at).name
+                )));
+            }
+            FleetOrder::Jump { system }
+        }
         "bombard" => {
+            unexpected(o.coords.is_some(), "coords")?;
+            unexpected(o.system.is_some(), "system")?;
             let p = o
                 .planet
                 .as_deref()
                 .ok_or_else(|| ctx.err("bombard orders need a `planet`"))?;
+            let sys = world.system(at);
+            let planet = sys
+                .planet_ids()
+                .find(|id| world.planet(*id).name == p)
+                .ok_or_else(|| {
+                    ctx.err(format!(
+                        "bombard order: no planet '{p}' in '{}' (where the fleet will be)",
+                        sys.name
+                    ))
+                })?;
             FleetOrder::Bombard {
-                planet: world
-                    .planet_by_name(p)
-                    .ok_or_else(|| ctx.err(format!("unknown planet '{p}' in order")))?,
+                planet,
                 tile: o.tile,
             }
         }
-        other => return Err(ctx.err(format!("unknown order type '{other}'"))),
+        other => {
+            return Err(ctx.err(format!(
+                "unknown order '{other}' (expected move, jump or bombard)"
+            )));
+        }
     })
 }
 
 struct PlanetCtx<'a> {
     header: String,
-    /// Position within the system, used to place planets without coordinates.
-    index: usize,
-    system_owner: Option<EmpireId>,
     empires: &'a HashMap<String, EmpireId>,
-}
-
-/// Default planet placement: an outward spiral from the star, under 100 units radially.
-pub fn default_planet_coordinates(index: usize) -> [f64; 2] {
-    let r = (15.0 + index as f64 * 10.0).min(95.0);
-    let a = index as f64 * 2.399_963; // golden angle
-    [
-        (r * a.cos() * 10.0).round() / 10.0,
-        (r * a.sin() * 10.0).round() / 10.0,
-    ]
 }
 
 fn parse_planet(
@@ -1175,43 +1509,59 @@ fn parse_planet(
 ) -> Result<Planet> {
     let header = pctx.header.clone();
     let ctx = Ctx::with_header(defs, root, header.clone());
-    let raw: RawPlanet = ctx.de(value)?;
+    let mut table = ctx.table(value)?;
+    let tile_keys: Vec<String> = table
+        .keys()
+        .filter(|k| k.starts_with("tile-"))
+        .cloned()
+        .collect();
+    let tiles: Vec<(String, Value)> = tile_keys
+        .into_iter()
+        .map(|k| {
+            let v = table.remove(&k).unwrap();
+            (k, v)
+        })
+        .collect();
+    let raw: RawPlanet = ctx.de(Value::Table(table))?;
     let size = match raw.size {
         RawSize::Small => PlanetSize::Small,
         RawSize::Large => PlanetSize::Large,
     };
-    let habitable = raw.habitable.unwrap_or(size == PlanetSize::Large);
     let mut p = Planet::new(
         name,
         raw.display_name,
         size,
-        habitable,
+        raw.habitable,
         defs.resource_count(),
     );
-    p.pop = raw.total_pop;
-    p.moon_of = raw.moon_of;
-    p.growth_progress = raw.growth_progress;
-    p.terraform_days_left = raw.terraform_days_left;
+    for pop in &raw.population {
+        let s = SpeciesId(ctx.lookup(Kind::Species, &pop.species)?);
+        p.add_pops(s, pop.count);
+    }
     p.siege = raw.siege;
-    p.coordinates = raw
-        .coordinates
-        .map_or_else(|| default_planet_coordinates(pctx.index), |c| [c.x, c.y]);
+    p.coordinates = raw.coords;
+    if let Some(t) = &raw.terraform {
+        if p.habitable {
+            return Err(ctx.err("a habitable planet cannot be terraformed"));
+        }
+        p.terraform = Some(TerraformProject {
+            paid: paid_list(&ctx, &t.paid)?,
+            remaining: ctx.cost("terraform remaining", &t.remaining)?,
+        });
+    }
     let empire = |e: &str| {
         pctx.empires
             .get(e)
             .copied()
             .ok_or_else(|| ctx.err(format!("unknown empire '{e}'")))
     };
-    p.owner = match raw.owned_by.as_deref() {
-        Some(o) => Some(empire(o)?),
-        None => pctx.system_owner,
-    };
+    p.owner = raw.owner.as_deref().map(empire).transpose()?;
 
-    for (key, tvalue) in raw.tiles {
-        let tctx = Ctx::with_header(defs, root, format!("{header}.tiles.{key}"));
-        let index: usize = key
+    for (key, tvalue) in tiles {
+        let tctx = Ctx::with_header(defs, root, format!("{header}.{key}"));
+        let index: usize = key["tile-".len()..]
             .parse()
-            .map_err(|_| tctx.err("tile keys must be integers"))?;
+            .map_err(|_| tctx.err("tile tables are named tile-N with N a tile index"))?;
         if index >= p.tiles.len() {
             return Err(tctx.err(format!(
                 "a {} planet only has tiles 0..={}",
@@ -1229,48 +1579,56 @@ fn parse_planet(
         if let Some(b) = raw_tile.building {
             let inst = parse_tile_building(&tctx, b)?;
             let def = defs.building(inst.def);
-            if !habitable && !def.barren {
+            if !p.habitable && !def.barren {
                 warnings.push(format!(
-                    "{}: {} is not a barren-class building but sits on a barren planet",
+                    "{}: {} is not tagged barren but sits on a barren planet",
                     tctx.header, def.key.name
                 ));
             }
-            if (def.land && tile.water) || (def.water && !tile.water) {
+            if !def.fits_terrain(tile.water) {
                 warnings.push(format!(
-                    "{}: {} must stand on {} but the tile is {}",
+                    "{}: {} cannot stand on {}",
                     tctx.header,
                     def.key.name,
-                    if def.water { "water" } else { "land" },
                     if tile.water { "water" } else { "land" },
                 ));
             }
             tile.building = Some(inst);
         }
         if let Some(c) = raw_tile.construction {
-            tile.construction = Some(match (c.building, c.upgrade) {
-                (Some(b), None) => Construction::Building {
-                    def: BuildingId(tctx.lookup(Kind::Building, &b)?),
-                    days_left: c.days_left,
-                    empire: match c.empire.as_deref() {
-                        Some(e) => Some(empire(e)?),
-                        None => p.owner,
-                    },
-                    paid: tctx.amounts(&c.paid)?,
-                },
-                (None, Some(u)) => {
+            let remaining = tctx.cost("construction remaining", &c.remaining)?;
+            let kind = match (c.building, c.upgrade, c.remove) {
+                (Some(b), None, false) => {
+                    if tile.building.is_some() {
+                        return Err(
+                            tctx.err("building construction on a tile that already has a building")
+                        );
+                    }
+                    ProjectKind::Building(BuildingId(tctx.lookup(Kind::Building, &b)?))
+                }
+                (None, Some(u), false) => {
                     let Some(inst) = &tile.building else {
                         return Err(tctx.err("upgrade construction on a tile without a building"));
                     };
-                    Construction::Upgrade {
-                        upgrade: resolve_tile_upgrade(&tctx, inst.def, &u)?,
-                        days_left: c.days_left,
+                    ProjectKind::Upgrade(resolve_tile_upgrade(&tctx, inst.def, &u)?)
+                }
+                (None, None, true) => {
+                    if tile.building.is_none() {
+                        return Err(tctx.err("removal on a tile without a building"));
                     }
+                    ProjectKind::Remove
                 }
                 _ => {
-                    return Err(
-                        tctx.err("construction needs exactly one of `building` or `upgrade`")
-                    );
+                    return Err(tctx.err(
+                        "construction needs exactly one of `building`, `upgrade` or `remove = true`",
+                    ));
                 }
+            };
+            tile.construction = Some(Construction {
+                kind,
+                paid: paid_list(&tctx, &c.paid)?,
+                remaining,
+                empire: c.empire.as_deref().map(empire).transpose()?,
             });
         }
     }
@@ -1282,7 +1640,7 @@ fn resolve_tile_upgrade(ctx: &Ctx, building: BuildingId, u: &str) -> Result<Upgr
     let id = UpgradeId(ctx.lookup(Kind::Upgrade, u)?);
     if !def.available_upgrades.contains(&id) {
         return Err(ctx.err(format!(
-            "upgrade '{u}' is not available for building '{}'",
+            "upgrade '{u}' does not apply to building '{}'",
             def.key.name
         )));
     }
@@ -1302,7 +1660,7 @@ fn parse_tile_building(ctx: &Ctx, value: Value) -> Result<BuildingInstance> {
                 inst.upgrades.push(resolve_tile_upgrade(ctx, def, u)?);
             }
             for u in &inst.upgrades {
-                for need in &ctx.defs.upgrade(*u).needs_upgrades {
+                for need in &ctx.defs.upgrade(*u).after_upgrades {
                     if !inst.upgrades.contains(need) {
                         return Err(ctx.err(format!(
                             "upgrade '{}' requires '{}'",
@@ -1312,7 +1670,8 @@ fn parse_tile_building(ctx: &Ctx, value: Value) -> Result<BuildingInstance> {
                     }
                 }
             }
-            inst.workers = raw.workers.min(ctx.defs.building(def).max_workers);
+            let max = ctx.defs.building(def).max_workers.unwrap_or(0);
+            inst.workers = raw.workers.min(max);
             inst.job_cap = raw.job_cap;
             inst.pinned = raw.pinned;
             inst.enabled = raw.enabled;
@@ -1331,7 +1690,7 @@ mod tests {
     fn import_header_position() {
         let p = Path::new("x.toml");
         assert!(check_import_header("# hi\n[import]\na = \"b\"\n[resource.x]\n", p).is_ok());
-        assert!(check_import_header("[resource.x]\ndisplay_name = \"x\"\n[import]\n", p).is_err());
+        assert!(check_import_header("[resource.x]\ndisplay-name = \"x\"\n[import]\n", p).is_err());
         assert!(check_import_header("[resource.x]\n", p).is_ok());
     }
 }

@@ -7,7 +7,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::defs::{Defs, ResourceAmount, Ruleset, TargetedModifier};
+use crate::defs::{Cost, Defs, ResourceAmount, Ruleset, ShipMods, ShipStats, TargetedModifier};
 use crate::geometry::PlanetSize;
 use crate::ids::*;
 use crate::sim::commands::Command;
@@ -89,21 +89,43 @@ impl BuildingInstance {
     }
 }
 
+/// What a tile construction project produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectKind {
+    Building(BuildingId),
+    Upgrade(UpgradeId),
+    /// Removing the tile's building (e.g. clearing a blocker).
+    Remove,
+}
+
+/// A construction project on a tile. Its normal resources are drawn from the builder's
+/// stockpile as soon as they are available, and its days tick down once per day; it completes
+/// once nothing is left.
 #[derive(Clone, Debug)]
-pub enum Construction {
-    Building {
-        def: BuildingId,
-        days_left: u32,
-        /// Who is building. Completing a site on a planet the builder does not own claims it
-        /// (and an unowned system along with it).
-        empire: Option<EmpireId>,
-        /// Refunded if a rival's claim cancels the site.
-        paid: Vec<ResourceAmount>,
-    },
-    Upgrade {
-        upgrade: UpgradeId,
-        days_left: u32,
-    },
+pub struct Construction {
+    pub kind: ProjectKind,
+    /// Normal resources spent so far (refunded, except the expansion resource, if cancelled).
+    pub paid: Vec<ResourceAmount>,
+    pub remaining: Cost,
+    /// Who is building. Completing a building on a planet the builder does not own claims it
+    /// (and an unowned system along with it). `None`: the planet's owner.
+    pub empire: Option<EmpireId>,
+}
+
+/// Terraforming in progress on a planet.
+#[derive(Clone, Debug)]
+pub struct TerraformProject {
+    pub paid: Vec<ResourceAmount>,
+    pub remaining: Cost,
+}
+
+impl Construction {
+    pub fn building(&self) -> Option<BuildingId> {
+        match self.kind {
+            ProjectKind::Building(b) => Some(b),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -162,15 +184,16 @@ pub struct Planet {
     pub system: SystemId,
     pub size: PlanetSize,
     pub habitable: bool,
-    pub moon_of: Option<String>,
     /// Fixed position relative to the system's star.
     pub coordinates: [f64; 2],
     pub owner: Option<EmpireId>,
     /// Bombardment accumulated towards surrender.
     pub siege: f64,
-    pub pop: u64,
-    pub growth_progress: f64,
-    pub terraform_days_left: Option<u32>,
+    /// Pops per species, sorted by species, without zero entries. Use the helper methods to
+    /// change it.
+    pub population: Vec<(SpeciesId, u64)>,
+    /// Terraforming in progress.
+    pub terraform: Option<TerraformProject>,
     pub tiles: Vec<Tile>,
     pub stats: PlanetStats,
     pub flows: Flows,
@@ -181,6 +204,8 @@ pub struct Planet {
     pub(crate) vacancy: Option<Vacancy>,
     pub(crate) cache: ProfileCache,
     pub(crate) dirty: bool,
+    /// Whether any tile may have a construction project (a cheap pre-check).
+    pub(crate) constructing: bool,
     pub(crate) flags: PlanetFlags,
     pub(crate) events: Vec<Event>,
     /// Construction sites completed this tick by an empire that does not own the planet.
@@ -201,13 +226,11 @@ impl Planet {
             system: SystemId(0),
             size,
             habitable,
-            moon_of: None,
             coordinates: [0.0, 0.0],
             owner: None,
             siege: 0.0,
-            pop: 0,
-            growth_progress: 0.0,
-            terraform_days_left: None,
+            population: Vec::new(),
+            terraform: None,
             tiles: vec![Tile::default(); size.tile_count()],
             stats: PlanetStats {
                 stability: 50.0,
@@ -220,6 +243,7 @@ impl Planet {
             vacancy: None,
             cache: ProfileCache::default(),
             dirty: true,
+            constructing: true,
             flags: PlanetFlags::default(),
             events: Vec::new(),
             claims: Vec::new(),
@@ -231,9 +255,96 @@ impl Planet {
             .iter()
             .filter(|t| {
                 t.building.as_ref().is_some_and(|b| b.def == def)
-                    || matches!(t.construction, Some(Construction::Building { def: d, .. }) if d == def)
+                    || t.construction.as_ref().and_then(|c| c.building()) == Some(def)
             })
             .count()
+    }
+
+    /// Total pops of every species.
+    pub fn pop(&self) -> u64 {
+        self.population.iter().map(|(_, n)| n).sum()
+    }
+
+    pub fn species_count(&self, species: SpeciesId) -> u64 {
+        self.population
+            .iter()
+            .find(|(s, _)| *s == species)
+            .map_or(0, |(_, n)| *n)
+    }
+
+    /// The most numerous species (lowest id on ties).
+    pub fn main_species(&self) -> Option<SpeciesId> {
+        self.population
+            .iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+            .map(|(s, _)| *s)
+    }
+
+    pub fn add_pops(&mut self, species: SpeciesId, n: u64) {
+        if n == 0 {
+            return;
+        }
+        match self.population.binary_search_by_key(&species, |(s, _)| *s) {
+            Ok(i) => self.population[i].1 += n,
+            Err(i) => self.population.insert(i, (species, n)),
+        }
+    }
+
+    /// Removes up to `n` pops of one species; returns how many were removed.
+    pub fn remove_species(&mut self, species: SpeciesId, n: u64) -> u64 {
+        let Ok(i) = self.population.binary_search_by_key(&species, |(s, _)| *s) else {
+            return 0;
+        };
+        let taken = n.min(self.population[i].1);
+        self.population[i].1 -= taken;
+        if self.population[i].1 == 0 {
+            self.population.remove(i);
+        }
+        taken
+    }
+
+    /// Removes up to `n` pops spread over the species in proportion to their numbers
+    /// (largest remainders first), returning what was removed per species.
+    pub fn remove_pops(&mut self, n: u64) -> Vec<(SpeciesId, u64)> {
+        let total = self.pop();
+        let n = n.min(total);
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut shares: Vec<(SpeciesId, u64, u64)> = self
+            .population
+            .iter()
+            .map(|(s, c)| {
+                let exact = *c as u128 * n as u128;
+                (
+                    *s,
+                    (exact / total as u128) as u64,
+                    (exact % total as u128) as u64,
+                )
+            })
+            .collect();
+        let mut left = n - shares.iter().map(|x| x.1).sum::<u64>();
+        let mut order: Vec<usize> = (0..shares.len()).collect();
+        order.sort_by(|&a, &b| shares[b].2.cmp(&shares[a].2).then(a.cmp(&b)));
+        for i in order {
+            if left == 0 {
+                break;
+            }
+            let count = self.population[i].1;
+            if shares[i].1 < count {
+                shares[i].1 += 1;
+                left -= 1;
+            }
+        }
+        let removed: Vec<(SpeciesId, u64)> = shares
+            .iter()
+            .filter(|x| x.1 > 0)
+            .map(|x| (x.0, x.1))
+            .collect();
+        for (s, c) in &removed {
+            self.remove_species(*s, *c);
+        }
+        removed
     }
 
     pub fn free_tiles(&self) -> impl Iterator<Item = usize> + '_ {
@@ -251,6 +362,7 @@ impl Planet {
     /// Marks cached building profiles as stale (call after changing tiles directly).
     pub fn invalidate(&mut self) {
         self.dirty = true;
+        self.constructing = true;
     }
 }
 
@@ -321,16 +433,24 @@ impl System {
     }
 }
 
-/// A ship waiting for on-demand resources (shipbuilding) at a shipyard.
+/// A technology being researched (`current-research`).
 #[derive(Clone, Debug)]
-pub struct ShipOrder {
+pub struct ResearchProject {
+    pub tech: TechId,
+    /// Resources still needed.
+    pub remaining: Cost,
+}
+
+/// A ship under construction at a planet (`current-shipbuilding`).
+#[derive(Clone, Debug)]
+pub struct ShipProject {
     pub ship: ShipId,
-    /// Shipyard planet; the ship appears in its system.
+    /// Where the ship is built. Only this planet's transient output (shipbuilding) goes into
+    /// it, and it launches in orbit of the planet.
     pub planet: PlanetId,
-    /// On-demand resources still needed.
-    pub remaining: Vec<(ResourceId, f64)>,
-    /// Fleet to join on completion (if it is still in that system), else a new fleet.
-    pub fleet: Option<FleetId>,
+    /// Normal resources spent so far (refunded if cancelled).
+    pub paid: Vec<ResourceAmount>,
+    pub remaining: Cost,
 }
 
 #[derive(Clone, Debug)]
@@ -338,32 +458,47 @@ pub struct Ship {
     pub def: ShipId,
     pub hull: f64,
     pub shield: f64,
+    /// Position relative to the fleet's position (see [`Fleet::coordinates`]).
+    pub offset: [f64; 2],
+    /// Hyperdrive charge, 0 to 1. Charges only while the fleet waits at the system edge to
+    /// carry out a jump order.
+    pub jump_charge: f64,
     /// Days until each weapon can fire again.
     pub(crate) cooldown: Vec<f64>,
 }
 
 impl Ship {
-    /// A freshly built ship at full strength.
-    pub fn new(def: ShipId, defs: &Defs) -> Self {
-        let d = defs.ship(def);
+    /// A freshly built ship at full strength (with `stats` from [`Empire::ship_stats`]).
+    pub fn new(def: ShipId, stats: &ShipStats) -> Self {
         Ship {
             def,
-            hull: d.max_hull,
-            shield: d.max_shield,
-            cooldown: vec![0.0; d.armament.len()],
+            hull: stats.max_hull,
+            shield: stats.max_shield,
+            offset: [0.0, 0.0],
+            jump_charge: 0.0,
+            cooldown: vec![0.0; stats.armament.len()],
         }
     }
 }
 
+/// Spacing between ships in a fleet formation.
+const FORMATION_GAP: f64 = 1.0;
+
+/// Formation offset of the `i`th ship in a fleet: rows of five behind the leader.
+pub fn formation_offset(i: usize) -> [f64; 2] {
+    let (row, col) = ((i / 5) as f64, (i % 5) as f64 - 2.0);
+    [col * FORMATION_GAP, -row * FORMATION_GAP]
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum FleetOrder {
-    Idle,
-    /// Travel (hyperjumping as needed) to `system`, then optionally to a point within it.
-    Move {
-        system: SystemId,
-        coordinates: Option<[f64; 2]>,
-    },
-    /// Travel to the planet and bombard it (a specific tile, or any building).
+    /// Fly to a point in the current system.
+    Move { coordinates: [f64; 2] },
+    /// Fly to the edge of the system facing `system` (an adjacent one), charge the
+    /// hyperdrives there and jump.
+    Jump { system: SystemId },
+    /// Bombard a planet in the current system (a specific tile, or any building) until it
+    /// surrenders.
     Bombard {
         planet: PlanetId,
         tile: Option<usize>,
@@ -378,19 +513,14 @@ pub struct Fleet {
     pub display_name: String,
     pub owner: EmpireId,
     pub system: SystemId,
-    /// Position relative to the system's star.
+    /// Position of the fleet relative to the system's star. Ships keep their formation
+    /// offsets around it; saves store each ship's absolute coordinates.
     pub coordinates: [f64; 2],
     pub ships: Vec<Ship>,
-    pub order: FleetOrder,
-    /// Days spent charging the hyperdrive for the next jump.
-    pub jump_charge: f64,
-    /// Whether the fleet fought this tick.
+    /// The order queue: the first order is being carried out; empty means idle.
+    pub orders: Vec<FleetOrder>,
+    /// Whether enemy fleets are present. Orders are suspended while in combat.
     pub in_combat: bool,
-    /// Next system on the route to the order's destination.
-    pub(crate) next_hop: Option<SystemId>,
-    /// `(from, to)` that `next_hop` was computed for, so routes are only searched again when
-    /// the fleet moves or its destination changes.
-    pub(crate) route_key: Option<(SystemId, SystemId)>,
 }
 
 impl Fleet {
@@ -408,36 +538,83 @@ impl Fleet {
             system,
             coordinates: [0.0, 0.0],
             ships: Vec::new(),
-            order: FleetOrder::Idle,
-            jump_charge: 0.0,
+            orders: Vec::new(),
             in_combat: false,
-            next_hop: None,
-            route_key: None,
         }
     }
 
-    /// The fleet moves at the pace of its slowest ship.
-    pub fn speed(&self, defs: &Defs) -> f64 {
+    pub fn is_idle(&self) -> bool {
+        self.orders.is_empty()
+    }
+
+    /// The order being carried out.
+    pub fn order(&self) -> Option<&FleetOrder> {
+        self.orders.first()
+    }
+
+    /// The last system the fleet's jump orders lead to (its own system if none).
+    pub fn destination(&self) -> SystemId {
+        self.orders
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                FleetOrder::Jump { system } => Some(*system),
+                _ => None,
+            })
+            .unwrap_or(self.system)
+    }
+
+    /// Fleet slots used (each ship takes its design's `fleet-size`).
+    pub fn size(&self, defs: &Defs) -> usize {
         self.ships
             .iter()
-            .map(|s| defs.ship(s.def).speed)
+            .map(|s| defs.ship(s.def).fleet_size as usize)
+            .sum()
+    }
+
+    /// The fleet moves at the pace of its slowest ship. `stats` is the owner's
+    /// [`Empire::ship_stats`].
+    pub fn speed(&self, stats: &[ShipStats]) -> f64 {
+        self.ships
+            .iter()
+            .map(|s| stats[s.def.idx()].speed)
             .fold(f64::INFINITY, f64::min)
             .min(1e9)
     }
 
-    /// Days of charging before every ship is ready to jump.
-    pub fn jump_time(&self, defs: &Defs, rules: &Ruleset) -> f64 {
+    /// Days a ship of this design takes to charge its hyperdrive from 0 to 1.
+    pub fn charge_days(stats: &ShipStats, rules: &Ruleset) -> f64 {
+        rules.hyperjump_days * stats.hyperjump_mult
+    }
+
+    /// Whether every ship's hyperdrive is fully charged.
+    pub fn charged(&self) -> bool {
+        self.ships.iter().all(|s| s.jump_charge >= 1.0 - 1e-9)
+    }
+
+    /// The least-charged ship's charge, 0 to 1 (what the fleet waits for).
+    pub fn jump_progress(&self) -> f64 {
+        self.ships.iter().map(|s| s.jump_charge).fold(1.0, f64::min)
+    }
+
+    pub fn max_range(&self, stats: &[ShipStats]) -> f64 {
         self.ships
             .iter()
-            .map(|s| rules.hyperjump_days * defs.ship(s.def).hyperjump_mult)
+            .map(|s| stats[s.def.idx()].max_range)
             .fold(0.0, f64::max)
     }
 
-    pub fn max_range(&self, defs: &Defs) -> f64 {
-        self.ships
-            .iter()
-            .map(|s| defs.ship(s.def).max_range)
-            .fold(0.0, f64::max)
+    /// Absolute position of ship `i` relative to the system's star.
+    pub fn ship_coordinates(&self, i: usize) -> [f64; 2] {
+        let o = self.ships[i].offset;
+        [self.coordinates[0] + o[0], self.coordinates[1] + o[1]]
+    }
+
+    /// Lines ships up in formation around the fleet position.
+    pub fn reform(&mut self) {
+        for (i, s) in self.ships.iter_mut().enumerate() {
+            s.offset = formation_offset(i);
+        }
     }
 }
 
@@ -487,7 +664,8 @@ pub struct Crisis {
 pub struct EmpireModifiers {
     pub buildings: Vec<TargetedModifier>,
     pub pop_growth_mult: f64,
-    pub stability: f64,
+    pub fleet_size_add: u32,
+    pub ships: ShipMods,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -495,7 +673,6 @@ pub struct EmpireStats {
     pub pop: u64,
     pub planets: u32,
     pub systems: u32,
-    pub research_income: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -503,30 +680,40 @@ pub struct Empire {
     pub name: String,
     pub display_name: String,
     pub color: Option<String>,
+    /// Stockpiles of normal resources (transient ones are always 0).
     pub storage: Vec<f64>,
     pub capital: Option<SystemId>,
+    pub dominant_species: Option<SpeciesId>,
     /// Indexed by `TechId`.
     pub techs: Vec<bool>,
-    pub researching: Option<TechId>,
-    pub research_progress: f64,
+    /// Technologies being researched, funded in order.
+    pub research: Vec<ResearchProject>,
+    /// Ships under construction, funded in order.
+    pub shipbuilding: Vec<ShipProject>,
     /// Wars this empire is fighting (kept symmetric between the two sides).
     pub wars: Vec<War>,
     /// Recent peace treaties; AI empires will not declare war on a truce partner.
     pub truces: Vec<Truce>,
-    pub ship_queue: Vec<ShipOrder>,
     /// Daily upkeep of all ships, per resource (computed each tick).
     pub fleet_upkeep: Vec<f64>,
     /// The governor's personality, if this empire is AI-run.
     pub ai: Option<AiPersonality>,
     pub accepts_migrants: bool,
     pub market_access: bool,
+    /// Stockpiled resources that ran out (recomputed every tick, not saved).
     pub crises: Vec<Crisis>,
-    /// Net change in storage last tick, per resource (including trade).
+    /// Net change in storage last tick, per resource (including trade and projects). For
+    /// transient resources: last tick's production.
     pub income: Vec<f64>,
+    /// Transient production last tick that no project could use.
+    pub wasted: Vec<f64>,
     /// Net galactic market purchases last tick (negative = sold).
     pub trade: Vec<f64>,
     pub core_pool: Option<PoolId>,
     pub modifiers: EmpireModifiers,
+    /// Effective stats of every ship design with this empire's technologies, indexed by
+    /// `ShipId`.
+    pub ship_stats: Vec<ShipStats>,
     pub stats: EmpireStats,
     pub(crate) modifier_version: u64,
     pub(crate) crisis_penalty: f64,
@@ -537,8 +724,8 @@ pub struct Empire {
     pub(crate) vacancies: Vec<Vacancy>,
     pub(crate) moves: Vec<Move>,
     pub(crate) events: Vec<Event>,
-    /// Ship orders finished this tick, spawned after settlement.
-    pub(crate) completed_ships: Vec<ShipOrder>,
+    /// Ships finished this tick, launched after settlement.
+    pub(crate) completed_ships: Vec<ShipProject>,
 }
 
 impl Empire {
@@ -550,24 +737,26 @@ impl Empire {
             color: None,
             storage: vec![0.0; r],
             capital: None,
+            dominant_species: None,
             techs: vec![false; defs.technologies.len()],
-            researching: None,
-            research_progress: 0.0,
+            research: Vec::new(),
+            shipbuilding: Vec::new(),
             wars: Vec::new(),
             truces: Vec::new(),
-            ship_queue: Vec::new(),
             fleet_upkeep: vec![0.0; r],
             ai: None,
             accepts_migrants: true,
             market_access: true,
             crises: Vec::new(),
             income: vec![0.0; r],
+            wasted: vec![0.0; r],
             trade: vec![0.0; r],
             core_pool: None,
             modifiers: EmpireModifiers {
                 pop_growth_mult: 1.0,
                 ..Default::default()
             },
+            ship_stats: defs.ships.iter().map(|s| s.base_stats.clone()).collect(),
             stats: EmpireStats::default(),
             modifier_version: 1,
             crisis_penalty: 0.0,
@@ -600,7 +789,17 @@ impl Empire {
         self.crises.iter().any(|c| c.resource == r)
     }
 
-    /// Recomputes `modifiers` from known technologies. Call after editing `techs` directly.
+    pub fn is_researching(&self, tech: TechId) -> bool {
+        self.research.iter().any(|p| p.tech == tech)
+    }
+
+    /// Most ships one of this empire's fleets can hold.
+    pub fn max_fleet_size(&self, rules: &Ruleset) -> usize {
+        (rules.base_fleet_size + self.modifiers.fleet_size_add).max(1) as usize
+    }
+
+    /// Recomputes `modifiers` and `ship_stats` from known technologies. Call after editing
+    /// `techs` directly.
     pub fn rebuild_modifiers(&mut self, defs: &Defs) {
         let mut m = EmpireModifiers {
             pop_growth_mult: 1.0,
@@ -609,11 +808,13 @@ impl Empire {
         for (i, known) in self.techs.iter().enumerate() {
             if *known {
                 let t = &defs.technologies[i];
-                m.buildings.extend(t.modifiers.iter().cloned());
+                m.buildings.extend(t.buildings.iter().cloned());
                 m.pop_growth_mult *= t.pop_growth_mult;
-                m.stability += t.stability;
+                m.fleet_size_add += t.fleet_size_add;
+                m.ships.combine(&t.ships);
             }
         }
+        self.ship_stats = defs.ships.iter().map(|s| s.stats(defs, &m.ships)).collect();
         self.modifiers = m;
         self.modifier_version += 1;
     }
@@ -792,7 +993,7 @@ impl World {
         let pmap = |p: PlanetId| planet_map.get(p.idx()).copied().flatten();
         for e in &mut self.empires {
             e.capital = e.capital.and_then(&system_map);
-            e.ship_queue.retain_mut(|o| match pmap(o.planet) {
+            e.shipbuilding.retain_mut(|o| match pmap(o.planet) {
                 Some(p) => {
                     o.planet = p;
                     true
@@ -808,23 +1009,24 @@ impl World {
             None => false,
         });
         for f in &mut self.fleets {
-            f.order = match std::mem::replace(&mut f.order, FleetOrder::Idle) {
-                FleetOrder::Move {
-                    system,
-                    coordinates,
-                } => match system_map(system) {
-                    Some(system) => FleetOrder::Move {
-                        system,
-                        coordinates,
-                    },
-                    None => FleetOrder::Idle,
-                },
-                FleetOrder::Bombard { planet, tile } => match pmap(planet) {
-                    Some(planet) => FleetOrder::Bombard { planet, tile },
-                    None => FleetOrder::Idle,
-                },
-                FleetOrder::Idle => FleetOrder::Idle,
-            };
+            // Orders that refer to removed systems or planets end the queue there.
+            let mut kept = Vec::new();
+            for o in std::mem::take(&mut f.orders) {
+                let o = match o {
+                    FleetOrder::Move { coordinates } => Some(FleetOrder::Move { coordinates }),
+                    FleetOrder::Jump { system } => {
+                        system_map(system).map(|system| FleetOrder::Jump { system })
+                    }
+                    FleetOrder::Bombard { planet, tile } => {
+                        pmap(planet).map(|planet| FleetOrder::Bombard { planet, tile })
+                    }
+                };
+                match o {
+                    Some(o) => kept.push(o),
+                    None => break,
+                }
+            }
+            f.orders = kept;
         }
         self.queue.clear();
         self.galaxy_moves.clear();
@@ -908,6 +1110,11 @@ impl World {
 
     pub fn planet_owner(&self, id: PlanetId) -> Option<EmpireId> {
         self.planets[id.idx()].owner
+    }
+
+    /// Effective stats of a ship design for an empire.
+    pub fn ship_stats(&self, empire: EmpireId, ship: ShipId) -> &ShipStats {
+        &self.empires[empire.idx()].ship_stats[ship.idx()]
     }
 
     pub fn at_war(&self, a: EmpireId, b: EmpireId) -> bool {
@@ -1043,6 +1250,36 @@ impl World {
             .filter(|(_, s)| s.owner == Some(empire))
             .map(|(i, _)| SystemId::from_idx(i));
         self.distances_from(owned)
+    }
+
+    /// The systems along a shortest hyperlane route from `from` to `to` (excluding `from`):
+    /// empty if they are the same, `None` if unreachable.
+    pub fn route(&self, from: SystemId, to: SystemId) -> Option<Vec<SystemId>> {
+        let dist = self.distances_from([to]);
+        if dist[from.idx()] == u32::MAX {
+            return None;
+        }
+        let mut path = Vec::new();
+        let mut at = from;
+        while at != to {
+            at = self.systems[at.idx()]
+                .links
+                .iter()
+                .copied()
+                .filter(|n| dist[n.idx()] < dist[at.idx()])
+                .min_by_key(|n| (dist[n.idx()], *n))?;
+            path.push(at);
+        }
+        Some(path)
+    }
+
+    /// Jump orders along the shortest route to `to` (empty if already there).
+    pub fn route_orders(&self, from: SystemId, to: SystemId) -> Option<Vec<FleetOrder>> {
+        self.route(from, to).map(|p| {
+            p.into_iter()
+                .map(|system| FleetOrder::Jump { system })
+                .collect()
+        })
     }
 
     /// The first hop on a shortest hyperlane route, or `None` if unreachable or already there.

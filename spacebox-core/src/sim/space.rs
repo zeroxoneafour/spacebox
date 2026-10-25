@@ -1,18 +1,20 @@
 //! Phase 1: fleets. Runs once per tick before any economy, simulated independently (and in
 //! parallel) for each system that contains fleets.
 //!
-//! Within a system:
+//! Each fleet works through its order queue (see [`FleetOrder`]):
 //!
-//! * Fleets heading elsewhere charge their hyperdrives. A fleet jumps to the next system on
-//!   its route once *every* ship is charged (`hyperjump_days * hyperjump_mult`, so the slowest
-//!   ship sets the pace) and arrives at the rim of the destination, on the side facing where it
-//!   came from.
-//! * Fleets of empires at war fight. The day is split into `combat_subticks` steps; fleets
-//!   close to weapon range of the nearest enemy and every weapon fires when its cooldown
-//!   (`fire_rate`, divided by outfit `fire_rate_mult`) allows. Damage hits shields first, and
-//!   any part of a shot that breaks through is applied to the hull proportionally.
-//! * Fleets with no enemies present carry out their orders: move within the system, or close
-//!   on a planet and bombard it. Fighting enemy fleets always takes priority over bombardment.
+//! * `Move`: fly to a point in the current system.
+//! * `Jump`: fly to the edge of the system facing the next one (`arrival_radius` from the
+//!   star), then, standing still there, charge every ship's hyperdrive from 0 to 1 (taking
+//!   `hyperjump_days * hyperjump_mult` days per ship). Once all are charged the fleet jumps
+//!   and arrives on the rim of the next system facing where it came from.
+//! * `Bombard`: close on a planet in the current system and fire on it until it surrenders.
+//!
+//! A fleet is *in combat* while an enemy fleet (of an empire at war with it) shares its system
+//! and either side is armed. Orders are suspended in combat: the day is split into
+//! `combat_subticks` steps, fleets close to weapon range of the nearest enemy, and every
+//! weapon fires when its cooldown (`fire_rate`, divided by `fire_rate_mult`) allows. Damage
+//! hits shields first, and any part of a shot that breaks through hits the hull.
 //!
 //! Bombardment results are applied serially afterwards (see [`apply_bombardment`]): buildings
 //! take damage and are eventually destroyed, and the planet surrenders once accumulated siege
@@ -20,7 +22,7 @@
 
 use rayon::prelude::*;
 
-use crate::defs::{Defs, Ruleset};
+use crate::defs::{Ruleset, ShipStats};
 use crate::ids::*;
 use crate::sim::events::{Event, EventKind};
 use crate::world::{Empire, Fleet, FleetOrder, Planet, System, World};
@@ -42,7 +44,6 @@ struct SystemOut {
 }
 
 struct Ctx<'a> {
-    defs: &'a Defs,
     rules: &'a Ruleset,
     empires: &'a [Empire],
     planets: &'a [Planet],
@@ -73,12 +74,64 @@ fn approach(pos: &mut [f64; 2], target: [f64; 2], step: f64, stop: f64) {
     pos[1] += (target[1] - pos[1]) / d * travel;
 }
 
-/// The system a fleet's order wants it to be in.
-fn destination(f: &Fleet, planets: &[Planet]) -> Option<SystemId> {
-    match f.order {
-        FleetOrder::Idle => None,
-        FleetOrder::Move { system, .. } => Some(system),
-        FleetOrder::Bombard { planet, .. } => planets.get(planet.idx()).map(|p| p.system),
+/// Where a fleet leaving `from` for `to` charges its hyperdrive: the system's edge closest to
+/// the destination.
+pub fn departure_point(systems: &[System], from: SystemId, to: SystemId, radius: f64) -> [f64; 2] {
+    let a = systems[from.idx()].coordinates;
+    let b = systems[to.idx()].coordinates;
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = dx.hypot(dy);
+    if len > 1e-9 {
+        [dx / len * radius, dy / len * radius]
+    } else {
+        [radius, 0.0]
+    }
+}
+
+/// How close to a point a fleet must be to count as there.
+const ARRIVED: f64 = 0.01;
+
+/// Whether `owner` may bombard `planet` while its fleet is in `system`: the planet must be in
+/// that system and belong to an enemy, or be unowned in a system that is unowned or its own
+/// (unowned planets in another empire's system cannot be taken).
+pub fn can_bombard(world: &World, owner: EmpireId, system: SystemId, planet: PlanetId) -> bool {
+    let Some(p) = world.planets.get(planet.idx()) else {
+        return false;
+    };
+    if p.system != system {
+        return false;
+    }
+    match p.owner {
+        Some(o) => o != owner && world.at_war(owner, o),
+        None => world.system(system).owner.is_none_or(|o| o == owner),
+    }
+}
+
+/// Drops orders that can no longer be carried out from the front of a fleet's queue: jumps
+/// to systems without a hyperlane (and everything after them), and bombardment of planets
+/// that are no longer valid targets.
+fn validate_orders(world: &mut World, i: usize) {
+    loop {
+        let f = &world.fleets[i];
+        let ok = match f.order() {
+            None => return,
+            Some(FleetOrder::Move { .. }) => true,
+            Some(FleetOrder::Jump { system }) => {
+                if !world.systems[f.system.idx()].links.contains(system) {
+                    world.fleets[i].orders.clear();
+                    return;
+                }
+                true
+            }
+            Some(FleetOrder::Bombard { planet, .. }) => {
+                can_bombard(world, f.owner, f.system, *planet)
+                    && f.max_range(&world.empires[f.owner.idx()].ship_stats) > 0.0
+            }
+        };
+        if ok {
+            return;
+        }
+        world.fleets[i].orders.remove(0);
     }
 }
 
@@ -88,32 +141,8 @@ pub(crate) fn tick(world: &mut World) {
     }
     let defs = world.defs.clone();
     let rules = defs.ruleset(world.ruleset);
-
-    // Routes are searched (one breadth-first search per fleet) only when a fleet's position or
-    // destination changed, or its cached hop is no longer a hyperlane.
-    /// A recomputed route: the next hop and the `(from, to)` it was computed for.
-    type Route = (Option<SystemId>, Option<(SystemId, SystemId)>);
-    let hops: Vec<Option<Route>> = world
-        .fleets
-        .iter()
-        .map(|f| {
-            let key = destination(f, &world.planets).map(|to| (f.system, to));
-            let valid = f
-                .next_hop
-                .is_none_or(|h| world.systems[f.system.idx()].links.contains(&h));
-            if key == f.route_key && valid {
-                return None;
-            }
-            Some((key.and_then(|(from, to)| world.next_hop(from, to)), key))
-        })
-        .collect();
-    for (f, update) in world.fleets.iter_mut().zip(hops) {
-        let Some((hop, key)) = update else { continue };
-        if f.next_hop != hop {
-            f.jump_charge = 0.0;
-        }
-        f.next_hop = hop;
-        f.route_key = key;
+    for i in 0..world.fleets.len() {
+        validate_orders(world, i);
     }
 
     let upkeep_ok = world
@@ -133,7 +162,6 @@ pub(crate) fn tick(world: &mut World) {
     let mut fleets = std::mem::take(&mut world.fleets);
     fleets.sort_by_key(|f| (f.system, f.id));
     let ctx = Ctx {
-        defs: &defs,
         rules,
         empires: &world.empires,
         planets: &world.planets,
@@ -162,27 +190,20 @@ pub(crate) fn tick(world: &mut World) {
         if !jumps.contains(&f.id) {
             continue;
         }
-        let Some(to) = f.next_hop else { continue };
-        let from = world.systems[f.system.idx()].coordinates;
-        let dest = world.systems[to.idx()].coordinates;
-        let (dx, dy) = (from[0] - dest[0], from[1] - dest[1]);
-        let len = dx.hypot(dy);
-        let r = rules.arrival_radius;
-        f.coordinates = if len > 1e-9 {
-            [dx / len * r, dy / len * r]
-        } else {
-            [r, 0.0]
+        let Some(FleetOrder::Jump { system: to }) = f.orders.first().cloned() else {
+            continue;
         };
+        f.coordinates = departure_point(&world.systems, to, f.system, rules.arrival_radius);
         f.system = to;
-        f.jump_charge = 0.0;
-        f.next_hop = None;
-        if destination(f, &world.planets) == Some(to) {
-            if let FleetOrder::Move {
-                coordinates: None, ..
-            } = f.order
-            {
-                f.order = FleetOrder::Idle;
-            }
+        f.orders.remove(0);
+        for s in &mut f.ships {
+            s.jump_charge = 0.0;
+        }
+        if !f
+            .orders
+            .iter()
+            .any(|o| matches!(o, FleetOrder::Jump { .. }))
+        {
             world.events.push(
                 Event::new(
                     world.day,
@@ -205,37 +226,28 @@ pub(crate) fn tick(world: &mut World) {
 
 fn simulate(fleets: &mut [Fleet], ctx: &Ctx) -> SystemOut {
     let mut out = SystemOut::default();
-    let defs = ctx.defs;
     let rules = ctx.rules;
     let sys = fleets[0].system;
     let sys_name = &ctx.systems[sys.idx()].display_name;
     let n = fleets.len();
     let owners: Vec<EmpireId> = fleets.iter().map(|f| f.owner).collect();
-    let hostile = |i: usize, j: usize| i != j && ctx.hostile(owners[i], owners[j]);
+    let stats = |f: &Fleet| -> &[ShipStats] { &ctx.empires[f.owner.idx()].ship_stats };
+    let speeds: Vec<f64> = fleets.iter().map(|f| f.speed(stats(f))).collect();
+    let ranges: Vec<f64> = fleets.iter().map(|f| f.max_range(stats(f))).collect();
+    // Enemies only fight if at least one side is armed.
+    let hostile = |i: usize, j: usize| {
+        i != j && ctx.hostile(owners[i], owners[j]) && (ranges[i] > 0.0 || ranges[j] > 0.0)
+    };
     let any_hostile = (0..n).any(|i| (0..n).any(|j| hostile(i, j)));
     let was_fighting = fleets.iter().any(|f| f.in_combat);
-    for f in fleets.iter_mut() {
-        f.in_combat = false;
-    }
     let steps = if any_hostile {
         rules.combat_subticks.max(1)
     } else {
         1
     };
     let dt = 1.0 / steps as f64;
-    let speeds: Vec<f64> = fleets.iter().map(|f| f.speed(defs)).collect();
-    let ranges: Vec<f64> = fleets.iter().map(|f| f.max_range(defs)).collect();
     let mut losses: Vec<Vec<ShipId>> = vec![Vec::new(); n];
-
-    // A bombardment target in this system, if the fleet has one.
-    let target_planet = |f: &Fleet| match f.order {
-        FleetOrder::Bombard { planet, tile } => ctx
-            .planets
-            .get(planet.idx())
-            .filter(|p| p.system == sys && p.owner != Some(f.owner))
-            .map(|p| (planet, tile, p.coordinates)),
-        _ => None,
-    };
+    let mut fought = vec![false; n];
 
     for step in 0..steps {
         let alive: Vec<usize> = fleets.iter().map(|f| f.ships.len()).collect();
@@ -250,18 +262,14 @@ fn simulate(fleets: &mut [Fleet], ctx: &Ctx) -> SystemOut {
                 })
         };
 
-        // Movement.
+        // Movement and orders.
         for i in 0..n {
-            if alive[i] == 0 {
+            if alive[i] == 0 || out.jumps.contains(&fleets[i].id) {
                 continue;
             }
             let step_len = speeds[i] * dt;
-            let leaving = fleets[i].next_hop.is_some();
-            if leaving {
-                fleets[i].jump_charge += dt;
-                continue;
-            }
             if let Some(j) = nearest_enemy(i, &pos) {
+                // In combat: orders wait while the fleet closes to weapon range.
                 if ranges[i] > 0.0 {
                     approach(
                         &mut fleets[i].coordinates,
@@ -272,16 +280,43 @@ fn simulate(fleets: &mut [Fleet], ctx: &Ctx) -> SystemOut {
                 }
                 continue;
             }
-            let f = &fleets[i];
-            let goal = match f.order {
-                FleetOrder::Move {
-                    system,
-                    coordinates: Some(c),
-                } if system == sys => Some((c, 0.0)),
-                _ => target_planet(f).map(|(_, _, c)| (c, (ranges[i] * 0.8).max(0.5))),
-            };
-            if let Some((c, stop)) = goal {
-                approach(&mut fleets[i].coordinates, c, step_len, stop);
+            let f = &mut fleets[i];
+            match f.orders.first().cloned() {
+                None => {}
+                Some(FleetOrder::Move { coordinates }) => {
+                    approach(&mut f.coordinates, coordinates, step_len, 0.0);
+                    if dist(f.coordinates, coordinates) <= ARRIVED {
+                        f.coordinates = coordinates;
+                        f.orders.remove(0);
+                    }
+                }
+                Some(FleetOrder::Jump { system }) => {
+                    let edge = departure_point(ctx.systems, sys, system, rules.arrival_radius);
+                    if dist(f.coordinates, edge) > ARRIVED {
+                        approach(&mut f.coordinates, edge, step_len, 0.0);
+                        if dist(f.coordinates, edge) <= ARRIVED {
+                            f.coordinates = edge;
+                        }
+                        continue;
+                    }
+                    // Stationary at the edge: charge.
+                    let ship_stats = stats(f);
+                    for s in &mut f.ships {
+                        let days = Fleet::charge_days(&ship_stats[s.def.idx()], rules);
+                        s.jump_charge = if days <= 0.0 {
+                            1.0
+                        } else {
+                            (s.jump_charge + dt / days).min(1.0)
+                        };
+                    }
+                    if f.charged() {
+                        out.jumps.push(f.id);
+                    }
+                }
+                Some(FleetOrder::Bombard { planet, .. }) => {
+                    let at = ctx.planets[planet.idx()].coordinates;
+                    approach(&mut f.coordinates, at, step_len, (ranges[i] * 0.8).max(0.5));
+                }
             }
         }
 
@@ -293,14 +328,15 @@ fn simulate(fleets: &mut [Fleet], ctx: &Ctx) -> SystemOut {
                 continue;
             }
             let has_enemy = nearest_enemy(i, &pos).is_some();
-            let bombard = if has_enemy {
-                None
-            } else {
-                target_planet(&fleets[i])
+            let bombard = match fleets[i].orders.first() {
+                Some(FleetOrder::Bombard { planet, tile }) if !has_enemy => {
+                    Some((*planet, *tile, ctx.planets[planet.idx()].coordinates))
+                }
+                _ => None,
             };
-            let mut fought = false;
+            let ship_stats = &ctx.empires[owners[i].idx()].ship_stats;
             for (si, ship) in fleets[i].ships.iter_mut().enumerate() {
-                for (wi, arm) in defs.ship(ship.def).armament.iter().enumerate() {
+                for (wi, arm) in ship_stats[ship.def.idx()].armament.iter().enumerate() {
                     ship.cooldown[wi] -= dt;
                     if ship.cooldown[wi] > 0.0 {
                         continue;
@@ -319,7 +355,7 @@ fn simulate(fleets: &mut [Fleet], ctx: &Ctx) -> SystemOut {
                         let k = (si + wi + step as usize) % alive[j];
                         damage.push((j, k, arm.shield_damage, arm.hull_damage));
                         ship.cooldown[wi] += arm.cooldown;
-                        fought = true;
+                        fought[i] = true;
                     } else if let Some((planet, tile, _)) =
                         bombard.filter(|(_, _, at)| dist(pos[i], *at) <= arm.range)
                     {
@@ -335,8 +371,8 @@ fn simulate(fleets: &mut [Fleet], ctx: &Ctx) -> SystemOut {
                     }
                 }
             }
-            if fought || has_enemy {
-                fleets[i].in_combat = true;
+            if has_enemy {
+                fought[i] = true;
             }
         }
         for (j, k, shield_dmg, hull_dmg) in damage {
@@ -360,6 +396,7 @@ fn simulate(fleets: &mut [Fleet], ctx: &Ctx) -> SystemOut {
 
         for (i, f) in fleets.iter_mut().enumerate() {
             let regen = ctx.upkeep_ok[f.owner.idx()];
+            let ship_stats = &ctx.empires[f.owner.idx()].ship_stats;
             f.ships.retain(|s| {
                 if s.hull <= 0.0 {
                     losses[i].push(s.def);
@@ -370,31 +407,39 @@ fn simulate(fleets: &mut [Fleet], ctx: &Ctx) -> SystemOut {
             });
             if regen {
                 for s in &mut f.ships {
-                    let d = defs.ship(s.def);
+                    let d = &ship_stats[s.def.idx()];
                     s.shield = (s.shield + d.shield_regen * dt).min(d.max_shield);
                 }
             }
         }
     }
 
+    // Combat lasts while enemies remain.
+    let alive: Vec<usize> = fleets.iter().map(|f| f.ships.len()).collect();
+    for i in 0..n {
+        fleets[i].in_combat = alive[i] > 0 && (0..n).any(|j| alive[j] > 0 && hostile(i, j));
+    }
+
     // Repairs in friendly, quiet systems.
     let sys_owner = ctx.systems[sys.idx()].owner;
-    for f in fleets.iter_mut() {
-        if !f.in_combat && sys_owner == Some(f.owner) && ctx.upkeep_ok[f.owner.idx()] {
+    for (i, f) in fleets.iter_mut().enumerate() {
+        if !fought[i] && sys_owner == Some(f.owner) && ctx.upkeep_ok[f.owner.idx()] {
+            let ship_stats = &ctx.empires[f.owner.idx()].ship_stats;
             for s in &mut f.ships {
-                let max = defs.ship(s.def).max_hull;
+                let max = ship_stats[s.def.idx()].max_hull;
                 s.hull = (s.hull + max * rules.ship_repair_rate).min(max);
             }
         }
     }
 
     // Narration.
-    let fighting = fleets.iter().any(|f| f.in_combat);
+    let fighting = fought.iter().any(|f| *f);
     if fighting && !was_fighting {
         let sides: Vec<String> = fleets
             .iter()
-            .filter(|f| f.in_combat)
-            .map(|f| {
+            .enumerate()
+            .filter(|(i, _)| fought[*i])
+            .map(|(_, f)| {
                 format!(
                     "{} ({})",
                     f.display_name,
@@ -435,13 +480,6 @@ fn simulate(fleets: &mut [Fleet], ctx: &Ctx) -> SystemOut {
         out.events
             .push(Event::new(ctx.day, kind, msg).empire(Some(f.owner)));
     }
-
-    for f in fleets.iter() {
-        if f.next_hop.is_some() && !f.ships.is_empty() && f.jump_charge >= f.jump_time(defs, rules)
-        {
-            out.jumps.push(f.id);
-        }
-    }
     out
 }
 
@@ -475,7 +513,7 @@ fn apply_bombardment(world: &mut World, mut hits: Vec<Hit>) {
             continue;
         }
         let attacker_name = world.empires[h.attacker.idx()].display_name.clone();
-        let (pop, stability, habitable) = (p.pop, p.stats.stability, p.habitable);
+        let (pop, stability, habitable) = (p.pop(), p.stats.stability, p.habitable);
         let p = &mut world.planets[h.planet.idx()];
         if !p.flags.bombarded && p.siege == 0.0 && habitable && pop > 0 {
             world.events.push(
@@ -538,14 +576,14 @@ fn surrender(world: &mut World, planet: PlanetId, attacker: EmpireId) {
     world.set_planet_owner(planet, Some(attacker));
     let ai = world.empires[attacker.idx()].ai.is_some();
     let sys = world.planets[planet.idx()].system;
+    // Fleets bombarding the planet move on to the rest of their orders. AI fleets first take
+    // on the nearest remaining planet in the system they can bombard, so the whole system
+    // ends up theirs.
     let next_target = |world: &World, from: [f64; 2]| {
         world
             .system(sys)
             .planet_ids()
-            .filter(|p| match world.planet(*p).owner {
-                None => true,
-                Some(o) => o != attacker && world.at_war(attacker, o),
-            })
+            .filter(|p| *p != planet && can_bombard(world, attacker, sys, *p))
             .min_by(|a, b| {
                 let d = |p: &PlanetId| dist(from, world.planet(*p).coordinates);
                 d(a).total_cmp(&d(b)).then(a.cmp(b))
@@ -557,7 +595,7 @@ fn surrender(world: &mut World, planet: PlanetId, attacker: EmpireId) {
         .enumerate()
         .filter(|(_, f)| {
             f.owner == attacker
-                && matches!(f.order, FleetOrder::Bombard { planet: p, .. } if p == planet)
+                && matches!(f.order(), Some(FleetOrder::Bombard { planet: p, .. }) if *p == planet)
         })
         .map(|(i, _)| i)
         .collect();
@@ -567,13 +605,18 @@ fn surrender(world: &mut World, planet: PlanetId, attacker: EmpireId) {
         } else {
             None
         };
-        world.fleets[i].order = match target {
-            Some(p) => FleetOrder::Bombard {
-                planet: p,
-                tile: None,
-            },
-            None => FleetOrder::Idle,
-        };
+        let f = &mut world.fleets[i];
+        match target {
+            Some(p) => {
+                f.orders[0] = FleetOrder::Bombard {
+                    planet: p,
+                    tile: None,
+                }
+            }
+            None => {
+                f.orders.remove(0);
+            }
+        }
     }
     let p = &world.planets[planet.idx()];
     let who = world.empires[attacker.idx()].display_name.clone();

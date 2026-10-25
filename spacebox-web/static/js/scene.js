@@ -24,7 +24,7 @@ export const SYSTEM_SCALE = 0.15;
 
 export function buildingColor(defs, id) {
   const b = defs.buildings[id];
-  for (const c of b.classes) if (c !== 'barren' && CLASS_COLORS[c]) return CLASS_COLORS[c];
+  for (const c of b.tags) if (c !== 'barren' && CLASS_COLORS[c]) return CLASS_COLORS[c];
   let h = 0;
   for (const ch of b.name) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
   return `hsl(${h % 360}, 60%, 60%)`;
@@ -40,11 +40,20 @@ function hash(n) {
   return ((x >>> 16) ^ x) / 4294967296 + 0.5;
 }
 
-/// The system a fleet's order is taking it to, if any.
+/// The last system the fleet's jump orders lead to (its own system if none).
 export function fleetDestination(state, f) {
-  if (f.order.type === 'move') return f.order.system;
-  if (f.order.type === 'bombard') return state.planets[f.order.planet]?.system ?? null;
-  return null;
+  return f.destination;
+}
+
+/// Where a fleet leaving system `from` for `to` charges its hyperdrive: the edge facing `to`.
+export function departurePoint(state, defs, from, to) {
+  const a = state.systems[from].coordinates;
+  const b = state.systems[to].coordinates;
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const len = Math.hypot(dx, dy) || 1;
+  const r = defs.rules.arrival_radius;
+  return [(dx / len) * r, (dy / len) * r];
 }
 
 
@@ -304,7 +313,7 @@ export class Scene {
     if (reset) this.setCamera(mid.clone().add(new THREE.Vector3(0, extent * 2.1 + 8, extent * 0.75 + 6)), mid);
   }
 
-  system({ state }, id, sel, reset) {
+  system({ state, defs }, id, sel, reset) {
     const s = state.systems[id];
     if (!s) return;
     const g = this.content;
@@ -332,7 +341,7 @@ export class Scene {
 
       const size = p.size === 'large' ? 0.5 : 0.3;
       const color = p.habitable ? (p.pop > 0 ? 0x3fa36b : 0x4a8c7a) : p.size === 'large' ? 0x8f8173 : 0x9d978e;
-      const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.8, emissive: p.terraform_days_left ? 0x4a3a00 : 0x000000 });
+      const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.8, emissive: p.terraform ? 0x4a3a00 : 0x000000 });
       const m = new THREE.Mesh(new THREE.SphereGeometry(size, 24, 16), mat);
       m.position.set(px * S, 0, pz * S);
       m.userData.pick = { kind: 'planet', id: pid };
@@ -356,6 +365,7 @@ export class Scene {
 
     // Fleets.
     const fleetGeo = new THREE.ConeGeometry(0.28, 0.7, 4);
+    const shipDotGeo = new THREE.SphereGeometry(0.06, 6, 4);
     for (const f of state.fleets) {
       if (f.system !== id) continue;
       const [fx, fz] = f.coordinates;
@@ -368,6 +378,13 @@ export class Scene {
       m.userData.pick = { kind: 'fleet', id: f.id };
       g.add(m);
       this.pickables.push(m);
+      // Each ship at its own position (the formation around the fleet).
+      const shipMat = new THREE.MeshBasicMaterial({ color: empireColor(state, f.owner) });
+      for (const [, , , x, y] of f.ships) {
+        const dot = new THREE.Mesh(shipDotGeo, shipMat);
+        dot.position.set(x * S, 0.5, y * S);
+        g.add(dot);
+      }
       if (f.in_combat || selected) {
         const ring = new THREE.Mesh(
           new THREE.TorusGeometry(0.55, 0.04, 6, 24),
@@ -379,19 +396,20 @@ export class Scene {
       }
       // Where it is heading inside this system.
       let target = null;
-      if (f.order.type === 'move' && f.order.system === id && f.order.coordinates) target = f.order.coordinates;
-      if (f.order.type === 'bombard' && state.planets[f.order.planet]?.system === id) target = state.planets[f.order.planet].coordinates;
+      const o = f.orders[0];
+      if (o?.order === 'move') target = o.coordinates;
+      if (o?.order === 'bombard') target = state.planets[o.planet].coordinates;
+      if (o?.order === 'jump') target = departurePoint(state, defs, id, o.system);
       if (target) {
         const line = new THREE.Line(
           new THREE.BufferGeometry().setFromPoints([m.position.clone(), new THREE.Vector3(target[0] * S, 0.5, target[1] * S)]),
-          new THREE.LineDashedMaterial({ color: f.order.type === 'bombard' ? 0xff6060 : empireColor(state, f.owner), dashSize: 0.3, gapSize: 0.2 }),
+          new THREE.LineDashedMaterial({ color: o.order === 'bombard' ? 0xff6060 : empireColor(state, f.owner), dashSize: 0.3, gapSize: 0.2 }),
         );
         line.computeLineDistances();
         g.add(line);
       }
-      const leaving = fleetDestination(state, f);
       let text = `${f.display_name} (${f.ships.length})`;
-      if (leaving != null && leaving !== id) text += ` → ${state.systems[leaving].display_name} ${Math.round((f.jump_charge / Math.max(f.jump_time, 0.01)) * 100)}%`;
+      if (o?.order === 'jump') text += ` → ${state.systems[o.system].display_name}${f.jump_progress > 0 ? ` ${Math.round(f.jump_progress * 100)}%` : ''}`;
       const fl = this.label(`fleet:${f.id}`, text);
       fl.position.copy(m.position);
       fl.position.y += 0.4;

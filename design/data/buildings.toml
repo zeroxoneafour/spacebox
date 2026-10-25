@@ -12,8 +12,8 @@ upkeep-cost = [
     { resource = "resources.example-resource", count = 1 }
 ]
 adjacency-bonus = [
-    { building-tag = "example-building-tag", housing-mult = 1.1 },
-    { building = "example-building", housing-mult = 0.75 },
+    { building-tags = [ "example-building-tag" ], housing-mult = 1.1 },
+    { buildings = [ "example-building" ], housing-mult = 0.75 },
 ]
 
 [building.example-building]
@@ -63,8 +63,8 @@ outputs = [
 ]
 
 [building.example-barren-building]
-display_name = "Example Barren Building"
-building-tags = [ "barren" ] # so equivalent to [ barren, land ]
+display-name = "Example Barren Building"
+building-tags = [ "barren", "example-building-tag" ] # so equivalent to [ barren, example-building-tag, land ]
 build-cost = [
     { resource = "resources.example-resource", count = 250 },
     { days = 100 }
@@ -95,9 +95,11 @@ display-name = "Example Barren Blocker"
 building-tags = [ "barren", "blocker" ]
 remove-cost = [ { resource = "resources.example-resource", count = 500 }, { days = 150 } ]
 
-[building.example-building-upgrade]
+[building-upgrade.example-building-upgrade]
 display-name = "Example Building Upgrade"
-applies-to = [ "example-building", "example-building-tag" ]
+# upgrade applies to buildings/building tags like this
+buildings = [ "example-building" ]
+building-tags = [ "example-building-tag" ]
 requires-tech = [ "technologies.example-technology" ]
 build-cost = [
     { resource = "resources.example-resource", count = 750 },

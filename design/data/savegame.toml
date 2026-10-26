@@ -11,6 +11,42 @@ day = 10
 seed = 8902341 # 64 bit unsigned integer (u64)
 ruleset = "rules.example-ruleset"
 
+# wars can have three different end goals -
+# 1. Humiliate - war fought to humiliate the opponent. Opponent has disabled influence gain for 1 year after the war ends.
+#    Humiliation wars do not have any prerequisites. Declaring a humiliation war costs 250 influence.
+# 2. Claim - war fought to seize opponent claims. At the end of the war, all seized claims permenantly join the empire that owns them.
+#    Claim wars require the empire to hold claims on other empire's systems. Declaring a claim war costs 500 influence.
+# 3. Total - war fought to eradicate an opponent. Opponent's systems are permenantly seized as the war proceeds.
+#    Total wars require the declaring empire to either be on the defensive of a total war declaration or be highly militant. Costs 1000 influence.
+# If you have a war declared on you, then setting your war goal costs 0 influence. Note that some war goals cannot be set
+# ex. defensive empires can set the "claim" war goal for free, but only if they have active claims on the offending parties
+# Wars must end by either mutual agreement or force.
+# You can propose an end to a war at any time but it may not be accepted by the other party if they are winning.
+[game.wars.example-war]
+display-name = "Example War"
+offensive-goal = "humiliate"
+defensive-goal = "claim"
+starting-day = 0
+# exhaustions are 0 to 1. once exhaustion for one side is 1, the other side can force their end to the war.
+# exhaustion rises when losing ships, losing systems/planets, running low on resources, etc.
+# possible ends - offensive victory, defensive victory, status quo (nothing changes, occupied (but not owned) systems are returned)
+# in a victory in a claim war only the winning side keeps its claims
+# in a total war the exact ending of the war doesn't actually matter, both sides keep what they have
+# thus, total war status quo might not end in a true status quo as planets can be permanently changed
+offensive-exhaustion = 0
+defensive-exhaustion = 0
+#victory = "offensive" # offensive, defensive, or status quo. If this field is not defined, the war is ongoing.
+
+# empires can form alliances with each other. empires of the same alliance -
+# 1. cannot go to war with each other
+# 2. must enter wars with their allies, unless their ally is going against another one of their allies or they have a truce with the opponent
+[game.alliances.example-alliance]
+display-name = "Great Alliance"
+
+[game.truces.example-truce]
+display-name = "Truce"
+valid-until = 300 # day vaild until
+
 [empire.example-empire]
 display-name = "Example Empire"
 color = "#ff0000"
@@ -37,14 +73,19 @@ current-shipbuilding = [
 [empire.example-empire.policy]
 accepts-migrants = true                   # whether other empires' pops may settle here (default true)
 market-access = true                      # whether it trades on the galactic market (default true)
+total-war = false # can declare total wars
 
 [empire.example-empire.diplomacy]
+humiliated = 0 # defaults to 0. days left of being humiliated. updated upon losing a humilation war
+# Claims costs the same formula as initial building placement in influence cost (100 * 2^n formula) to make
+claims = [
+    #"example-system-2" # would be valid if this was a system unowned by the example-empire
+]
 wars = [
-    #{ empire = "example-empire-2", since-day = 120 },  # since-day is required and should always be specified
+    { war = "example-war", side = "offense" } # in a real game, would also have a defense. Since the defense does not exist, this war would end instantly when the save is loaded.
 ]
-truces = [
-    #{ empire = "example-empire-2", until-day = 300 }, # this is valid if there as an empire 2, which there isn't. this is how the truces field would be formatted
-]
+truces = [ "example-truce" ]
+alliances = [ "example-alliance" ]
 
 [empire.example-empire.fleets.home-fleet]
 display-name = "Example Empire Home Fleet"
@@ -84,8 +125,12 @@ scientific = 0.5 # willingness to expand research capability. lower values prior
 display-name = "Example System"
 star-type = "yellow-small"
 star-count = 1
-# this changes only when all planets in an occupied system are captured, or when an empty system has any one planet change loyalty
+# this changes initially when an empty system has any one planet change loyalty
+# in a total war, it changes when all owned planets in a system are captured
+# in a non-total war, it only changes at the end of the war when the claims are resolved
 owner = "example-empire"
+# use this to track occupation during a non-total war. in a total war, bypass this and straight up change owner
+#occupier = "example-empire-2"
 linked-systems = [
     #"example-system-2" # would be valid if there was an example-system-2
 ]
@@ -101,6 +146,10 @@ habitable = false
 coords = [-14.0, 12]
 # if there is no owner specified, the planet is unowned even if it is in an owned system
 owner = "example-empire" # uninhabited planets change loyalty immediately when bombarded
+# use this to track occupation during a non-total war. in a total war, bypass this and straight up change owner
+# planets should produce resources for their occupier if it is defined, else produce for their owner
+# occupier gets unset at the end of non-total wars, and depending on the outcome ownership is either passed on or kept
+#occupier = "example-empire-2"
 # terraforming progress
 terraform = { paid = [ { resource = "resources.example-resource", count = 1500.0 } ], remaining = [ { resource = "resources.example-resource", count = 500.0 }, { days = 120 } ] }
 
@@ -121,6 +170,7 @@ habitable = true
 population = [ { species = "species.example-species", count = 1000 } ]
 coords = [25.0, 4.0]
 owner = "example-empire" # inhabited planets must surrender before changing loyalty
+#occupier = "example-empire-2"
 siege = 1250.0      # optional, default 0
 
 [system.example-system.planets.example-planet.tile-0]

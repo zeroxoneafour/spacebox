@@ -132,7 +132,7 @@ export class Scene {
     const el = this.renderer.domElement;
     let down = null;
     const pick = (ev) => {
-      const r = el.getBoundingClientRect();
+      const r = el.getBoulabelsndingClientRect();
       this.pointer.set(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
       this.raycaster.setFromCamera(this.pointer, this.camera);
       this.raycaster.params.Line = { threshold: 0 };

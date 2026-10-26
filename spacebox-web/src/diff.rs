@@ -14,10 +14,54 @@
 
 use serde_json::{Value, json};
 
+use crate::snapshot::Snapshot;
+
+#[cfg(test)]
 pub fn diff(old: &Value, new: &Value) -> Vec<Value> {
     let mut ops = Vec::new();
     let mut path = Vec::new();
     walk(old, new, &mut path, &mut ops);
+    ops
+}
+
+/// The ops turning one snapshot into another. Only entities whose text changed are parsed and
+/// compared structurally, so the result is the same as diffing the full states.
+pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Value> {
+    let mut ops = Vec::new();
+    let mut path = Vec::new();
+    // The top level holds a few small fields besides the lists, which never vanish.
+    if let (Value::Object(a), Value::Object(b)) = (&old.top, &new.top) {
+        for (k, vb) in b {
+            path.push(Value::String(k.clone()));
+            match a.get(k) {
+                Some(va) => walk(va, vb, &mut path, &mut ops),
+                None => ops.push(set(&path, vb)),
+            }
+            path.pop();
+        }
+    }
+    let parse = |s: &str| serde_json::from_str::<Value>(s).expect("snapshot text is JSON");
+    for ((name, a), (_, b)) in old.lists.iter().zip(&new.lists) {
+        path.push(Value::String((*name).to_string()));
+        if a.len() != b.len() {
+            ops.push(json!({ "p": path, "n": b.len() }));
+        }
+        for (i, vb) in b.iter().enumerate() {
+            if a.get(i)
+                .is_some_and(|va| std::sync::Arc::ptr_eq(va, vb) || va == vb)
+            {
+                continue;
+            }
+            path.push(Value::from(i));
+            let vb = parse(vb);
+            match a.get(i) {
+                Some(va) => walk(&parse(va), &vb, &mut path, &mut ops),
+                None => ops.push(set(&path, &vb)),
+            }
+            path.pop();
+        }
+        path.pop();
+    }
     ops
 }
 
@@ -157,5 +201,30 @@ mod tests {
         roundtrip(json!({"a": 1, "b": 2}), json!({"a": 1}));
         roundtrip(json!({"v": [1, 2, 3]}), json!({"v": [1, 9]}));
         roundtrip(json!({"x": null}), json!({"x": {"y": [1]}}));
+    }
+
+    #[test]
+    fn snapshot_diffs_rebuild_the_new_state() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../data/scenarios/sol.toml");
+        let (mut w, _) = spacebox_core::load_world(path).unwrap();
+        w.refresh_topology();
+        let a = crate::snapshot::state(&w, None);
+        w.run(30);
+        let b = crate::snapshot::state(&w, Some(&a));
+        // Unchanged entities share their text with the previous version.
+        assert!(
+            a.lists[0]
+                .1
+                .iter()
+                .zip(&b.lists[0].1)
+                .any(|(x, y)| std::sync::Arc::ptr_eq(x, y))
+        );
+        let ops = diff_snapshots(&a, &b);
+        assert!(!ops.is_empty());
+        let mut full: Value = serde_json::from_str(&a.to_json()).unwrap();
+        apply(&mut full, &ops);
+        let want: Value = serde_json::from_str(&b.to_json()).unwrap();
+        assert_eq!(full, want);
+        assert!(diff_snapshots(&b, &b).is_empty());
     }
 }

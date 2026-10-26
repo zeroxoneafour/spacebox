@@ -16,6 +16,7 @@
 //!    crises; shortage ratios are published for the next tick. Then (serially) projects draw
 //!    from storage and transient production, research completes, migrations are committed,
 //!    finished ships launched and completed expansion sites claim their planets and systems.
+//!    Wars then update (exhaustion, humiliation, wars left without one side end).
 //! 7. **Governors** (parallel per AI empire) look at the fresh state and queue commands.
 
 pub mod ai;
@@ -25,6 +26,7 @@ pub mod events;
 pub mod migration;
 pub mod planet;
 pub mod space;
+pub mod war;
 
 use rayon::prelude::*;
 
@@ -77,7 +79,7 @@ impl World {
         // 2. Planets.
         planets.par_iter_mut().enumerate().for_each(|(i, p)| {
             let pool = &pools[p.pool.idx()];
-            let owner = p.owner.map(|o| (o, &empires[o.idx()]));
+            let owner = p.controller().map(|o| (o, &empires[o.idx()]));
             let ctx = planet::PlanetCtx {
                 defs,
                 rules,
@@ -89,6 +91,18 @@ impl World {
             };
             planet::tick(p, PlanetId::from_idx(i), &ctx);
         });
+
+        let busy: Vec<u32> = planets
+            .par_iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.constructing
+                    || p.terraform.is_some()
+                    || !p.events.is_empty()
+                    || !p.claims.is_empty()
+            })
+            .map(|(i, _)| i as u32)
+            .collect();
 
         // 3. Systems.
         systems
@@ -153,13 +167,15 @@ impl World {
         pools
             .par_iter_mut()
             .for_each(|p| economy::finalize_pool(p, empires));
+        self.busy = busy;
         economy::fund_projects(self);
         migration::commit(self);
         self.launch_ships();
         self.apply_claims();
+        war::tick(self);
 
-        for p in &mut self.planets {
-            self.events.append(&mut p.events);
+        for &i in &self.busy {
+            self.events.append(&mut self.planets[i as usize].events);
         }
         for e in &mut self.empires {
             self.events.append(&mut e.events);
@@ -250,9 +266,9 @@ impl World {
     fn apply_claims(&mut self) {
         let day = self.day;
         let mut claims = Vec::new();
-        for (i, p) in self.planets.iter_mut().enumerate() {
-            for e in p.claims.drain(..) {
-                claims.push((PlanetId::from_idx(i), e));
+        for &i in &self.busy {
+            for e in self.planets[i as usize].claims.drain(..) {
+                claims.push((PlanetId(i), e));
             }
         }
         for (pid, e) in claims {
@@ -357,14 +373,17 @@ impl World {
         let mut owned = vec![Vec::new(); n_emp];
         let mut owned_planets = vec![Vec::new(); n_emp];
         let mut presence = vec![Vec::new(); n_emp];
+        // Borders follow ownership; economies follow control (occupiers run what they hold).
         for (i, s) in self.systems.iter().enumerate() {
             if let Some(o) = valid(s.owner) {
                 owned[o.idx()].push(SystemId::from_idx(i));
+            }
+            if let Some(o) = valid(s.occupier.or(s.owner)) {
                 presence[o.idx()].push(SystemId::from_idx(i));
             }
         }
         for (i, p) in self.planets.iter().enumerate() {
-            if let Some(o) = valid(p.owner) {
+            if let Some(o) = valid(p.controller()) {
                 owned_planets[o.idx()].push(PlanetId::from_idx(i));
                 presence[o.idx()].push(p.system);
             }
@@ -379,8 +398,9 @@ impl World {
         for s in &mut self.systems {
             owners.clear();
             for p in &mut self.planets[s.planet_start as usize..s.planet_end as usize] {
-                let owner = valid(p.owner);
-                p.owner = owner;
+                p.owner = valid(p.owner);
+                p.occupier = valid(p.occupier);
+                let owner = p.controller();
                 p.group = match owners.iter().position(|o| *o == owner) {
                     Some(g) => g as u8,
                     None => {
@@ -391,6 +411,7 @@ impl World {
             }
             // Keep the existing groups (and their buffers) when the owners are unchanged.
             if !s.groups.iter().map(|g| g.owner).eq(owners.iter().copied()) {
+                s.quiet = false;
                 s.groups = owners
                     .iter()
                     .map(|o| SystemGroup::new(*o, PoolId(0), n_res))

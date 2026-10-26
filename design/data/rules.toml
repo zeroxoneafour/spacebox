@@ -74,6 +74,17 @@ siege-decay = 0.02                    # siege progress lost per day without bomb
 [ruleset.example-ruleset.diplomacy]
 truce-days = 360              # after peace, AI empires won't renew the war for this long
 
+[ruleset.example-ruleset.war]
+humiliate-cost = 250                     # influence to declare each war goal
+claim-cost = 500
+total-cost = 1000
+humiliation-days = 360                   # no influence income for the loser of a humiliation war
+daily-exhaustion = 0.0005                # per day of war, per side
+ship-loss-exhaustion = 0.5               # x the share of the side's fleet slots lost that day
+planet-loss-exhaustion = 0.02            # per uninhabited planet lost
+populated-planet-loss-exhaustion = 0.08  # per populated planet lost
+crisis-exhaustion = 0.002                # per day, x summed crisis severity (averaged over members)
+
 # Terraforming
 [ruleset.example-ruleset.terraforming.large]
 requires-tech = "technologies.example-technology"

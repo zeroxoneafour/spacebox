@@ -35,11 +35,13 @@ The client loads three.js from the jsDelivr CDN, so the browser needs internet a
   resource multipliers. Click a tile to build, upgrade, demolish, cap jobs, pin workers or
   disable it. Projects show what they still need; cancelling one refunds what it has used.
 - **Side panels.** Empires (create, rename, recolour, dominant species, toggle AI and tune its
-  militant/expansionist/scientific sliders, migration and market access, set stockpiles,
-  transient output and waste, add or cancel research projects, grant or revoke technologies,
-  declare war or make peace, cancel ships under construction, spawn fleets); systems (owner,
-  capital, hyperlanes, planets with owners, fleets present, add planets, delete); planets
-  (owner, siege progress, ship construction, pops per species, add, remove, set or move pops,
+  militant/expansionist/scientific sliders, migration, market access and total-war policy, set
+  stockpiles, transient output and waste, add or cancel research projects, grant or revoke
+  technologies, diplomacy: declare wars with a goal, set the defense's goal, follow both
+  sides' exhaustion, propose, accept or enforce peace, drop claims, found, join or leave
+  alliances; cancel ships under construction, spawn fleets); systems (owner, occupier,
+  claimants and claiming, capital, hyperlanes, planets with owners, fleets present, add
+  planets, delete); planets (owner, occupier, siege progress, ship construction, pops per species, add, remove, set or move pops,
   terraform or cancel it, toggle habitability, delete).
 - **Expansion.** On an empty tile in an unowned system, choose which empire builds. The panel
   shows the extra influence and days for the claim.
@@ -62,7 +64,7 @@ All bodies are JSON. Ids are indices into the corresponding arrays of the state.
 | POST | `/api/sync` | Same as tick, but does not advance time (use after admin edits) |
 | POST | `/api/command` | Engine command with normal rules, e.g. `{ "type": "build", "planet": 3, "tile": 7, "building": 5 }` |
 | POST | `/api/empires` | Create an empire: `{ display_name, ai, color, capital, starting_resources, dominant_species }`; `ai` is `{ militant, expansionist, scientific }` (0–1) or null for a player empire; `starting_resources` uses the ruleset's `base-resource-stores` |
-| PATCH | `/api/empires/{id}` | `display_name`, `ai` (personality object, or `null` to hand control to the player), `color`, `accepts_migrants`, `market_access`, `dominant_species` |
+| PATCH | `/api/empires/{id}` | `display_name`, `ai` (personality object, or `null` to hand control to the player), `color`, `accepts_migrants`, `market_access`, `total_war`, `dominant_species` |
 | POST | `/api/empires/{id}/techs` | Grant or revoke a technology: `{ tech, known }` |
 | POST | `/api/empires/{id}/storage` | Set a stockpile: `{ resource, count }` (not for transient resources) |
 | POST | `/api/systems` | Add a system: `{ display_name, coordinates, owner, links, link_nearest, random_planets }` |
@@ -87,21 +89,27 @@ owned planet; fed by that planet's shipyards), `cancel_ship`, `set_orders`
 { order: "bombard", planet, tile }], append }`), `move_fleet` and `bombard` (which replace
 the queue with a route of jumps plus the move or bombardment),
 `move_fleet`, `bombard`, `stop_fleet`, `merge_fleets`, `split_fleet`, `rename_fleet`,
-`disband_fleet`, `declare_war`, `make_peace`. The fields match `spacebox_core::Command`;
+`disband_fleet`, `declare_war` (`goal`: `"humiliate"`, `"claim"` or `"total"`),
+`set_war_goal`, `propose_peace` and `enforce_peace` (`outcome`: `"offensive"`, `"defensive"`
+or `"status quo"`), `accept_peace`, `claim`, `drop_claim`, `create_alliance`,
+`join_alliance`, `leave_alliance`. The fields match `spacebox_core::Command`;
 fleet ids are the stable `id` of each entry in `state.fleets`.
 
 ### Diffs
 
-Each time state is requested, the server takes a JSON snapshot. If it differs from the latest
-one, it gets a new `version`, and the last 32 versions are kept. A client that sends
-`since: <version>` and the current `epoch` gets back `ops`: a list of path-based edits
-(`{p, v}` set, `{p, d}` delete, `{p, n}` resize array). If that version has been evicted, or
-the world has been replaced (new `epoch`), the client gets the full `state` instead.
+Each time state is requested, the server takes a snapshot: every system, planet, empire and
+fleet serialized on its own, with entities unchanged since the previous snapshot sharing its
+text. If anything changed it gets a new `version`, and the last 8 versions are kept. A client
+that sends `since: <version>` and the current `epoch` gets back `ops`: a list of path-based
+edits (`{p, v}` set, `{p, d}` delete, `{p, n}` resize array), computed by parsing and
+comparing only the entities that changed. If that version has been evicted, or the world has
+been replaced (new `epoch`), the client gets the full `state` instead.
 
 `since_event` works the same way for the event log.
 
-On a 120-system galaxy, a 10-day step sends about 10 KB of ops instead of the 320 KB full
-state.
+A snapshot costs little more than its JSON size in memory (about 10 MB for 2,000 systems) and
+takes about 10 ms to build for that size. On a 120-system galaxy, a 10-day step sends about
+10 KB of ops instead of the 320 KB full state.
 
 Removing systems or planets shifts the ids that come after them. The diff handles this, but
 any queued engine commands are dropped.

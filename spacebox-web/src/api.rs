@@ -7,18 +7,19 @@ use std::sync::{Arc, Mutex};
 
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use spacebox_core::generate::{self, GalaxyParams};
 use spacebox_core::geometry::PlanetSize;
 use spacebox_core::world::{
-    AiPersonality, BuildingInstance, Empire, Fleet, FleetOrder, Planet, ProjectKind, Ship,
+    AiPersonality, BuildingInstance, Empire, Fleet, FleetOrder, Planet, ProjectKind, Ship, WarGoal,
+    WarOutcome,
 };
 use spacebox_core::{
-    BuildingId, Command, EmpireId, FleetId, PlanetId, ResourceId, ShipId, SpeciesId, SystemId,
-    TechId, UpgradeId, World, load_assets, load_world, save,
+    AllianceId, BuildingId, Command, EmpireId, FleetId, PlanetId, ResourceId, ShipId, SpeciesId,
+    SystemId, TechId, UpgradeId, WarId, World, load_assets, load_world, save,
 };
 
 use crate::engine::{Engine, Known};
@@ -47,10 +48,30 @@ impl From<&str> for ApiError {
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
+/// A response whose JSON is already serialized (large states are never built as trees).
+type TextResult = Result<([(header::HeaderName, &'static str); 1], String), ApiError>;
+
 /// Runs `f` with the engine locked, off the async executor.
 async fn run<F>(state: Shared, f: F) -> ApiResult
 where
     F: FnOnce(&mut Engine) -> Result<Value, ApiError> + Send + 'static,
+{
+    run_with(state, f).await.map(Json)
+}
+
+/// Like [`run`], for handlers that produce JSON text.
+async fn run_text<F>(state: Shared, f: F) -> TextResult
+where
+    F: FnOnce(&mut Engine) -> Result<String, ApiError> + Send + 'static,
+{
+    let text = run_with(state, f).await?;
+    Ok(([(header::CONTENT_TYPE, "application/json")], text))
+}
+
+async fn run_with<T, F>(state: Shared, f: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Engine) -> Result<T, ApiError> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
         // A panic in an earlier request must not take the whole server down.
@@ -64,7 +85,6 @@ where
             format!("engine task failed: {e}"),
         )
     })?
-    .map(Json)
 }
 
 fn ok() -> Value {
@@ -91,6 +111,20 @@ fn system(w: &World, id: u32) -> Result<SystemId, ApiError> {
 }
 fn empire(w: &World, id: u32) -> Result<EmpireId, ApiError> {
     check(id, w.empires.len(), "empire").map(EmpireId)
+}
+fn war(w: &World, id: u32) -> Result<WarId, ApiError> {
+    check(id, w.wars.len(), "war").map(WarId)
+}
+fn alliance(w: &World, id: u32) -> Result<AllianceId, ApiError> {
+    check(id, w.alliances.len(), "alliance").map(AllianceId)
+}
+fn war_goal(s: &str) -> Result<WarGoal, ApiError> {
+    WarGoal::parse(s)
+        .ok_or_else(|| format!("unknown war goal '{s}' (humiliate, claim or total)").into())
+}
+fn war_outcome(s: &str) -> Result<WarOutcome, ApiError> {
+    WarOutcome::parse(s)
+        .ok_or_else(|| format!("unknown outcome '{s}' (offensive, defensive or status quo)").into())
 }
 fn resource(w: &World, id: u32) -> Result<ResourceId, ApiError> {
     check(id, w.defs.resources.len(), "resource").map(ResourceId)
@@ -128,8 +162,8 @@ pub async fn get_defs(State(s): State<Shared>) -> ApiResult {
     .await
 }
 
-pub async fn get_state(State(s): State<Shared>) -> ApiResult {
-    run(s, |eng| Ok(eng.full())).await
+pub async fn get_state(State(s): State<Shared>) -> TextResult {
+    run_text(s, |eng| Ok(eng.full())).await
 }
 
 #[derive(Deserialize, Default)]
@@ -144,21 +178,21 @@ fn one() -> u64 {
     1
 }
 
-pub async fn tick(State(s): State<Shared>, body: Option<Json<TickReq>>) -> ApiResult {
+pub async fn tick(State(s): State<Shared>, body: Option<Json<TickReq>>) -> TextResult {
     let req = body.map(|b| b.0).unwrap_or(TickReq {
         days: 1,
         ..Default::default()
     });
-    run(s, move |eng| {
+    run_text(s, move |eng| {
         eng.tick(req.days.min(3650));
         Ok(eng.sync(&req.known))
     })
     .await
 }
 
-pub async fn sync(State(s): State<Shared>, body: Option<Json<Known>>) -> ApiResult {
+pub async fn sync(State(s): State<Shared>, body: Option<Json<Known>>) -> TextResult {
     let known = body.map(|b| b.0).unwrap_or_default();
-    run(s, move |eng| Ok(eng.sync(&known))).await
+    run_text(s, move |eng| Ok(eng.sync(&known))).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -291,13 +325,51 @@ pub enum Cmd {
     DisbandFleet {
         fleet: u32,
     },
+    /// `goal`: "humiliate", "claim" or "total".
     DeclareWar {
         empire: u32,
         target: u32,
+        goal: String,
     },
-    MakePeace {
+    SetWarGoal {
         empire: u32,
-        target: u32,
+        war: u32,
+        goal: String,
+    },
+    /// `outcome`: "offensive", "defensive" or "status quo".
+    ProposePeace {
+        empire: u32,
+        war: u32,
+        outcome: String,
+    },
+    AcceptPeace {
+        empire: u32,
+        war: u32,
+    },
+    EnforcePeace {
+        empire: u32,
+        war: u32,
+        outcome: String,
+    },
+    Claim {
+        empire: u32,
+        system: u32,
+    },
+    DropClaim {
+        empire: u32,
+        system: u32,
+    },
+    CreateAlliance {
+        empire: u32,
+        display_name: String,
+    },
+    JoinAlliance {
+        empire: u32,
+        alliance: u32,
+    },
+    LeaveAlliance {
+        empire: u32,
+        alliance: u32,
     },
 }
 
@@ -519,16 +591,77 @@ fn to_command(w: &World, c: Cmd) -> Result<Command, ApiError> {
         Cmd::DeclareWar {
             empire: a,
             target: b,
+            goal,
         } => Command::DeclareWar {
             empire: empire(w, a)?,
             target: empire(w, b)?,
+            goal: war_goal(&goal)?,
         },
-        Cmd::MakePeace {
+        Cmd::SetWarGoal {
             empire: a,
-            target: b,
-        } => Command::MakePeace {
+            war: x,
+            goal,
+        } => Command::SetWarGoal {
             empire: empire(w, a)?,
-            target: empire(w, b)?,
+            war: war(w, x)?,
+            goal: war_goal(&goal)?,
+        },
+        Cmd::ProposePeace {
+            empire: a,
+            war: x,
+            outcome,
+        } => Command::ProposePeace {
+            empire: empire(w, a)?,
+            war: war(w, x)?,
+            outcome: war_outcome(&outcome)?,
+        },
+        Cmd::AcceptPeace { empire: a, war: x } => Command::AcceptPeace {
+            empire: empire(w, a)?,
+            war: war(w, x)?,
+        },
+        Cmd::EnforcePeace {
+            empire: a,
+            war: x,
+            outcome,
+        } => Command::EnforcePeace {
+            empire: empire(w, a)?,
+            war: war(w, x)?,
+            outcome: war_outcome(&outcome)?,
+        },
+        Cmd::Claim {
+            empire: a,
+            system: s,
+        } => Command::Claim {
+            empire: empire(w, a)?,
+            system: system(w, s)?,
+        },
+        Cmd::DropClaim {
+            empire: a,
+            system: s,
+        } => Command::DropClaim {
+            empire: empire(w, a)?,
+            system: system(w, s)?,
+        },
+        Cmd::CreateAlliance {
+            empire: a,
+            display_name,
+        } => Command::CreateAlliance {
+            empire: empire(w, a)?,
+            display_name,
+        },
+        Cmd::JoinAlliance {
+            empire: a,
+            alliance: x,
+        } => Command::JoinAlliance {
+            empire: empire(w, a)?,
+            alliance: alliance(w, x)?,
+        },
+        Cmd::LeaveAlliance {
+            empire: a,
+            alliance: x,
+        } => Command::LeaveAlliance {
+            empire: empire(w, a)?,
+            alliance: alliance(w, x)?,
         },
     })
 }
@@ -652,6 +785,7 @@ pub struct EmpirePatch {
     color: Option<String>,
     accepts_migrants: Option<bool>,
     market_access: Option<bool>,
+    total_war: Option<bool>,
     #[serde(default, deserialize_with = "double")]
     dominant_species: Option<Option<u32>>,
 }
@@ -685,6 +819,9 @@ pub async fn patch_empire(
         }
         if let Some(v) = p.market_access {
             e.market_access = v;
+        }
+        if let Some(v) = p.total_war {
+            e.total_war = v;
         }
         Ok(ok())
     })
@@ -1154,10 +1291,10 @@ pub async fn edit_tile(
             {
                 p.tiles[t].construction = None;
             }
-            p.tiles[t].building.as_mut().unwrap().upgrades = us;
+            p.tiles[t].building.as_mut().unwrap().upgrades = us.into_boxed_slice();
         }
         if let Some(ms) = multipliers {
-            p.tiles[t].resource_mults = ms;
+            p.tiles[t].resource_mults = ms.into_boxed_slice();
         }
         if let Some(wet) = req.water {
             p.tiles[t].water = wet;

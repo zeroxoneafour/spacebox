@@ -15,53 +15,69 @@ use crate::sim::events::Event;
 use crate::sim::migration::{Emigrants, Move, Vacancy};
 use crate::sim::planet::ProfileCache;
 
-/// Per-resource flow vectors (indexed by `ResourceId`), all in units per day.
+/// Per-resource flows, all in units per day: what was produced (`supply`), what was consumed
+/// (`demand`, throttled by last tick's shortages) and what would have been consumed if nothing
+/// were short (`demand_full`). Stored as one contiguous buffer so that summing many of them
+/// touches one allocation each.
 #[derive(Clone, Debug, Default)]
 pub struct Flows {
-    /// Amount actually produced.
-    pub supply: Vec<f64>,
-    /// Amount actually consumed (throttled by last tick's shortages).
-    pub demand: Vec<f64>,
-    /// Amount that would be consumed if nothing were short.
-    pub demand_full: Vec<f64>,
+    data: Vec<f64>,
 }
 
 impl Flows {
     pub fn new(resources: usize) -> Self {
         Flows {
-            supply: vec![0.0; resources],
-            demand: vec![0.0; resources],
-            demand_full: vec![0.0; resources],
+            data: vec![0.0; resources * 3],
         }
+    }
+
+    fn n(&self) -> usize {
+        self.data.len() / 3
+    }
+
+    pub fn supply(&self) -> &[f64] {
+        &self.data[..self.n()]
+    }
+
+    pub fn demand(&self) -> &[f64] {
+        let n = self.n();
+        &self.data[n..2 * n]
+    }
+
+    pub fn demand_full(&self) -> &[f64] {
+        let n = self.n();
+        &self.data[2 * n..]
+    }
+
+    /// `(supply, demand, demand_full)`, mutably.
+    pub fn parts_mut(&mut self) -> (&mut [f64], &mut [f64], &mut [f64]) {
+        let n = self.n();
+        let (supply, rest) = self.data.split_at_mut(n);
+        let (demand, full) = rest.split_at_mut(n);
+        (supply, demand, full)
     }
 
     pub fn clear(&mut self) {
-        self.supply.fill(0.0);
-        self.demand.fill(0.0);
-        self.demand_full.fill(0.0);
+        self.data.fill(0.0);
     }
 
     pub fn add(&mut self, other: &Flows) {
-        for (a, b) in self.supply.iter_mut().zip(&other.supply) {
-            *a += b;
-        }
-        for (a, b) in self.demand.iter_mut().zip(&other.demand) {
-            *a += b;
-        }
-        for (a, b) in self.demand_full.iter_mut().zip(&other.demand_full) {
+        for (a, b) in self.data.iter_mut().zip(&other.data) {
             *a += b;
         }
     }
 
-    pub fn net(&self, r: ResourceId) -> f64 {
-        self.supply[r.idx()] - self.demand[r.idx()]
+    /// Supply minus demand of one resource.
+    pub fn net(&self, r: usize) -> f64 {
+        self.data[r] - self.data[self.n() + r]
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct BuildingInstance {
     pub def: BuildingId,
-    pub upgrades: Vec<UpgradeId>,
+    /// Installed upgrades (rarely changed, so a boxed slice rather than a `Vec`).
+    pub upgrades: Box<[UpgradeId]>,
     /// Workers employed as of the last tick.
     pub workers: u32,
     /// Player-set limit on the number of jobs offered.
@@ -76,10 +92,16 @@ pub struct BuildingInstance {
 }
 
 impl BuildingInstance {
+    pub fn add_upgrade(&mut self, u: UpgradeId) {
+        let mut ups = std::mem::take(&mut self.upgrades).into_vec();
+        ups.push(u);
+        self.upgrades = ups.into_boxed_slice();
+    }
+
     pub fn new(def: BuildingId) -> Self {
         BuildingInstance {
             def,
-            upgrades: Vec::new(),
+            upgrades: Box::default(),
             workers: 0,
             job_cap: None,
             pinned: false,
@@ -131,12 +153,12 @@ impl Construction {
 #[derive(Clone, Debug, Default)]
 pub struct Tile {
     /// Output multipliers for buildings on this tile.
-    pub resource_mults: Vec<(ResourceId, f64)>,
-    /// Covered by water: only `water`-class buildings (and unrestricted ones) can stand here,
-    /// never `land`-class ones.
+    pub resource_mults: Box<[(ResourceId, f64)]>,
+    /// Covered by water: only `water` buildings can stand here; otherwise only `land` ones.
     pub water: bool,
     pub building: Option<BuildingInstance>,
-    pub construction: Option<Construction>,
+    /// Boxed: few tiles are under construction at any time.
+    pub construction: Option<Box<Construction>>,
 }
 
 impl Tile {
@@ -175,6 +197,12 @@ pub(crate) struct PlanetFlags {
     pub famine_announced: Option<u64>,
     /// Set by the space phase when fleets bombarded the planet this tick.
     pub bombarded: bool,
+    /// Some building has bombardment damage left to repair.
+    pub damaged: bool,
+    /// The last tick had nothing to simulate (no active buildings, pops, projects, siege or
+    /// damage): flows are zero and stats steady, so later ticks can skip the planet until
+    /// something changes.
+    pub idle: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -187,13 +215,16 @@ pub struct Planet {
     /// Fixed position relative to the system's star.
     pub coordinates: [f64; 2],
     pub owner: Option<EmpireId>,
+    /// An enemy holding the planet during a non-total war. The planet works for its
+    /// [`Planet::controller`]; ownership is settled when the war ends.
+    pub occupier: Option<EmpireId>,
     /// Bombardment accumulated towards surrender.
     pub siege: f64,
     /// Pops per species, sorted by species, without zero entries. Use the helper methods to
     /// change it.
     pub population: Vec<(SpeciesId, u64)>,
     /// Terraforming in progress.
-    pub terraform: Option<TerraformProject>,
+    pub terraform: Option<Box<TerraformProject>>,
     pub tiles: Vec<Tile>,
     pub stats: PlanetStats,
     pub flows: Flows,
@@ -228,6 +259,7 @@ impl Planet {
             habitable,
             coordinates: [0.0, 0.0],
             owner: None,
+            occupier: None,
             siege: 0.0,
             population: Vec::new(),
             terraform: None,
@@ -258,6 +290,11 @@ impl Planet {
                     || t.construction.as_ref().and_then(|c| c.building()) == Some(def)
             })
             .count()
+    }
+
+    /// Who the planet works for: its occupier, if any, else its owner.
+    pub fn controller(&self) -> Option<EmpireId> {
+        self.occupier.or(self.owner)
     }
 
     /// Total pops of every species.
@@ -374,6 +411,8 @@ pub struct System {
     pub star_count: u32,
     /// Only changes when the owner no longer holds any planet in the system.
     pub owner: Option<EmpireId>,
+    /// An enemy occupying every planet the owner holds here, during a non-total war.
+    pub occupier: Option<EmpireId>,
     pub links: Vec<SystemId>,
     /// Position relative to the galaxy centre.
     pub coordinates: [f64; 2],
@@ -381,6 +420,8 @@ pub struct System {
     pub(crate) planet_end: u32,
     /// Planets grouped by owner, one group per owner present.
     pub groups: Vec<SystemGroup>,
+    /// All planets were idle when the groups were last summed (so they hold zeros).
+    pub(crate) quiet: bool,
 }
 
 /// The planets of one owner within a system, which balance resources and migrants locally
@@ -416,11 +457,13 @@ impl System {
             star_type: "yellow".into(),
             star_count: 1,
             owner: None,
+            occupier: None,
             links: Vec::new(),
             coordinates: [0.0, 0.0],
             planet_start: 0,
             planet_end: 0,
             groups: Vec::new(),
+            quiet: false,
         }
     }
 
@@ -437,6 +480,9 @@ impl System {
 #[derive(Clone, Debug)]
 pub struct ResearchProject {
     pub tech: TechId,
+    /// Normal resources spent so far (refunded if cancelled). Empty for research paid only
+    /// in transient resources.
+    pub paid: Vec<ResourceAmount>,
     /// Resources still needed.
     pub remaining: Cost,
 }
@@ -639,16 +685,147 @@ impl Default for AiPersonality {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct War {
-    pub enemy: EmpireId,
-    pub since_day: u64,
+/// What a side fights for (see `design/data/savegame.toml`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarGoal {
+    /// The loser can't gain influence for a while after the war.
+    Humiliate,
+    /// Occupied systems the winner has claims on become the winner's.
+    Claim,
+    /// Captured planets and systems change hands for good as the war goes on.
+    Total,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+impl WarGoal {
+    pub const ALL: [WarGoal; 3] = [WarGoal::Humiliate, WarGoal::Claim, WarGoal::Total];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WarGoal::Humiliate => "humiliate",
+            WarGoal::Claim => "claim",
+            WarGoal::Total => "total",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        WarGoal::ALL.into_iter().find(|g| g.as_str() == s)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Side {
+    Offense,
+    Defense,
+}
+
+impl Side {
+    pub fn idx(self) -> usize {
+        self as usize
+    }
+
+    pub fn other(self) -> Side {
+        match self {
+            Side::Offense => Side::Defense,
+            Side::Defense => Side::Offense,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Offense => "offense",
+            Side::Defense => "defense",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [Side::Offense, Side::Defense]
+            .into_iter()
+            .find(|x| x.as_str() == s)
+    }
+}
+
+/// How a war ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarOutcome {
+    Offensive,
+    Defensive,
+    StatusQuo,
+}
+
+impl WarOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WarOutcome::Offensive => "offensive",
+            WarOutcome::Defensive => "defensive",
+            WarOutcome::StatusQuo => "status quo",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            WarOutcome::Offensive,
+            WarOutcome::Defensive,
+            WarOutcome::StatusQuo,
+        ]
+        .into_iter()
+        .find(|x| x.as_str() == s)
+    }
+
+    /// The victory of `side`.
+    pub fn victory(side: Side) -> Self {
+        match side {
+            Side::Offense => WarOutcome::Offensive,
+            Side::Defense => WarOutcome::Defensive,
+        }
+    }
+
+    /// The side that won, if any.
+    pub fn winner(self) -> Option<Side> {
+        match self {
+            WarOutcome::Offensive => Some(Side::Offense),
+            WarOutcome::Defensive => Some(Side::Defense),
+            WarOutcome::StatusQuo => None,
+        }
+    }
+}
+
+/// A war (`[game.wars.x]`). Which empires fight on which side is recorded in their
+/// `diplomacy.wars`. Ended wars are kept as history.
+#[derive(Clone, Debug)]
+pub struct War {
+    pub name: String,
+    pub display_name: String,
+    /// Each side's goal, indexed by [`Side::idx`]; the defense may not have chosen one yet.
+    pub goals: [Option<WarGoal>; 2],
+    pub starting_day: u64,
+    /// 0..=1 per side. Once one side reaches 1, the other can force its victory.
+    pub exhaustion: [f64; 2],
+    /// Set once the war is over.
+    pub victory: Option<WarOutcome>,
+    /// Each side's standing peace proposal, which the other side may accept (not saved).
+    pub proposals: [Option<WarOutcome>; 2],
+}
+
+impl War {
+    pub fn is_active(&self) -> bool {
+        self.victory.is_none()
+    }
+}
+
+/// An alliance (`[game.alliances.x]`); members list it in their `diplomacy.alliances`.
+#[derive(Clone, Debug)]
+pub struct Alliance {
+    pub name: String,
+    pub display_name: String,
+}
+
+/// A truce (`[game.truces.x]`) between the empires that list it in `diplomacy.truces`: none of
+/// them may declare war on another before `valid_until`.
+#[derive(Clone, Debug)]
 pub struct Truce {
-    pub with: EmpireId,
-    pub until_day: u64,
+    pub name: String,
+    pub display_name: String,
+    pub valid_until: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -690,10 +867,18 @@ pub struct Empire {
     pub research: Vec<ResearchProject>,
     /// Ships under construction, funded in order.
     pub shipbuilding: Vec<ShipProject>,
-    /// Wars this empire is fighting (kept symmetric between the two sides).
-    pub wars: Vec<War>,
-    /// Recent peace treaties; AI empires will not declare war on a truce partner.
-    pub truces: Vec<Truce>,
+    /// Wars this empire takes part in (ongoing and ended) and its side in each.
+    pub wars: Vec<(WarId, Side)>,
+    /// Truces it is party to.
+    pub truces: Vec<TruceId>,
+    /// Alliances it belongs to.
+    pub alliances: Vec<AllianceId>,
+    /// Systems it claims (prerequisite for claim wars).
+    pub claims: Vec<SystemId>,
+    /// Days of humiliation left: no influence income while above 0.
+    pub humiliated: u64,
+    /// Policy: may declare total wars.
+    pub total_war: bool,
     /// Daily upkeep of all ships, per resource (computed each tick).
     pub fleet_upkeep: Vec<f64>,
     /// The governor's personality, if this empire is AI-run.
@@ -743,6 +928,10 @@ impl Empire {
             shipbuilding: Vec::new(),
             wars: Vec::new(),
             truces: Vec::new(),
+            alliances: Vec::new(),
+            claims: Vec::new(),
+            humiliated: 0,
+            total_war: false,
             fleet_upkeep: vec![0.0; r],
             ai: None,
             accepts_migrants: true,
@@ -772,17 +961,6 @@ impl Empire {
 
     pub fn knows(&self, tech: TechId) -> bool {
         self.techs[tech.idx()]
-    }
-
-    pub fn at_war_with(&self, other: EmpireId) -> bool {
-        self.wars.iter().any(|w| w.enemy == other)
-    }
-
-    /// Whether a truce with `other` is still in force on `day`.
-    pub fn in_truce(&self, other: EmpireId, day: u64) -> bool {
-        self.truces
-            .iter()
-            .any(|t| t.with == other && t.until_day > day)
     }
 
     pub fn has_crisis(&self, r: ResourceId) -> bool {
@@ -830,6 +1008,9 @@ impl Empire {
 #[derive(Clone, Debug)]
 pub struct Pool {
     pub empire: Option<EmpireId>,
+    /// All member systems were quiet when the pool was last aggregated, so its flows are
+    /// zero (see [`System::quiet`]).
+    pub(crate) quiet: bool,
     pub systems: Vec<SystemId>,
     /// `(system, group index)` pairs whose planets belong to this pool.
     pub members: Vec<(SystemId, u8)>,
@@ -851,6 +1032,7 @@ impl Pool {
     pub(crate) fn new(empire: Option<EmpireId>, resources: usize) -> Self {
         Pool {
             empire,
+            quiet: false,
             systems: Vec::new(),
             members: Vec::new(),
             planets: Vec::new(),
@@ -884,6 +1066,9 @@ pub struct World {
     pub planets: Vec<Planet>,
     pub pools: Vec<Pool>,
     pub fleets: Vec<Fleet>,
+    pub wars: Vec<War>,
+    pub alliances: Vec<Alliance>,
+    pub truces: Vec<Truce>,
     pub market: Vec<MarketEntry>,
     /// The file the world was loaded from, if any.
     pub root_file: Option<FileId>,
@@ -896,6 +1081,13 @@ pub struct World {
     /// Systems where each empire owns the system or any planet.
     pub(crate) empire_presence: Vec<Vec<SystemId>>,
     pub(crate) galaxy_moves: Vec<Move>,
+    /// Planets with projects, events or claims this tick (found once, in parallel, so that
+    /// later serial steps don't scan every planet).
+    pub(crate) busy: Vec<u32>,
+    /// War losses this tick, for exhaustion: fleet strength lost per empire, and planets lost
+    /// as `(former controller, populated)`.
+    pub(crate) ship_losses: Vec<f64>,
+    pub(crate) planet_losses: Vec<(EmpireId, bool)>,
 }
 
 impl World {
@@ -911,6 +1103,9 @@ impl World {
             planets: Vec::new(),
             pools: Vec::new(),
             fleets: Vec::new(),
+            wars: Vec::new(),
+            alliances: Vec::new(),
+            truces: Vec::new(),
             market: vec![MarketEntry::default(); r],
             root_file: None,
             next_fleet_id: 1,
@@ -921,6 +1116,9 @@ impl World {
             empire_planets: Vec::new(),
             empire_presence: Vec::new(),
             galaxy_moves: Vec::new(),
+            busy: Vec::new(),
+            ship_losses: Vec::new(),
+            planet_losses: Vec::new(),
         }
     }
 
@@ -993,6 +1191,7 @@ impl World {
         let pmap = |p: PlanetId| planet_map.get(p.idx()).copied().flatten();
         for e in &mut self.empires {
             e.capital = e.capital.and_then(&system_map);
+            e.claims = e.claims.iter().filter_map(|s| system_map(*s)).collect();
             e.shipbuilding.retain_mut(|o| match pmap(o.planet) {
                 Some(p) => {
                     o.planet = p;
@@ -1117,35 +1316,92 @@ impl World {
         &self.empires[empire.idx()].ship_stats[ship.idx()]
     }
 
-    pub fn at_war(&self, a: EmpireId, b: EmpireId) -> bool {
-        a != b && self.empires[a.idx()].at_war_with(b)
+    pub fn war(&self, id: WarId) -> &War {
+        &self.wars[id.idx()]
     }
 
-    /// Declares war (`true`) or makes peace between two empires. Peace starts a truce of the
-    /// ruleset's `truce_days` on both sides.
-    pub fn set_war(&mut self, a: EmpireId, b: EmpireId, war: bool) {
+    /// `empire`'s side in `war`, if it takes part.
+    pub fn side_of(&self, war: WarId, empire: EmpireId) -> Option<Side> {
+        self.empires[empire.idx()]
+            .wars
+            .iter()
+            .find(|(w, _)| *w == war)
+            .map(|(_, s)| *s)
+    }
+
+    /// The empires on one side of a war.
+    pub fn members(&self, war: WarId, side: Side) -> Vec<EmpireId> {
+        (0..self.empires.len())
+            .map(EmpireId::from_idx)
+            .filter(|e| self.side_of(war, *e) == Some(side))
+            .collect()
+    }
+
+    /// The ongoing wars `empire` fights in, with its side.
+    pub fn active_wars(&self, empire: EmpireId) -> impl Iterator<Item = (WarId, Side)> + '_ {
+        self.empires[empire.idx()]
+            .wars
+            .iter()
+            .copied()
+            .filter(|(w, _)| self.wars[w.idx()].is_active())
+    }
+
+    /// The ongoing war in which `a` and `b` are on opposite sides, if any.
+    pub fn war_between(&self, a: EmpireId, b: EmpireId) -> Option<(WarId, Side)> {
         if a == b {
-            return;
+            return None;
         }
-        let day = self.day;
-        let truce = self.rules().truce_days;
-        for (x, y) in [(a, b), (b, a)] {
-            let e = &mut self.empires[x.idx()];
-            e.wars.retain(|w| w.enemy != y);
-            e.truces.retain(|t| t.with != y && t.until_day > day);
-            if war {
-                e.wars.push(War {
-                    enemy: y,
-                    since_day: day,
-                });
-                e.wars.sort_by_key(|w| w.enemy);
-            } else {
-                e.truces.push(Truce {
-                    with: y,
-                    until_day: day + truce,
-                });
+        self.active_wars(a)
+            .find(|(w, s)| self.side_of(*w, b) == Some(s.other()))
+    }
+
+    pub fn at_war(&self, a: EmpireId, b: EmpireId) -> bool {
+        self.war_between(a, b).is_some()
+    }
+
+    /// Whether `a` and `b` belong to a common alliance.
+    pub fn allied(&self, a: EmpireId, b: EmpireId) -> bool {
+        a != b
+            && self.empires[a.idx()]
+                .alliances
+                .iter()
+                .any(|x| self.empires[b.idx()].alliances.contains(x))
+    }
+
+    /// Whether a truce between `a` and `b` is in force.
+    pub fn in_truce(&self, a: EmpireId, b: EmpireId) -> bool {
+        self.empires[a.idx()].truces.iter().any(|t| {
+            self.truces[t.idx()].valid_until > self.day && self.empires[b.idx()].truces.contains(t)
+        })
+    }
+
+    /// `hostile[a * n + b]`: whether empires `a` and `b` are at war.
+    pub fn hostility(&self) -> Vec<bool> {
+        let n = self.empires.len();
+        let mut hostile = vec![false; n * n];
+        for (w, war) in self.wars.iter().enumerate() {
+            if !war.is_active() {
+                continue;
+            }
+            let w = WarId::from_idx(w);
+            let off = self.members(w, Side::Offense);
+            let def = self.members(w, Side::Defense);
+            for a in &off {
+                for b in &def {
+                    hostile[a.idx() * n + b.idx()] = true;
+                    hostile[b.idx() * n + a.idx()] = true;
+                }
             }
         }
+        hostile
+    }
+
+    /// The goal `attacker` fights for against `defender` (the strongest if several wars).
+    pub fn goal_against(&self, attacker: EmpireId, defender: EmpireId) -> Option<WarGoal> {
+        self.active_wars(attacker)
+            .filter(|(w, s)| self.side_of(*w, defender) == Some(s.other()))
+            .filter_map(|(w, s)| self.wars[w.idx()].goals[s.idx()])
+            .max_by_key(|g| *g as u8)
     }
 
     pub fn fleet(&self, id: FleetId) -> Option<&Fleet> {
@@ -1188,11 +1444,39 @@ impl World {
     pub fn set_planet_owner(&mut self, planet: PlanetId, owner: Option<EmpireId>) {
         let p = &mut self.planets[planet.idx()];
         p.owner = owner;
+        p.occupier = None;
         p.siege = 0.0;
         p.dirty = true;
         let sys = p.system;
         self.update_system_owner(sys);
+        self.update_system_occupier(sys);
         self.topology_dirty = true;
+    }
+
+    /// Sets (or with `None`, lifts) a planet's occupation.
+    pub fn set_planet_occupier(&mut self, planet: PlanetId, occupier: Option<EmpireId>) {
+        let p = &mut self.planets[planet.idx()];
+        p.occupier = occupier.filter(|o| p.owner != Some(*o));
+        p.siege = 0.0;
+        p.dirty = true;
+        let sys = p.system;
+        self.update_system_occupier(sys);
+        self.topology_dirty = true;
+    }
+
+    /// A system is occupied by an empire that occupies every planet its owner holds there.
+    pub fn update_system_occupier(&mut self, system: SystemId) {
+        let s = &self.systems[system.idx()];
+        let occupier = s.owner.and_then(|owner| {
+            let mut held = s
+                .planet_ids()
+                .map(|p| &self.planets[p.idx()])
+                .filter(|p| p.owner == Some(owner))
+                .map(|p| p.occupier);
+            let first = held.next()??;
+            held.all(|o| o == Some(first)).then_some(first)
+        });
+        self.systems[system.idx()].occupier = occupier;
     }
 
     /// Re-evaluates who owns a system after its planets changed hands.
@@ -1282,19 +1566,74 @@ impl World {
         })
     }
 
-    /// The first hop on a shortest hyperlane route, or `None` if unreachable or already there.
-    pub fn next_hop(&self, from: SystemId, to: SystemId) -> Option<SystemId> {
-        if from == to {
+    /// Hyperlane jumps from `empire`'s borders (its owned systems), exploring at most `max`
+    /// jumps out: the distance of every system (`u32::MAX` beyond `max`) and the systems
+    /// reached, nearest first. Much cheaper than [`World::jumps_from_borders`] in a large
+    /// galaxy. Valid after the first tick or [`World::refresh_topology`].
+    pub fn jumps_within(&self, empire: EmpireId, max: u32) -> (Vec<u32>, Vec<SystemId>) {
+        let mut dist = vec![u32::MAX; self.systems.len()];
+        let mut reached = self.owned_systems(empire);
+        for s in &reached {
+            dist[s.idx()] = 0;
+        }
+        let mut i = 0;
+        while i < reached.len() {
+            let s = reached[i];
+            i += 1;
+            let d = dist[s.idx()];
+            if d >= max {
+                continue;
+            }
+            for &n in &self.systems[s.idx()].links {
+                if dist[n.idx()] == u32::MAX {
+                    dist[n.idx()] = d + 1;
+                    reached.push(n);
+                }
+            }
+        }
+        (dist, reached)
+    }
+
+    /// Systems owned by `empire`, from the cached lists when they are current.
+    pub(crate) fn owned_systems(&self, empire: EmpireId) -> Vec<SystemId> {
+        if self.topology_dirty {
+            self.systems
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.owner == Some(empire))
+                .map(|(i, _)| SystemId::from_idx(i))
+                .collect()
+        } else {
+            self.empire_systems(empire).to_vec()
+        }
+    }
+
+    /// Hyperlane jumps from `empire`'s borders to `target`, searching outwards only until it
+    /// is found: `None` if unreachable or if the empire owns no systems.
+    pub fn jumps_to(&self, empire: EmpireId, target: SystemId) -> Option<u32> {
+        let mut queue = self.owned_systems(empire);
+        if queue.is_empty() {
             return None;
         }
-        let dist = self.distances_from([to]);
-        self.systems[from.idx()]
-            .links
-            .iter()
-            .copied()
-            .filter(|n| dist[n.idx()] != u32::MAX)
-            .min_by_key(|n| (dist[n.idx()], *n))
-            .filter(|n| dist[n.idx()] < dist[from.idx()])
+        let mut dist = vec![u32::MAX; self.systems.len()];
+        for s in &queue {
+            dist[s.idx()] = 0;
+        }
+        let mut i = 0;
+        while i < queue.len() {
+            let s = queue[i];
+            i += 1;
+            if s == target {
+                return Some(dist[s.idx()]);
+            }
+            for &n in &self.systems[s.idx()].links {
+                if dist[n.idx()] == u32::MAX {
+                    dist[n.idx()] = dist[s.idx()] + 1;
+                    queue.push(n);
+                }
+            }
+        }
+        None
     }
 
     /// Planets owned by `empire` (valid after the first tick or [`World::refresh_topology`]).

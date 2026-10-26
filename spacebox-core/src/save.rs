@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use crate::defs::{Cost, DefKey, Defs, ResourceAmount};
@@ -15,15 +16,9 @@ use crate::error::{Error, Result};
 use crate::ids::*;
 use crate::world::{BuildingInstance, FleetOrder, ProjectKind, World};
 
-/// Writes the world to `path`.
+/// Writes the world to `path`: streamed to a temporary file next to it, which then replaces
+/// `path`, so a failed save never leaves a half-written file behind.
 pub fn save(world: &World, path: impl AsRef<Path>) -> Result<()> {
-    let path = path.as_ref();
-    let text = save_to_string(world, path)?;
-    fs::write(path, text).map_err(|e| Error::io(path, e))
-}
-
-/// Renders the save file that would be written to `path` (used for relative import paths).
-pub fn save_to_string(world: &World, path: impl AsRef<Path>) -> Result<String> {
     let path = path.as_ref();
     let dir = path
         .parent()
@@ -58,8 +53,17 @@ pub fn save_to_string(world: &World, path: impl AsRef<Path>) -> Result<String> {
         }
     }
     out.push('\n');
-    w.write_state(world, &mut out);
-    Ok(out)
+    let tmp = target.with_extension("toml.tmp");
+    let write = |out: &mut String| -> io::Result<()> {
+        let mut sink = io::BufWriter::new(fs::File::create(&tmp)?);
+        w.write_state(world, out, &mut sink)?;
+        sink.flush()
+    };
+    if let Err(e) = write(&mut out) {
+        let _ = fs::remove_file(&tmp);
+        return Err(Error::io(&tmp, e));
+    }
+    fs::rename(&tmp, &target).map_err(|e| Error::io(&target, e))
 }
 
 struct Writer<'a> {
@@ -154,6 +158,7 @@ impl<'a> Writer<'a> {
             for p in &e.research {
                 self.use_file(d.tech(p.tech).key.file);
                 self.use_cost(&p.remaining);
+                self.use_amounts(&p.paid);
             }
             for p in &e.shipbuilding {
                 self.use_file(d.ship(p.ship).key.file);
@@ -245,7 +250,12 @@ impl<'a> Writer<'a> {
         )
     }
 
-    fn write_state(&self, world: &World, out: &mut String) {
+    fn write_state(
+        &self,
+        world: &World,
+        out: &mut String,
+        sink: &mut impl Write,
+    ) -> io::Result<()> {
         let d = self.defs;
         out.push_str("[game]\n");
         let _ = writeln!(out, "day = {}", world.day);
@@ -255,6 +265,32 @@ impl<'a> Writer<'a> {
             let _ = writeln!(out, "ruleset = {}", self.r(&rules.key));
         }
         out.push('\n');
+        for w in &world.wars {
+            let _ = writeln!(out, "[game.wars.{}]", key(&w.name));
+            let _ = writeln!(out, "display-name = {}", s(&w.display_name));
+            for (field, goal) in ["offensive-goal", "defensive-goal"].iter().zip(w.goals) {
+                if let Some(g) = goal {
+                    let _ = writeln!(out, "{field} = {}", s(g.as_str()));
+                }
+            }
+            let _ = writeln!(out, "starting-day = {}", w.starting_day);
+            let _ = writeln!(out, "offensive-exhaustion = {}", w.exhaustion[0]);
+            let _ = writeln!(out, "defensive-exhaustion = {}", w.exhaustion[1]);
+            if let Some(v) = w.victory {
+                let _ = writeln!(out, "victory = {}", s(v.as_str()));
+            }
+            out.push('\n');
+        }
+        for a in &world.alliances {
+            let _ = writeln!(out, "[game.alliances.{}]", key(&a.name));
+            let _ = writeln!(out, "display-name = {}\n", s(&a.display_name));
+        }
+        // Expired truces are dropped.
+        for t in world.truces.iter().filter(|t| t.valid_until > world.day) {
+            let _ = writeln!(out, "[game.truces.{}]", key(&t.name));
+            let _ = writeln!(out, "display-name = {}", s(&t.display_name));
+            let _ = writeln!(out, "valid-until = {}\n", t.valid_until);
+        }
 
         for e in &world.empires {
             let ek = key(&e.name);
@@ -292,9 +328,16 @@ impl<'a> Writer<'a> {
             if !e.research.is_empty() {
                 out.push_str("current-research = [\n");
                 for p in &e.research {
+                    // `paid` defaults to [] and is usually empty (research is mostly paid in
+                    // transient resources), so it is only written when there is something in it.
+                    let paid = if p.paid.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", paid = {}", self.amounts(&p.paid))
+                    };
                     let _ = writeln!(
                         out,
-                        "    {{ technology = {}, remaining = {} }},",
+                        "    {{ technology = {}{paid}, remaining = {} }},",
                         self.r(&d.tech(p.tech).key),
                         self.cost(&p.remaining)
                     );
@@ -321,28 +364,58 @@ impl<'a> Writer<'a> {
 
             let _ = writeln!(out, "[empire.{ek}.policy]");
             let _ = writeln!(out, "accepts-migrants = {}", e.accepts_migrants);
-            let _ = writeln!(out, "market-access = {}\n", e.market_access);
+            let _ = writeln!(out, "market-access = {}", e.market_access);
+            let _ = writeln!(out, "total-war = {}\n", e.total_war);
 
             let _ = writeln!(out, "[empire.{ek}.diplomacy]");
+            if e.humiliated > 0 {
+                let _ = writeln!(out, "humiliated = {}", e.humiliated);
+            }
+            let list = |names: Vec<&str>| -> String {
+                names.into_iter().map(s).collect::<Vec<_>>().join(", ")
+            };
+            let _ = writeln!(
+                out,
+                "claims = [{}]",
+                list(
+                    e.claims
+                        .iter()
+                        .map(|c| world.system(*c).name.as_str())
+                        .collect()
+                )
+            );
             out.push_str("wars = [\n");
-            for w in &e.wars {
+            for (w, side) in &e.wars {
                 let _ = writeln!(
                     out,
-                    "    {{ empire = {}, since-day = {} }},",
-                    s(&world.empire(w.enemy).name),
-                    w.since_day
+                    "    {{ war = {}, side = {} }},",
+                    s(&world.war(*w).name),
+                    s(side.as_str())
                 );
             }
-            out.push_str("]\ntruces = [\n");
-            for t in e.truces.iter().filter(|t| t.until_day > world.day) {
-                let _ = writeln!(
-                    out,
-                    "    {{ empire = {}, until-day = {} }},",
-                    s(&world.empire(t.with).name),
-                    t.until_day
-                );
-            }
-            out.push_str("]\n\n");
+            out.push_str("]\n");
+            let _ = writeln!(
+                out,
+                "truces = [{}]",
+                list(
+                    e.truces
+                        .iter()
+                        .map(|t| &world.truces[t.idx()])
+                        .filter(|t| t.valid_until > world.day)
+                        .map(|t| t.name.as_str())
+                        .collect()
+                )
+            );
+            let _ = writeln!(
+                out,
+                "alliances = [{}]\n",
+                list(
+                    e.alliances
+                        .iter()
+                        .map(|a| world.alliances[a.idx()].name.as_str())
+                        .collect()
+                )
+            );
 
             let eid = world.empire_by_name(&e.name);
             for fl in world.fleets.iter().filter(|fl| Some(fl.owner) == eid) {
@@ -405,6 +478,9 @@ impl<'a> Writer<'a> {
             if let Some(o) = sys.owner {
                 let _ = writeln!(out, "owner = {}", s(&world.empire(o).name));
             }
+            if let Some(o) = sys.occupier {
+                let _ = writeln!(out, "occupier = {}", s(&world.empire(o).name));
+            }
             let links: Vec<String> = sys
                 .links
                 .iter()
@@ -424,6 +500,9 @@ impl<'a> Writer<'a> {
                 let _ = writeln!(out, "coords = {}", coords(p.coordinates));
                 if let Some(o) = p.owner {
                     let _ = writeln!(out, "owner = {}", s(&world.empire(o).name));
+                }
+                if let Some(o) = p.occupier {
+                    let _ = writeln!(out, "occupier = {}", s(&world.empire(o).name));
                 }
                 if !p.population.is_empty() {
                     let pops: Vec<String> = p
@@ -504,7 +583,11 @@ impl<'a> Writer<'a> {
                     out.push('\n');
                 }
             }
+            // Written out system by system, so the whole save never sits in memory.
+            sink.write_all(out.as_bytes())?;
+            out.clear();
         }
+        sink.write_all(out.as_bytes())
     }
 
     /// A bare building reference, or an inline table for a building with state.

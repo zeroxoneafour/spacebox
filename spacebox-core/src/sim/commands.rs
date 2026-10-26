@@ -10,9 +10,10 @@
 use crate::defs::{Cost, Defs, ResourceAmount, Ruleset};
 use crate::ids::*;
 use crate::sim::events::{Event, EventKind};
+use crate::sim::war;
 use crate::world::{
     BuildingInstance, Construction, Fleet, FleetOrder, ProjectKind, ResearchProject, ShipProject,
-    TerraformProject, World,
+    TerraformProject, WarGoal, WarOutcome, World,
 };
 
 #[derive(Clone, Debug)]
@@ -167,13 +168,62 @@ pub enum Command {
     DisbandFleet {
         fleet: FleetId,
     },
+    /// Declare a war with `goal` on `target` (costs influence; see [`World::can_declare_war`]).
     DeclareWar {
         empire: EmpireId,
         target: EmpireId,
+        goal: WarGoal,
     },
-    MakePeace {
+    /// Set the defense's goal in a war declared on `empire` (free).
+    SetWarGoal {
         empire: EmpireId,
-        target: EmpireId,
+        war: WarId,
+        goal: WarGoal,
+    },
+    /// Propose ending a war with `outcome` (the war ends if the other side proposed the same).
+    ProposePeace {
+        empire: EmpireId,
+        war: WarId,
+        outcome: WarOutcome,
+    },
+    /// Accept the other side's proposal.
+    AcceptPeace {
+        empire: EmpireId,
+        war: WarId,
+    },
+    /// End a war with `outcome`, once the other side's exhaustion is 1.
+    EnforcePeace {
+        empire: EmpireId,
+        war: WarId,
+        outcome: WarOutcome,
+    },
+    /// Claim another empire's system (costs influence like expanding there).
+    Claim {
+        empire: EmpireId,
+        system: SystemId,
+    },
+    DropClaim {
+        empire: EmpireId,
+        system: SystemId,
+    },
+    CreateAlliance {
+        empire: EmpireId,
+        display_name: String,
+    },
+    JoinAlliance {
+        empire: EmpireId,
+        alliance: AllianceId,
+    },
+    LeaveAlliance {
+        empire: EmpireId,
+        alliance: AllianceId,
+    },
+    /// Change an empire's policy (fields left `None` stay as they are).
+    SetPolicy {
+        empire: EmpireId,
+        accepts_migrants: Option<bool>,
+        market_access: Option<bool>,
+        total_war: Option<bool>,
     },
 }
 
@@ -195,17 +245,6 @@ pub fn can_afford(defs: &Defs, storage: &[f64], cost: &[ResourceAmount]) -> bool
         .all(|a| storage[a.resource.idx()] + 1e-9 >= a.count)
 }
 
-/// The full cost of a tile project (`building` is the tile's current building).
-pub fn project_cost(defs: &Defs, kind: ProjectKind, building: Option<&BuildingInstance>) -> Cost {
-    match kind {
-        ProjectKind::Building(b) => defs.building(b).build_cost.clone(),
-        ProjectKind::Upgrade(u) => defs.upgrade(u).build_cost.clone(),
-        ProjectKind::Remove => building
-            .and_then(|b| defs.building(b.def).remove_cost.clone())
-            .unwrap_or_default(),
-    }
-}
-
 /// Gives back what a cancelled project paid, except the expansion resource (influence),
 /// which is never refunded.
 pub(crate) fn refund(rules: &Ruleset, paid: &[ResourceAmount], storage: &mut [f64]) {
@@ -214,19 +253,6 @@ pub(crate) fn refund(rules: &Ruleset, paid: &[ResourceAmount], storage: &mut [f6
             storage[a.resource.idx()] += a.count;
         }
     }
-}
-
-/// What a research project has paid: its cost minus what remains, normal resources only.
-fn research_paid(defs: &Defs, tech: TechId, remaining: &Cost) -> Vec<ResourceAmount> {
-    defs.tech(tech)
-        .cost
-        .iter()
-        .filter(|a| !defs.is_transient(a.resource))
-        .map(|a| ResourceAmount {
-            resource: a.resource,
-            count: (a.count - remaining.get(a.resource)).max(0.0),
-        })
-        .collect()
 }
 
 impl World {
@@ -350,20 +376,12 @@ impl World {
             expansion_jumps: None,
         };
         if sys.owner.is_none() {
-            let computed;
-            let dist = match borders {
-                Some(d) => d,
-                None => {
-                    computed = self.jumps_from_borders(empire);
-                    &computed
-                }
-            };
-            // Every owned system is at distance 0.
-            let owns_any = dist.contains(&0);
-            let jumps = if owns_any {
-                dist[p.system.idx()]
-            } else {
-                1 // an empire without territory may found a colony anywhere at the base cost
+            // An empire without territory may found a colony anywhere at the base cost.
+            let jumps = match borders {
+                Some(d) if d.contains(&0) => d[p.system.idx()],
+                Some(_) => 1,
+                None if self.owned_systems(empire).is_empty() => 1,
+                None => self.jumps_to(empire, p.system).unwrap_or(u32::MAX),
             };
             if jumps == u32::MAX {
                 return Err(format!("no hyperlane route to {}", sys.display_name));
@@ -700,13 +718,13 @@ fn start_project(world: &mut World, planet: PlanetId, tile: usize, c: Constructi
             }
             ProjectKind::Upgrade(u) => {
                 if let Some(b) = &mut t.building {
-                    b.upgrades.push(u);
+                    b.add_upgrade(u);
                 }
             }
             ProjectKind::Remove => t.building = None,
         }
     } else {
-        p.tiles[tile].construction = Some(c);
+        p.tiles[tile].construction = Some(Box::new(c));
     }
     p.invalidate();
 }
@@ -967,10 +985,10 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
                 .cost
                 .clone();
             cost.days = cost.days.max(1);
-            world.planet_mut(planet).terraform = Some(TerraformProject {
+            world.planet_mut(planet).terraform = Some(Box::new(TerraformProject {
                 paid: Vec::new(),
                 remaining: cost,
-            });
+            }));
             let msg = format!(
                 "{} begins terraforming {}",
                 world.empire(owner).display_name,
@@ -1000,9 +1018,11 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
         Command::Research { empire, tech } => {
             world.can_research(empire, tech)?;
             let remaining = world.defs.research_cost(tech);
-            world.empires[empire.idx()]
-                .research
-                .push(ResearchProject { tech, remaining });
+            world.empires[empire.idx()].research.push(ResearchProject {
+                tech,
+                paid: Vec::new(),
+                remaining,
+            });
             Ok(None)
         }
         Command::CancelResearch { empire, tech } => {
@@ -1030,8 +1050,7 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
             }
             let rules = defs.ruleset(world.ruleset);
             for project in cancelled {
-                let paid = research_paid(&defs, project.tech, &project.remaining);
-                refund(rules, &paid, &mut e.storage);
+                refund(rules, &project.paid, &mut e.storage);
             }
             Ok(None)
         }
@@ -1287,49 +1306,51 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
             world.remove_fleet(fleet);
             Ok(None)
         }
-        Command::DeclareWar { empire, target } => set_war(world, empire, target, true),
-        Command::MakePeace { empire, target } => set_war(world, empire, target, false),
-    }
-}
-
-fn set_war(world: &mut World, empire: EmpireId, target: EmpireId, war: bool) -> CmdResult {
-    let n = world.empires.len();
-    if empire.idx() >= n || target.idx() >= n {
-        return Err("no such empire".into());
-    }
-    if empire == target {
-        return Err("an empire cannot be at war with itself".into());
-    }
-    if world.at_war(empire, target) == war {
-        return Err(if war {
-            "already at war"
-        } else {
-            "already at peace"
+        Command::DeclareWar {
+            empire,
+            target,
+            goal,
+        } => war::declare_war(world, empire, target, goal),
+        Command::SetWarGoal { empire, war, goal } => war::set_war_goal(world, empire, war, goal),
+        Command::ProposePeace {
+            empire,
+            war,
+            outcome,
+        } => war::propose_peace(world, empire, war, outcome),
+        Command::AcceptPeace { empire, war } => war::accept_peace(world, empire, war),
+        Command::EnforcePeace {
+            empire,
+            war,
+            outcome,
+        } => war::enforce_peace(world, empire, war, outcome),
+        Command::Claim { empire, system } => war::claim(world, empire, system),
+        Command::DropClaim { empire, system } => war::drop_claim(world, empire, system),
+        Command::CreateAlliance {
+            empire,
+            display_name,
+        } => war::create_alliance(world, empire, display_name),
+        Command::JoinAlliance { empire, alliance } => war::join_alliance(world, empire, alliance),
+        Command::LeaveAlliance { empire, alliance } => war::leave_alliance(world, empire, alliance),
+        Command::SetPolicy {
+            empire,
+            accepts_migrants,
+            market_access,
+            total_war,
+        } => {
+            let e = world
+                .empires
+                .get_mut(empire.idx())
+                .ok_or("no such empire")?;
+            if let Some(v) = accepts_migrants {
+                e.accepts_migrants = v;
+            }
+            if let Some(v) = market_access {
+                e.market_access = v;
+            }
+            if let Some(v) = total_war {
+                e.total_war = v;
+            }
+            Ok(None)
         }
-        .into());
     }
-    world.set_war(empire, target, war);
-    let (a, b) = (
-        &world.empire(empire).display_name,
-        &world.empire(target).display_name,
-    );
-    let (kind, msg) = if war {
-        (EventKind::WarDeclared, format!("{a} declares war on {b}"))
-    } else {
-        (EventKind::PeaceMade, format!("{a} makes peace with {b}"))
-    };
-    if !war {
-        // Peace stands down any bombardment of the former enemy.
-        for f in &mut world.fleets {
-            f.orders.retain(|o| {
-                let FleetOrder::Bombard { planet, .. } = o else {
-                    return true;
-                };
-                let owner = world.planets.get(planet.idx()).and_then(|p| p.owner);
-                !((f.owner == empire && owner == Some(target))
-                    || (f.owner == target && owner == Some(empire)))
-            });
-        }
-    }
-    Ok(Some(Event::new(world.day, kind, msg).empire(Some(empire))))
 }

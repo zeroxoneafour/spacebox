@@ -332,19 +332,32 @@ fn print_summary(world: &World) {
                 .collect();
             println!("    building: {}", q.join(", "));
         }
-        if !e.wars.is_empty() {
-            let w: Vec<String> = e
-                .wars
-                .iter()
-                .map(|w| {
-                    format!(
-                        "{} (since day {})",
-                        world.empire(w.enemy).display_name,
-                        w.since_day
-                    )
-                })
-                .collect();
-            println!("    AT WAR with {}", w.join(", "));
+        let eid = world.empire_by_name(&e.name).unwrap();
+        let wars: Vec<String> = world
+            .active_wars(eid)
+            .map(|(id, side)| {
+                let w = world.war(id);
+                let enemies: Vec<&str> = world
+                    .members(id, side.other())
+                    .into_iter()
+                    .map(|o| world.empire(o).display_name.as_str())
+                    .collect();
+                format!(
+                    "{} on the {} against {} (goal {}, exhaustion {:.0}% vs {:.0}%)",
+                    w.display_name,
+                    side.as_str(),
+                    enemies.join(", "),
+                    w.goals[side.idx()].map_or("not chosen", |g| g.as_str()),
+                    w.exhaustion[side.idx()] * 100.0,
+                    w.exhaustion[side.other().idx()] * 100.0
+                )
+            })
+            .collect();
+        if !wars.is_empty() {
+            println!("    AT WAR: {}", wars.join("; "));
+        }
+        if e.humiliated > 0 {
+            println!("    humiliated for {} more days", e.humiliated);
         }
         if let Some(ai) = &e.ai {
             println!(
@@ -398,7 +411,7 @@ fn print_planet(world: &World, pid: PlanetId) {
     );
     let mut flows = Vec::new();
     for r in 0..world.defs.resource_count() {
-        let net = p.flows.supply[r] - p.flows.demand[r];
+        let net = p.flows.net(r);
         if net.abs() > 0.005 {
             flows.push(format!("{} {net:+.1}", short(world, r)));
         }

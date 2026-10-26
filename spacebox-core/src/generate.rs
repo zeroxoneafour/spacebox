@@ -297,7 +297,7 @@ pub fn random_system(
                 } else {
                     rng.range_f(0.6, 0.9)
                 };
-                t.resource_mults.push((r, (m * 100.0).round() / 100.0));
+                t.resource_mults = Box::new([(r, (m * 100.0).round() / 100.0)]);
             }
         }
         generate_terrain(defs, rng, &mut p);

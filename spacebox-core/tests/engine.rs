@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use spacebox_core::defs::Kind;
 use spacebox_core::sim::planet::building_profile;
-use spacebox_core::world::{FleetOrder, ProjectKind};
+use spacebox_core::world::{FleetOrder, ProjectKind, Side, WarGoal, WarOutcome};
 use spacebox_core::{Command, EventKind, World, load_world, save};
 
 fn data_dir() -> PathBuf {
@@ -56,6 +56,23 @@ fn res(w: &World, name: &str) -> spacebox_core::ResourceId {
     w.defs.find_resource(name).unwrap()
 }
 
+/// Gives `empire` the influence for a war and declares it (total wars also get the policy).
+fn declare(
+    w: &mut World,
+    empire: spacebox_core::EmpireId,
+    target: spacebox_core::EmpireId,
+    goal: WarGoal,
+) {
+    set_stock(w, empire, "influence", 5000.0);
+    w.empires[empire.idx()].total_war |= goal == WarGoal::Total;
+    w.apply_now(Command::DeclareWar {
+        empire,
+        target,
+        goal,
+    })
+    .unwrap();
+}
+
 /// Sets an empire's stock of a resource.
 fn set_stock(w: &mut World, empire: spacebox_core::EmpireId, name: &str, count: f64) {
     let r = res(w, name);
@@ -95,6 +112,7 @@ fn loads_the_spec_examples() {
     assert_eq!(w.seed, 8902341);
     let e = &w.empires[0];
     assert_eq!(e.research.len(), 1);
+    assert!(e.research[0].paid.is_empty());
     assert_eq!(e.shipbuilding.len(), 1);
     assert_eq!(e.shipbuilding[0].paid[0].count, 155.0);
     assert!(e.dominant_species.is_some());
@@ -109,6 +127,14 @@ fn loads_the_spec_examples() {
     assert!(matches!(c.kind, ProjectKind::Upgrade(_)));
     assert_eq!(c.remaining.days, 50);
     assert_eq!(c.paid[0].count, 750.0);
+    assert_eq!(planet.siege, 1250.0);
+    let barren = w.planet(
+        w.planet_by_name("example-system/example-barren-planet")
+            .unwrap(),
+    );
+    let tf = barren.terraform.as_ref().unwrap();
+    assert_eq!(tf.paid[0].count, 1500.0);
+    assert_eq!(tf.remaining.days, 120);
     let removal = planet.tiles[3].construction.as_ref().unwrap();
     assert_eq!(removal.kind, ProjectKind::Remove);
     assert!(removal.paid.is_empty());
@@ -137,12 +163,33 @@ fn loads_the_spec_examples() {
     assert_eq!(t2.ships.fire_rate_mult, 1.1);
     assert_eq!(t2.buildings[0].targets.buildings.len(), 1);
     assert_eq!(t2.buildings[0].targets.tags.len(), 1);
-    w.run(30);
+    // Diplomacy: the example war has an offense but nobody on the defense.
+    let war = spacebox_core::WarId::from_idx(0);
+    assert_eq!(w.war(war).display_name, "Example War");
+    assert_eq!(
+        w.war(war).goals,
+        [Some(WarGoal::Claim), Some(WarGoal::Humiliate)]
+    );
+    assert!(w.war(war).is_active());
+    let e = &w.empires[0];
+    assert_eq!(e.wars, [(war, Side::Offense)]);
+    assert_eq!(w.alliances[0].display_name, "Great Alliance");
+    assert_eq!(e.alliances.len(), 1);
+    assert_eq!(w.truces[0].valid_until, 300);
+    assert!(!e.total_war && e.humiliated == 0 && e.claims.is_empty());
+    // ...so it ends as soon as the game runs.
+    w.tick();
+    assert_eq!(w.war(war).victory, Some(WarOutcome::Offensive));
+    w.run(29);
     let dir = temp_dir("spec");
     save::save(&w, dir.join("out.toml")).unwrap();
     let (back, warnings) = load_world(dir.join("out.toml")).unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(back.day, 40);
+    // Ended wars stay as history, with their participants.
+    assert_eq!(back.war(war).victory, Some(WarOutcome::Offensive));
+    assert_eq!(back.empires[0].wars, [(war, Side::Offense)]);
+    assert_eq!(back.empires[0].truces.len(), 2);
 }
 
 #[test]
@@ -1291,11 +1338,7 @@ fn fleets_jump_fight_and_conquer() {
         })
         .is_err()
     );
-    w.apply_now(Command::DeclareWar {
-        empire: terran,
-        target: cetian,
-    })
-    .unwrap();
+    declare(&mut w, terran, cetian, WarGoal::Total);
     assert!(w.at_war(cetian, terran));
     w.apply_now(Command::Bombard {
         fleet: home,
@@ -1353,20 +1396,23 @@ fn peace_stops_bombardment() {
     let cetian = w.empire_by_name("empire-2").unwrap();
     let home = w.fleets.iter().find(|f| f.owner == terran).unwrap().id;
     let ceti_prime = w.planet_by_name("tau-ceti/tau-ceti-e").unwrap();
-    w.apply_now(Command::DeclareWar {
-        empire: terran,
-        target: cetian,
-    })
-    .unwrap();
+    declare(&mut w, terran, cetian, WarGoal::Humiliate);
     w.apply_now(Command::Bombard {
         fleet: home,
         planet: ceti_prime,
         tile: None,
     })
     .unwrap();
-    w.apply_now(Command::MakePeace {
+    let war = w.empire(terran).wars[0].0;
+    w.apply_now(Command::ProposePeace {
         empire: cetian,
-        target: terran,
+        war,
+        outcome: WarOutcome::StatusQuo,
+    })
+    .unwrap();
+    w.apply_now(Command::AcceptPeace {
+        empire: terran,
+        war,
     })
     .unwrap();
     // The bombardment order is gone; the jumps towards Tau Ceti remain.
@@ -1412,11 +1458,7 @@ fn fleets_and_projects_survive_a_save_round_trip() {
         tech: grid,
     })
     .unwrap();
-    w.apply_now(Command::DeclareWar {
-        empire: terran,
-        target: cetian,
-    })
-    .unwrap();
+    declare(&mut w, terran, cetian, WarGoal::Humiliate);
     let home = w.fleets.iter().find(|f| f.owner == terran).unwrap().id;
     let sirius = w.system_by_name("sirius").unwrap();
     w.apply_now(Command::MoveFleet {
@@ -1790,20 +1832,33 @@ fn peace_brings_a_truce() {
         w.empire_by_name("empire-2").unwrap(),
     );
     w.run(10);
-    w.apply_now(Command::DeclareWar {
-        empire: a,
-        target: b,
-    })
-    .unwrap();
-    assert_eq!(w.empire(a).wars[0].since_day, 10);
-    w.apply_now(Command::MakePeace {
-        empire: b,
-        target: a,
-    })
-    .unwrap();
-    let truce = w.rules().truce_days;
-    assert!(w.empire(a).in_truce(b, 11) && w.empire(b).in_truce(a, 11));
-    assert!(!w.empire(a).in_truce(b, 10 + truce));
+    declare(&mut w, a, b, WarGoal::Humiliate);
+    let war = w.empire(a).wars[0].0;
+    assert_eq!(w.war(war).starting_day, 10);
+    assert_eq!(w.empire(b).wars[0], (war, Side::Defense));
+    // Mutual agreement: both propose the same outcome.
+    for e in [b, a] {
+        w.apply_now(Command::ProposePeace {
+            empire: e,
+            war,
+            outcome: WarOutcome::StatusQuo,
+        })
+        .unwrap();
+    }
+    assert_eq!(w.war(war).victory, Some(WarOutcome::StatusQuo));
+    assert!(w.in_truce(a, b) && w.in_truce(b, a));
+    let truce = w.empire(a).truces[0];
+    assert_eq!(w.truces[truce.idx()].valid_until, 10 + w.rules().truce_days);
+    let err = w
+        .apply_now(Command::DeclareWar {
+            empire: a,
+            target: b,
+            goal: WarGoal::Humiliate,
+        })
+        .unwrap_err();
+    assert!(err.contains("truce"), "{err}");
+    w.day += w.rules().truce_days;
+    assert!(!w.in_truce(a, b));
 }
 
 #[test]
@@ -1819,11 +1874,7 @@ fn ai_fleets_finish_conquering_a_system() {
     });
     let home = w.fleets.iter().find(|f| f.owner == terran).unwrap().id;
     let ceti_f = w.planet_by_name("tau-ceti/tau-ceti-f").unwrap();
-    w.apply_now(Command::DeclareWar {
-        empire: terran,
-        target: cetian,
-    })
-    .unwrap();
+    declare(&mut w, terran, cetian, WarGoal::Total);
     w.apply_now(Command::Bombard {
         fleet: home,
         planet: ceti_f,
@@ -1857,11 +1908,7 @@ fn player_fleets_stand_down_after_a_surrender() {
     let cetian = w.empire_by_name("empire-2").unwrap();
     let home = w.fleets.iter().find(|f| f.owner == terran).unwrap().id;
     let ceti_f = w.planet_by_name("tau-ceti/tau-ceti-f").unwrap();
-    w.apply_now(Command::DeclareWar {
-        empire: terran,
-        target: cetian,
-    })
-    .unwrap();
+    declare(&mut w, terran, cetian, WarGoal::Total);
     w.apply_now(Command::Bombard {
         fleet: home,
         planet: ceti_f,
@@ -1968,11 +2015,7 @@ fn fleets_work_through_their_order_queue() {
 
     // Combat suspends orders: the Cetian fleet comes to Sirius while the Terran fleet has a
     // move order there, and the order waits until the battle is over.
-    w.apply_now(Command::DeclareWar {
-        empire: terran,
-        target: cetian,
-    })
-    .unwrap();
+    declare(&mut w, terran, cetian, WarGoal::Humiliate);
     let vanguard = w.fleets.iter().find(|f| f.owner == cetian).unwrap().id;
     w.apply_now(Command::MoveFleet {
         fleet: vanguard,
@@ -2057,4 +2100,273 @@ fn tags_are_scoped_to_their_file() {
             .any(|w| w.contains("no building has the tag 'forge'")),
         "{warnings:?}"
     );
+}
+
+#[test]
+fn research_paid_in_normal_resources_is_refunded() {
+    let dir = temp_dir("research-paid");
+    let d = data_dir();
+    std::fs::write(
+        dir.join("techs.toml"),
+        format!(
+            "[import]\nresources = \"{0}/resources.toml\"\n\n\
+             [technology.expensive]\ndisplay-name = \"Expensive\"\n\
+             research-resources = [{{ resource = \"resources.minerals\", count = 300 }}, \
+             {{ resource = \"resources.research\", count = 100000 }}]\n",
+            d.display()
+        ),
+    )
+    .unwrap();
+    let path = scenario(
+        &dir,
+        r#"
+[empire.e]
+display-name = "E"
+resource-stores = [ { resource = "resources.minerals", count = 200 } ]
+
+[system.s]
+display-name = "S"
+star-type = "yellow"
+coords = [0, 0]
+owner = "e"
+"#,
+    );
+    // Add the tech file to the scenario's imports.
+    let text = std::fs::read_to_string(&path).unwrap().replacen(
+        "[import]\n",
+        "[import]\nextra = \"techs.toml\"\n",
+        1,
+    );
+    std::fs::write(&path, text).unwrap();
+    let (mut w, _) = load_world(&path).unwrap();
+    let e = spacebox_core::EmpireId(0);
+    let minerals = res(&w, "minerals");
+    let tech = w.defs.find_tech("expensive").unwrap();
+    w.apply_now(Command::Research { empire: e, tech }).unwrap();
+    w.tick();
+    let p = &w.empire(e).research[0];
+    assert_eq!(p.paid.len(), 1, "only normal resources are tracked");
+    assert_eq!(p.paid[0].count, 200.0);
+    assert_eq!(p.remaining.get(minerals), 100.0);
+    // Saved only when non-empty, and read back.
+    let out = dir.join("out.toml");
+    save::save(&w, &out).unwrap();
+    assert!(
+        std::fs::read_to_string(&out)
+            .unwrap()
+            .contains("paid = [{ resource")
+    );
+    let (back, _) = load_world(&out).unwrap();
+    assert_eq!(back.empire(e).research[0].paid[0].count, 200.0);
+    w.apply_now(Command::CancelResearch { empire: e, tech })
+        .unwrap();
+    assert_eq!(w.empire(e).storage[minerals.idx()], 200.0);
+}
+
+#[test]
+fn limited_wars_occupy_and_peace_returns_occupations() {
+    let mut w = quiet_sol();
+    let terran = w.empire_by_name("empire-1").unwrap();
+    let cetian = w.empire_by_name("empire-2").unwrap();
+    let home = w.fleets.iter().find(|f| f.owner == terran).unwrap().id;
+    let ceti_f = w.planet_by_name("tau-ceti/tau-ceti-f").unwrap();
+    // Declaring costs influence.
+    set_stock(&mut w, terran, "influence", 100.0);
+    assert!(
+        w.apply_now(Command::DeclareWar {
+            empire: terran,
+            target: cetian,
+            goal: WarGoal::Humiliate,
+        })
+        .unwrap_err()
+        .contains("influence")
+    );
+    // Claim wars need claims, total wars the policy.
+    set_stock(&mut w, terran, "influence", 5000.0);
+    for goal in [WarGoal::Claim, WarGoal::Total] {
+        assert!(
+            w.apply_now(Command::DeclareWar {
+                empire: terran,
+                target: cetian,
+                goal,
+            })
+            .is_err()
+        );
+    }
+    w.apply_now(Command::DeclareWar {
+        empire: terran,
+        target: cetian,
+        goal: WarGoal::Humiliate,
+    })
+    .unwrap();
+    let influence = res(&w, "influence");
+    assert_eq!(
+        w.empire(terran).storage[influence.idx()],
+        5000.0 - w.rules().humiliate_cost
+    );
+    let war = w.empire(terran).wars[0].0;
+    // The defense picks its goal for free; it has no claims, and total war needs a total
+    // war declared on it or the policy.
+    assert!(
+        w.apply_now(Command::SetWarGoal {
+            empire: cetian,
+            war,
+            goal: WarGoal::Claim
+        })
+        .is_err()
+    );
+    w.apply_now(Command::SetWarGoal {
+        empire: cetian,
+        war,
+        goal: WarGoal::Humiliate,
+    })
+    .unwrap();
+    w.apply_now(Command::Bombard {
+        fleet: home,
+        planet: ceti_f,
+        tile: None,
+    })
+    .unwrap();
+    for _ in 0..120 {
+        w.tick();
+        if w.planet(ceti_f).occupier.is_some() {
+            break;
+        }
+    }
+    // Occupied, not taken: it now works for the occupier.
+    let p = w.planet(ceti_f);
+    assert_eq!((p.owner, p.occupier), (Some(cetian), Some(terran)));
+    assert_eq!(p.controller(), Some(terran));
+    assert!(w.empire_planets(terran).contains(&ceti_f));
+    assert!(w.war(war).exhaustion.iter().all(|x| *x > 0.0));
+    // Nobody can force an end before the enemy is exhausted.
+    assert!(
+        w.apply_now(Command::EnforcePeace {
+            empire: terran,
+            war,
+            outcome: WarOutcome::Offensive,
+        })
+        .is_err()
+    );
+    w.wars[war.idx()].exhaustion[Side::Defense.idx()] = 1.0;
+    w.apply_now(Command::EnforcePeace {
+        empire: terran,
+        war,
+        outcome: WarOutcome::Offensive,
+    })
+    .unwrap();
+    // A humiliation war hands nothing over; the loser is humiliated.
+    assert_eq!(w.planet(ceti_f).occupier, None);
+    assert_eq!(w.planet(ceti_f).owner, Some(cetian));
+    assert_eq!(w.empire(cetian).humiliated, w.rules().humiliation_days);
+    set_stock(&mut w, cetian, "influence", 0.0);
+    w.run(5);
+    assert_eq!(w.empire(cetian).storage[influence.idx()], 0.0);
+    assert!(w.empire(terran).storage[influence.idx()] > 0.0);
+}
+
+#[test]
+fn claim_wars_transfer_occupied_claims() {
+    let mut w = quiet_sol();
+    let terran = w.empire_by_name("empire-1").unwrap();
+    let cetian = w.empire_by_name("empire-2").unwrap();
+    let tau = w.system_by_name("tau-ceti").unwrap();
+    set_stock(&mut w, terran, "influence", 5000.0);
+    w.apply_now(Command::Claim {
+        empire: terran,
+        system: tau,
+    })
+    .unwrap();
+    assert_eq!(w.empire(terran).claims, [tau]);
+    w.apply_now(Command::DeclareWar {
+        empire: terran,
+        target: cetian,
+        goal: WarGoal::Claim,
+    })
+    .unwrap();
+    let war = w.empire(terran).wars[0].0;
+    // Occupy every Cetian planet in Tau Ceti.
+    let held: Vec<_> = w
+        .system(tau)
+        .planet_ids()
+        .filter(|p| w.planet(*p).owner == Some(cetian))
+        .collect();
+    for p in &held {
+        w.set_planet_occupier(*p, Some(terran));
+    }
+    assert_eq!(w.system(tau).occupier, Some(terran));
+    assert_eq!(w.system(tau).owner, Some(cetian));
+    // The occupation survives a save.
+    let dir = temp_dir("occupation");
+    save::save(&w, dir.join("out.toml")).unwrap();
+    let (mut w, warnings) = load_world(dir.join("out.toml")).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(w.system(tau).occupier, Some(terran));
+    assert_eq!(w.war(war).goals[0], Some(WarGoal::Claim));
+
+    w.apply_now(Command::ProposePeace {
+        empire: cetian,
+        war,
+        outcome: WarOutcome::Offensive,
+    })
+    .unwrap();
+    w.apply_now(Command::AcceptPeace {
+        empire: terran,
+        war,
+    })
+    .unwrap();
+    assert_eq!(w.system(tau).owner, Some(terran));
+    assert_eq!(w.system(tau).occupier, None);
+    for p in &held {
+        assert_eq!(w.planet(*p).owner, Some(terran));
+        assert_eq!(w.planet(*p).occupier, None);
+    }
+    assert!(w.empire(terran).claims.is_empty());
+}
+
+#[test]
+fn allies_join_wars_unless_allied_to_both() {
+    let mut w = warlike_galaxy(0.0);
+    w.empires.iter_mut().for_each(|e| e.ai = None);
+    let e: Vec<_> = (0..4).map(spacebox_core::EmpireId::from_idx).collect();
+    w.apply_now(Command::CreateAlliance {
+        empire: e[0],
+        display_name: "North".into(),
+    })
+    .unwrap();
+    w.apply_now(Command::CreateAlliance {
+        empire: e[2],
+        display_name: "South".into(),
+    })
+    .unwrap();
+    let (north, south) = (
+        spacebox_core::AllianceId::from_idx(0),
+        spacebox_core::AllianceId::from_idx(1),
+    );
+    for (who, a) in [(e[1], north), (e[3], north), (e[3], south)] {
+        w.apply_now(Command::JoinAlliance {
+            empire: who,
+            alliance: a,
+        })
+        .unwrap();
+    }
+    assert!(w.allied(e[0], e[1]) && w.allied(e[3], e[2]) && !w.allied(e[0], e[2]));
+    // Allies cannot fight each other.
+    set_stock(&mut w, e[0], "influence", 5000.0);
+    assert!(
+        w.apply_now(Command::DeclareWar {
+            empire: e[0],
+            target: e[1],
+            goal: WarGoal::Humiliate,
+        })
+        .unwrap_err()
+        .contains("allied")
+    );
+    declare(&mut w, e[2], e[0], WarGoal::Humiliate);
+    let war = w.empire(e[2]).wars[0].0;
+    assert_eq!(w.members(war, Side::Offense), [e[2]]);
+    assert_eq!(w.members(war, Side::Defense), [e[0], e[1]]);
+    // e[3], allied to both sides, stays out.
+    assert!(w.empire(e[3]).wars.is_empty());
+    assert!(w.at_war(e[1], e[2]) && !w.at_war(e[3], e[0]));
 }

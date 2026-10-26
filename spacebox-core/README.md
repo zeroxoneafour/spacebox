@@ -65,12 +65,15 @@ One tick is one day (`src/sim/mod.rs`):
    planet's shipbuilding, research the rest of the empire's transient output, and whatever is
    left is wasted. Research completes, migrations are committed, finished ships launch as new
    fleets, and completed expansion sites claim their planet and system (refunding rival
-   projects).
+   projects). Wars then update (`src/sim/war.rs`): humiliation counts down, exhaustion
+   rises, and wars where one side has no planets left end.
 7. **Governors** (parallel). AI empires (those with an `[empire.x.ai]` personality) queue
    housing on empty worlds, construction, upgrades, terraforming, expansion claims, research
    and shipbuilding, and switch off labs and shipyards whose output nothing would use. They
-   declare war on neighbours they can beat (depending on how militant they are), make peace
-   when losing or war-weary, defend their systems, merge their fleets, and send them to
+   set their total-war policy from their militancy, claim neighbouring systems, declare
+   humiliation, claim or total wars on neighbours they can beat (depending on how militant
+   they are), choose their goal when attacked, force, propose and accept peace by
+   exhaustion, defend their systems, liberate occupied worlds, merge their fleets, and send them to
    bombard the nearest enemy world. After a planet surrenders, an AI fleet moves on to the
    next enemy or unowned planet in the same system until the whole system is theirs; player
    fleets stand down instead. Decisions use a deterministic per-day roll, so runs stay
@@ -88,6 +91,19 @@ Planets sit in one flat `Vec`, stored contiguously per system. Building profiles
 until a tile or the owner's technologies change. All per-entity work is `rayon` parallel, and
 the results are deterministic: reductions happen in a fixed order.
 
+Most planets in a large galaxy are empty, unowned rocks. A planet whose last tick had nothing
+to simulate (no active buildings, pops, projects, siege or damage) is skipped until something
+changes, and so are systems and resource pools made only of such planets. Steps that need only
+the busy planets (projects, claims, events) find them with one parallel pass.
+
+Large saves are parsed piecewise and in parallel (see `src/split.rs`), and saves are streamed
+to disk.
+
 On a 16-thread machine, a generated galaxy with 20,000 systems, ~110,000 planets and 100 AI
-empires (expanding, clearing land, building fleets and waging wars) simulates in about 30 ms
-per day.
+empires (expanding, clearing land, building fleets and waging wars):
+
+| | Time | Peak memory |
+| --- | --- | --- |
+| Simulate one day | ~8 ms | |
+| Load its 200 MB save | 1.7 s | 560 MB (the world itself is ~300 MB) |
+| Generate it | 2.8 s | 290 MB |

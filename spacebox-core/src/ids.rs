@@ -45,4 +45,10 @@ id_types!(
     OutfitId,
     /// A fleet. Unlike other ids this is stable: it never shifts when fleets are removed.
     FleetId,
+    /// A war (`[game.wars.*]`), ongoing or ended.
+    WarId,
+    /// An alliance (`[game.alliances.*]`).
+    AllianceId,
+    /// A truce (`[game.truces.*]`).
+    TruceId,
 );

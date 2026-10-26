@@ -553,6 +553,7 @@ name = "spacebox-web"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "rayon",
  "serde",
  "serde_json",
  "spacebox-core",

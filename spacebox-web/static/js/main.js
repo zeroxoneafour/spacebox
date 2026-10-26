@@ -279,6 +279,7 @@ function empireInspector(id) {
       <label><input type="checkbox" data-change="empire-ai" data-id="${id}" ${e.ai ? 'checked' : ''}>AI governor</label>
       <label><input type="checkbox" data-change="empire-flag" data-field="accepts_migrants" data-id="${id}" ${e.accepts_migrants ? 'checked' : ''}>migrants</label>
       <label><input type="checkbox" data-change="empire-flag" data-field="market_access" data-id="${id}" ${e.market_access ? 'checked' : ''}>market</label>
+      <label><input type="checkbox" data-change="empire-flag" data-field="total_war" data-id="${id}" ${e.total_war ? 'checked' : ''}>total war</label>
       <input type="color" data-change="empire-color" data-id="${id}" value="${e.color || '#9aa4b8'}">
     </div>
     ${e.ai ? `<div class="box">${TRAITS.map((t) => `<div class="row"><label style="min-width:90px">${t}</label>
@@ -304,14 +305,7 @@ function empireInspector(id) {
     <h3>Technologies (admin grant/revoke)</h3>
     <div class="techs">${d.technologies.map((t) => `<div><label><input type="checkbox" data-change="empire-tech" data-id="${id}" data-tech="${t.id}" ${e.techs.includes(t.id) ? 'checked' : ''}>${esc(t.display_name)}</label> <span class="muted">${esc(t.tags.join(', '))}</span></div>`).join('')}</div>
     <h3>Diplomacy</h3>
-    ${s.empires.filter((o) => o.id !== id).map((o) => {
-      const war = e.wars.find((w) => w.enemy === o.id);
-      const truce = e.truces.find((t) => t.with === o.id);
-      const status = war ? `at war since day ${war.since_day}` : truce ? `truce until day ${truce.until_day}` : 'at peace';
-      return `<div class="row"><span class="swatch" style="background:${empireColor(s, o.id)}"></span>${esc(o.display_name)}
-        <span class="${war ? 'neg' : 'muted'}">${status}</span>
-        <button class="small ${war ? '' : 'danger'}" data-act="${war ? 'make-peace' : 'declare-war'}" data-id="${id}" data-other="${o.id}">${war ? 'make peace' : 'declare war'}</button></div>`;
-    }).join('') || '<p class="muted">No other empires.</p>'}
+    ${diplomacy(id)}
     <h3>Fleets</h3>
     ${s.fleets.filter((f) => f.owner === id).map((f) => `<div class="list-item" data-act="select-fleet" data-id="${f.id}">${esc(f.display_name)} <span class="muted">${f.ships.length} ships @ ${esc(s.systems[f.system].display_name)}${f.in_combat ? ' · <span class="neg">in combat</span>' : ''}</span></div>`).join('') || '<p class="muted">None</p>'}
     ${e.shipbuilding.length ? `<h3>Ships under construction</h3>${e.shipbuilding.map((o, i) => `<div class="row">${esc(shipName(o.ship))} at ${esc(s.planets[o.planet].display_name)} <span class="muted">${esc(projStr(o.remaining))} left</span><button class="small" data-act="cancel-ship" data-id="${id}" data-index="${i}">cancel</button></div>${bar(progress(D().ships[o.ship].build_cost, o.remaining))}`).join('')}` : ''}
@@ -325,12 +319,64 @@ function empireInspector(id) {
     ${systems.map((x) => `<div class="list-item" data-act="goto-system" data-id="${x.id}">${esc(x.display_name)}${x.id === e.capital ? ' ★' : ''}</div>`).join('') || '<p class="muted">None</p>'}`;
 }
 
+const GOALS = ['humiliate', 'claim', 'total'];
+const OUTCOMES = ['offensive', 'defensive', 'status quo'];
+const outcomeStr = (o) => (o === 'status quo' ? 'a status quo' : `${o} victory`);
+const names = (ids) => ids.map((e) => esc(S().empires[e].display_name)).join(', ');
+
+/// An empire's wars, relations, claims and alliances, with their commands.
+function diplomacy(id) {
+  const s = S();
+  const e = s.empires[id];
+  const wars = e.wars.map((w) => ({ war: s.wars[w.war], side: w.side })).filter((w) => w.war.victory == null);
+  const warHtml = wars.map(({ war, side }) => {
+    const [me, them] = side === 'offense' ? [0, 1] : [1, 0];
+    const enemies = side === 'offense' ? war.defense : war.offense;
+    const theirOffer = war.proposals[them];
+    return `<div class="box">
+      <div><b>${esc(war.display_name)}</b> <span class="muted">since day ${war.starting_day}, on the ${side} against ${names(enemies)}</span></div>
+      <div class="muted">Goals: offense ${esc(war.goals[0] ?? '–')}, defense ${esc(war.goals[1] ?? 'not chosen')}</div>
+      <div>Our exhaustion ${num(war.exhaustion[me] * 100)}%</div>${bar(war.exhaustion[me])}
+      <div>Their exhaustion ${num(war.exhaustion[them] * 100)}%</div>${bar(war.exhaustion[them])}
+      ${side === 'defense' && war.goals[1] == null ? `<div class="row"><select id="wg-${war.id}">${GOALS.map((g) => `<option>${g}</option>`).join('')}</select><button class="small" data-act="war-goal" data-id="${id}" data-war="${war.id}">set goal</button></div>` : ''}
+      ${war.proposals[me] ? `<div class="muted">We proposed ${outcomeStr(war.proposals[me])}.</div>` : ''}
+      ${theirOffer ? `<div class="row">They propose ${outcomeStr(theirOffer)} <button class="small primary" data-act="peace-accept" data-id="${id}" data-war="${war.id}">accept</button></div>` : ''}
+      <div class="row"><select id="po-${war.id}">${OUTCOMES.map((o) => `<option value="${o}">${outcomeStr(o)}</option>`).join('')}</select>
+        <button class="small" data-act="peace-propose" data-id="${id}" data-war="${war.id}">propose</button>
+        ${war.exhaustion[them] >= 1 ? `<button class="small danger" data-act="peace-enforce" data-id="${id}" data-war="${war.id}">enforce</button>` : ''}</div>
+    </div>`;
+  }).join('');
+  const allied = (o) => e.alliances.some((a) => s.empires[o].alliances.includes(a));
+  const truce = (o) => e.truces.map((t) => s.truces.find((x) => x.id === t)).find((t) => t && s.empires[o].truces.includes(t.id));
+  const others = s.empires.filter((o) => o.id !== id).map((o) => {
+    const war = e.at_war.includes(o.id);
+    const t = truce(o.id);
+    const status = war ? 'at war' : allied(o.id) ? 'allied' : t ? `truce until day ${t.valid_until}` : 'at peace';
+    const canDeclare = !war && !allied(o.id) && !t;
+    return `<div class="row"><span class="swatch" style="background:${empireColor(s, o.id)}"></span>${esc(o.display_name)}
+      <span class="${war ? 'neg' : 'muted'}">${status}</span>
+      ${canDeclare ? `<select id="dw-${o.id}">${GOALS.map((g) => `<option>${g}</option>`).join('')}</select><button class="small danger" data-act="declare-war" data-id="${id}" data-other="${o.id}">declare war</button>` : ''}</div>`;
+  }).join('') || '<p class="muted">No other empires.</p>';
+  const claims = e.claims.map((c) => `<div class="row"><a class="list-item" data-act="select-system" data-id="${c}">${esc(s.systems[c].display_name)}</a><button class="small" data-act="claim-drop" data-id="${id}" data-system="${c}">drop</button></div>`).join('') || '<p class="muted">No claims (claim systems from the system panel).</p>';
+  const mine = e.alliances.map((a) => `<div class="row">${esc(s.alliances[a].display_name)} <span class="muted">${names(s.empires.filter((o) => o.alliances.includes(a)).map((o) => o.id))}</span><button class="small" data-act="alliance-leave" data-id="${id}" data-alliance="${a}">leave</button></div>`).join('');
+  const joinable = s.alliances.filter((a) => !e.alliances.includes(a.id));
+  return `${e.humiliated > 0 ? `<div class="neg">Humiliated: no influence income for ${e.humiliated} more days</div>` : ''}
+    ${warHtml}
+    ${others}
+    <h3>Claims</h3>${claims}
+    <h3>Alliances</h3>${mine || '<p class="muted">None</p>'}
+    ${joinable.length ? `<div class="row"><select id="al-join">${joinable.map((a) => `<option value="${a.id}">${esc(a.display_name)}</option>`).join('')}</select><button class="small" data-act="alliance-join" data-id="${id}">join</button></div>` : ''}
+    <div class="row"><input type="text" id="al-name" placeholder="New alliance"><button class="small" data-act="alliance-create" data-id="${id}">found</button></div>`;
+}
+
 function warsList() {
   const s = S();
-  const wars = [];
-  for (const e of s.empires) for (const o of e.at_war) if (o > e.id) wars.push(`${esc(e.display_name)} ⚔ ${esc(s.empires[o].display_name)}`);
-  return wars.length ? `<h3>Wars</h3>${wars.map((w) => `<div class="neg">${w}</div>`).join('')}` : '';
+  const wars = s.wars.filter((w) => w.victory == null);
+  return wars.length ? `<h3>Wars</h3>${wars.map((w) => `<div class="neg">${esc(w.display_name)}: ${names(w.offense)} ⚔ ${names(w.defense)} <span class="muted">(${num(w.exhaustion[0] * 100)}% / ${num(w.exhaustion[1] * 100)}% exhausted)</span></div>`).join('')}` : '';
 }
+
+/// Who a planet works for: its occupier if occupied, else its owner.
+const controller = (p) => p.occupier ?? p.owner;
 
 function fleetInspector(id) {
   const s = S();
@@ -340,9 +386,9 @@ function fleetInspector(id) {
   const sys = s.systems[f.system];
   const orders = f.orders.map((o, i) => `<div class="${i === 0 ? '' : 'muted'}">${i + 1}. ${esc(orderStr(o))}</div>`).join('') || '<div class="muted">Idle</div>';
   // Enemy planets, or unclaimed ones in systems nobody else owns.
-  const targets = s.planets.filter((p) => (p.owner == null
+  const targets = s.planets.filter((p) => (controller(p) == null
     ? s.systems[p.system].owner == null || s.systems[p.system].owner === f.owner
-    : p.owner !== f.owner && owner.at_war.includes(p.owner)));
+    : controller(p) !== f.owner && owner.at_war.includes(controller(p))));
   const mates = s.fleets.filter((o) => o.id !== id && o.owner === f.owner && o.system === f.system);
   const power = f.ships.reduce((a, [def]) => a + d.ships[def].dps, 0);
   return `
@@ -395,6 +441,13 @@ function systemInspector(id) {
     <h3>Ownership</h3>
     <div class="row"><select data-change="system-owner" data-id="${id}"><option value="">unowned</option>${empireOpts}</select>
       ${sys.owner != null ? `<button class="small" data-act="system-capital" data-id="${id}">make capital</button>` : ''}</div>
+    ${sys.occupier != null ? `<div class="neg">Occupied by ${esc(s.empires[sys.occupier].display_name)}</div>` : ''}
+    ${(() => {
+      const claimants = s.empires.filter((e) => e.claims.includes(id));
+      const can = s.empires.filter((e) => sys.owner != null && e.id !== sys.owner && !e.claims.includes(id));
+      return `${claimants.length ? `<div class="muted">Claimed by ${names(claimants.map((e) => e.id))}</div>` : ''}
+        ${can.length ? `<div class="row"><select id="cl-empire">${can.map((e) => `<option value="${e.id}">${esc(e.display_name)}</option>`).join('')}</select><button class="small" data-act="claim" data-id="${id}">claim</button></div>` : ''}`;
+    })()}
     <h3>Hyperlanes</h3>
     ${sys.links.map((l) => `<div class="row"><a class="list-item" data-act="select-system" data-id="${l}">${esc(s.systems[l].display_name)}</a><button class="small danger" data-act="system-unlink" data-id="${id}" data-other="${l}">cut</button></div>`).join('') || '<p class="muted">Not linked</p>'}
     <div class="row"><select id="sys-link">${linkable.map((x) => `<option value="${x.id}">${esc(x.display_name)}</option>`).join('')}</select><button class="small" data-act="system-link" data-id="${id}">link</button></div>
@@ -402,7 +455,7 @@ function systemInspector(id) {
     ${sys.planets.map((pid) => {
       const p = s.planets[pid];
       const own = p.owner != null ? `<span class="swatch" style="background:${empireColor(s, p.owner)}"></span>` : '';
-      return `<div class="list-item" data-act="select-planet" data-id="${pid}">${own}${esc(p.display_name)} <span class="muted">${p.size} ${p.habitable ? 'habitable' : 'barren'}${p.pop ? ` · ${num(p.pop)} pops` : ''}${p.siege > 0 ? ' · <span class="neg">under siege</span>' : ''}</span></div>`;
+      return `<div class="list-item" data-act="select-planet" data-id="${pid}">${own}${esc(p.display_name)} <span class="muted">${p.size} ${p.habitable ? 'habitable' : 'barren'}${p.pop ? ` · ${num(p.pop)} pops` : ''}${p.siege > 0 ? ' · <span class="neg">under siege</span>' : ''}${p.occupier != null ? ` · <span class="neg">occupied by ${esc(s.empires[p.occupier].display_name)}</span>` : ''}</span></div>`;
     }).join('') || '<p class="muted">No planets</p>'}
     <h3>Fleets here</h3>
     ${s.fleets.filter((f) => f.system === id).map((f) => `<div class="list-item" data-act="select-fleet" data-id="${f.id}"><span class="swatch" style="background:${empireColor(s, f.owner)}"></span>${esc(f.display_name)} <span class="muted">${f.ships.length} ships${f.in_combat ? ' · <span class="neg">fighting</span>' : ''}</span></div>`).join('') || '<p class="muted">None</p>'}
@@ -436,6 +489,7 @@ function planetInspector(id, tile) {
     <div class="kv">
       <span>System</span><span><a class="list-item" data-act="select-system" data-id="${p.system}">${esc(s.systems[p.system].display_name)}</a></span>
       <span>Owner</span><span><select data-change="planet-owner" data-id="${id}"><option value="">unowned</option>${s.empires.map((e) => `<option value="${e.id}" ${e.id === owner ? 'selected' : ''}>${esc(e.display_name)}</option>`).join('')}</select></span>
+      ${p.occupier != null ? `<span>Occupier</span><span class="neg">${esc(s.empires[p.occupier].display_name)} (produces for them)</span>` : ''}
       <span>Coordinates</span><span>${p.coordinates.map((v) => num(v, 1)).join(', ')}</span>
       <span>Type</span><span>${p.size}, ${p.habitable ? 'habitable' : 'barren'}${p.terraform ? ` (terraforming, ${esc(projStr(p.terraform.remaining))} left)` : ''}</span>
       <span>Population</span><span>${num(p.pop)} / ${num(st.housing)} housing</span>
@@ -657,8 +711,16 @@ const actions = {
 
   'tile-build': (el) => api.command({ type: 'build', planet: +el.dataset.id, tile: +el.dataset.tile, building: +$('#tile-building').value, empire: intOr(el.dataset.empire) }),
   'select-fleet': (el) => { ui.sel = { kind: 'fleet', id: +el.dataset.id }; },
-  'declare-war': (el) => api.command({ type: 'declare_war', empire: +el.dataset.id, target: +el.dataset.other }),
-  'make-peace': (el) => api.command({ type: 'make_peace', empire: +el.dataset.id, target: +el.dataset.other }),
+  'declare-war': (el) => api.command({ type: 'declare_war', empire: +el.dataset.id, target: +el.dataset.other, goal: $(`#dw-${el.dataset.other}`).value }),
+  'war-goal': (el) => api.command({ type: 'set_war_goal', empire: +el.dataset.id, war: +el.dataset.war, goal: $(`#wg-${el.dataset.war}`).value }),
+  'peace-propose': (el) => api.command({ type: 'propose_peace', empire: +el.dataset.id, war: +el.dataset.war, outcome: $(`#po-${el.dataset.war}`).value }),
+  'peace-accept': (el) => api.command({ type: 'accept_peace', empire: +el.dataset.id, war: +el.dataset.war }),
+  'peace-enforce': (el) => api.command({ type: 'enforce_peace', empire: +el.dataset.id, war: +el.dataset.war, outcome: $(`#po-${el.dataset.war}`).value }),
+  'claim': (el) => api.command({ type: 'claim', empire: +$('#cl-empire').value, system: +el.dataset.id }),
+  'claim-drop': (el) => api.command({ type: 'drop_claim', empire: +el.dataset.id, system: +el.dataset.system }),
+  'alliance-create': (el) => api.command({ type: 'create_alliance', empire: +el.dataset.id, display_name: $('#al-name').value || 'Alliance' }),
+  'alliance-join': (el) => api.command({ type: 'join_alliance', empire: +el.dataset.id, alliance: +$('#al-join').value }),
+  'alliance-leave': (el) => api.command({ type: 'leave_alliance', empire: +el.dataset.id, alliance: +el.dataset.alliance }),
   'cancel-ship': (el) => api.command({ type: 'cancel_ship', empire: +el.dataset.id, index: +el.dataset.index }),
   'spawn-fleet': async (el) => {
     const r = await api.createFleet({
@@ -925,7 +987,7 @@ async function onContext(pick, point) {
     if (pick?.kind === 'planet' || pick?.kind === 'tile') {
       const pid = pick.kind === 'planet' ? pick.id : pick.planet;
       const p = s.planets[pid];
-      if (p.owner !== f.owner && (p.owner == null || s.empires[f.owner].at_war.includes(p.owner))) {
+      if (controller(p) !== f.owner && (controller(p) == null || s.empires[f.owner].at_war.includes(controller(p)))) {
         await api.command({ type: 'bombard', fleet: f.id, planet: pid, tile: pick.kind === 'tile' ? pick.tile : null });
         toast(`${f.display_name}: bombard ${p.display_name}`);
       } else {

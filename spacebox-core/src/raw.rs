@@ -368,6 +368,20 @@ pub struct RawRulesDiplomacy {
     pub truce_days: Option<u64>,
 }
 
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawRulesWar {
+    pub humiliate_cost: Option<f64>,
+    pub claim_cost: Option<f64>,
+    pub total_cost: Option<f64>,
+    pub humiliation_days: Option<u64>,
+    pub daily_exhaustion: Option<f64>,
+    pub ship_loss_exhaustion: Option<f64>,
+    pub planet_loss_exhaustion: Option<f64>,
+    pub populated_planet_loss_exhaustion: Option<f64>,
+    pub crisis_exhaustion: Option<f64>,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawTerraform {
@@ -407,6 +421,8 @@ pub struct RawRuleset {
     #[serde(default)]
     pub diplomacy: RawRulesDiplomacy,
     #[serde(default)]
+    pub war: RawRulesWar,
+    #[serde(default)]
     pub terraforming: RawRulesTerraforming,
 }
 
@@ -422,6 +438,77 @@ pub struct RawGame {
     #[serde(default)]
     pub seed: u64,
     pub ruleset: Option<String>,
+    #[serde(default)]
+    pub wars: indexmap_like::Entries<RawWarDef>,
+    #[serde(default)]
+    pub alliances: indexmap_like::Entries<RawAlliance>,
+    #[serde(default)]
+    pub truces: indexmap_like::Entries<RawTruceDef>,
+}
+
+/// `[game.wars.x]`
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawWarDef {
+    pub display_name: String,
+    pub offensive_goal: String,
+    pub defensive_goal: Option<String>,
+    pub starting_day: u64,
+    #[serde(default)]
+    pub offensive_exhaustion: f64,
+    #[serde(default)]
+    pub defensive_exhaustion: f64,
+    /// `"offensive"`, `"defensive"` or `"status quo"`; absent while the war goes on.
+    pub victory: Option<String>,
+}
+
+/// `[game.alliances.x]`
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawAlliance {
+    pub display_name: String,
+}
+
+/// `[game.truces.x]`
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawTruceDef {
+    pub display_name: String,
+    pub valid_until: u64,
+}
+
+/// Named entries of a table (`[game.wars.a]`, `[game.wars.b]`, ...), in file order.
+pub mod indexmap_like {
+    use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
+
+    #[derive(Debug)]
+    pub struct Entries<T>(pub Vec<(String, T)>);
+
+    impl<T> Default for Entries<T> {
+        fn default() -> Self {
+            Entries(Vec::new())
+        }
+    }
+
+    impl<'de, T: Deserialize<'de>> Deserialize<'de> for Entries<T> {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V<T>(std::marker::PhantomData<T>);
+            impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+                type Value = Entries<T>;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a table of named entries")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Entries<T>, A::Error> {
+                    let mut out = Vec::new();
+                    while let Some((k, v)) = m.next_entry::<String, T>()? {
+                        out.push((k, v));
+                    }
+                    Ok(Entries(out))
+                }
+            }
+            d.deserialize_map(V(std::marker::PhantomData))
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -437,22 +524,19 @@ pub struct RawAi {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct RawWar {
-    pub empire: String,
-    pub since_day: u64,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct RawTruce {
-    pub empire: String,
-    pub until_day: u64,
+pub struct RawWarSide {
+    pub war: String,
+    /// `"offense"` or `"defense"`.
+    pub side: String,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawResearch {
     pub technology: String,
+    /// Normal resources already spent (refunded if cancelled); transient ones aren't tracked.
+    #[serde(default)]
+    pub paid: Vec<RawAmount>,
     /// Defaults to the full research cost.
     pub remaining: Option<Vec<toml::Value>>,
 }
@@ -502,6 +586,9 @@ pub struct RawPolicy {
     pub accepts_migrants: bool,
     #[serde(default = "yes")]
     pub market_access: bool,
+    /// May declare total wars.
+    #[serde(default)]
+    pub total_war: bool,
 }
 
 impl Default for RawPolicy {
@@ -509,6 +596,7 @@ impl Default for RawPolicy {
         RawPolicy {
             accepts_migrants: true,
             market_access: true,
+            total_war: false,
         }
     }
 }
@@ -517,9 +605,16 @@ impl Default for RawPolicy {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RawDiplomacy {
     #[serde(default)]
-    pub wars: Vec<RawWar>,
+    pub humiliated: u64,
+    /// Claimed systems.
     #[serde(default)]
-    pub truces: Vec<RawTruce>,
+    pub claims: Vec<String>,
+    #[serde(default)]
+    pub wars: Vec<RawWarSide>,
+    #[serde(default)]
+    pub truces: Vec<String>,
+    #[serde(default)]
+    pub alliances: Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -566,6 +661,7 @@ pub struct RawSystem {
     #[serde(default = "one_u32")]
     pub star_count: u32,
     pub owner: Option<String>,
+    pub occupier: Option<String>,
     #[serde(default)]
     pub linked_systems: Vec<String>,
     pub coords: [f64; 2],
@@ -608,6 +704,7 @@ pub struct RawPlanet {
     pub habitable: bool,
     pub coords: [f64; 2],
     pub owner: Option<String>,
+    pub occupier: Option<String>,
     #[serde(default)]
     pub population: Vec<RawPopulation>,
     /// Accumulated bombardment towards surrender.

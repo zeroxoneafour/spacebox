@@ -8,7 +8,9 @@
 //!   star), then, standing still there, charge every ship's hyperdrive from 0 to 1 (taking
 //!   `hyperjump_days * hyperjump_mult` days per ship). Once all are charged the fleet jumps
 //!   and arrives on the rim of the next system facing where it came from.
-//! * `Bombard`: close on a planet in the current system and fire on it until it surrenders.
+//! * `Bombard`: close on a planet in the current system and fire on it until it surrenders:
+//!   at the given tile's building, or at random buildings if no tile is given (or once that
+//!   building is destroyed).
 //!
 //! A fleet is *in combat* while an enemy fleet (of an empire at war with it) shares its system
 //! and either side is armed. Orders are suspended in combat: the day is split into
@@ -19,10 +21,14 @@
 //! Bombardment results are applied serially afterwards (see [`apply_bombardment`]): buildings
 //! take damage and are eventually destroyed, and the planet surrenders once accumulated siege
 //! damage exceeds its resistance. Barren or unpopulated planets surrender immediately.
+//!
+//! A surrendering planet changes owner if the attacker fights a total war against its owner
+//! (or it was unowned); otherwise the attacker only occupies it. A planet its owner's side
+//! takes back from an occupier is liberated.
 
 use rayon::prelude::*;
 
-use crate::defs::{Ruleset, ShipStats};
+use crate::defs::{Defs, Ruleset, ShipStats};
 use crate::ids::*;
 use crate::sim::events::{Event, EventKind};
 use crate::world::{Empire, Fleet, FleetOrder, Planet, System, World};
@@ -41,10 +47,15 @@ struct SystemOut {
     hits: Vec<Hit>,
     events: Vec<Event>,
     jumps: Vec<FleetId>,
+    /// Fleet slots of destroyed ships, per owner.
+    lost: Vec<(EmpireId, f64)>,
 }
 
 struct Ctx<'a> {
+    defs: &'a Defs,
     rules: &'a Ruleset,
+    /// `hostile[a * n + b]`, see [`World::hostility`].
+    hostile: Vec<bool>,
     empires: &'a [Empire],
     planets: &'a [Planet],
     systems: &'a [System],
@@ -55,7 +66,7 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     fn hostile(&self, a: EmpireId, b: EmpireId) -> bool {
-        a != b && self.empires[a.idx()].at_war_with(b)
+        self.hostile[a.idx() * self.empires.len() + b.idx()]
     }
 }
 
@@ -92,8 +103,8 @@ pub fn departure_point(systems: &[System], from: SystemId, to: SystemId, radius:
 const ARRIVED: f64 = 0.01;
 
 /// Whether `owner` may bombard `planet` while its fleet is in `system`: the planet must be in
-/// that system and belong to an enemy, or be unowned in a system that is unowned or its own
-/// (unowned planets in another empire's system cannot be taken).
+/// that system and be controlled (owned, or occupied) by an enemy, or be unowned in a system
+/// that is unowned or its own (unowned planets in another empire's system cannot be taken).
 pub fn can_bombard(world: &World, owner: EmpireId, system: SystemId, planet: PlanetId) -> bool {
     let Some(p) = world.planets.get(planet.idx()) else {
         return false;
@@ -101,7 +112,7 @@ pub fn can_bombard(world: &World, owner: EmpireId, system: SystemId, planet: Pla
     if p.system != system {
         return false;
     }
-    match p.owner {
+    match p.controller() {
         Some(o) => o != owner && world.at_war(owner, o),
         None => world.system(system).owner.is_none_or(|o| o == owner),
     }
@@ -162,7 +173,9 @@ pub(crate) fn tick(world: &mut World) {
     let mut fleets = std::mem::take(&mut world.fleets);
     fleets.sort_by_key(|f| (f.system, f.id));
     let ctx = Ctx {
+        defs: &defs,
         rules,
+        hostile: world.hostility(),
         empires: &world.empires,
         planets: &world.planets,
         systems: &world.systems,
@@ -178,10 +191,14 @@ pub(crate) fn tick(world: &mut World) {
 
     let mut hits = Vec::new();
     let mut jumps = Vec::new();
+    world.ship_losses.resize(world.empires.len(), 0.0);
     for out in outs {
         world.events.extend(out.events);
         hits.extend(out.hits);
         jumps.extend(out.jumps);
+        for (e, slots) in out.lost {
+            world.ship_losses[e.idx()] += slots;
+        }
     }
 
     // Destroyed fleets disappear; fleets that finished charging jump.
@@ -461,6 +478,8 @@ fn simulate(fleets: &mut [Fleet], ctx: &Ctx) -> SystemOut {
             continue;
         }
         let f = &fleets[i];
+        let slots: u32 = lost.iter().map(|s| ctx.defs.ship(*s).fleet_size).sum();
+        out.lost.push((f.owner, slots as f64));
         let (kind, msg) = if f.ships.is_empty() {
             (
                 EventKind::FleetDestroyed,
@@ -500,14 +519,15 @@ fn apply_bombardment(world: &mut World, mut hits: Vec<Hit>) {
         }
     }
     let day = world.day;
+    let seed = world.seed;
     let defs = world.defs.clone();
     let rules = defs.ruleset(world.ruleset);
     for h in merged {
         let p = &world.planets[h.planet.idx()];
-        if p.owner == Some(h.attacker) {
+        if p.controller() == Some(h.attacker) {
             continue;
         }
-        if let Some(o) = p.owner
+        if let Some(o) = p.controller()
             && !world.at_war(h.attacker, o)
         {
             continue;
@@ -537,14 +557,26 @@ fn apply_bombardment(world: &mut World, mut hits: Vec<Hit>) {
                 .as_ref()
                 .is_some_and(|b| !defs.building(b.def).blocker)
         };
+        // A given tile while it still has a building; otherwise (or with no tile given) a
+        // random building, picked with a deterministic roll.
         let tile = h
             .tile
             .filter(|t| p.tiles.get(*t).is_some_and(target))
-            .or_else(|| p.tiles.iter().position(target));
+            .or_else(|| {
+                let candidates: Vec<usize> = (0..p.tiles.len())
+                    .filter(|t| target(&p.tiles[*t]))
+                    .collect();
+                let roll =
+                    crate::rng::hash01(seed, &[day, h.planet.0 as u64, h.attacker.0 as u64, 0xB0B]);
+                (!candidates.is_empty()).then(|| {
+                    candidates[(roll * candidates.len() as f64) as usize % candidates.len()]
+                })
+            });
         if let Some(t) = tile {
             let b = p.tiles[t].building.as_mut().unwrap();
             let hp = defs.building(b.def).hp.unwrap_or(rules.building_hp);
             b.damage += h.damage / hp;
+            p.flags.damaged = true;
             if b.damage >= 1.0 {
                 let name = defs.building(b.def).display_name.clone();
                 p.tiles[t].building = None;
@@ -567,13 +599,37 @@ fn apply_bombardment(world: &mut World, mut hits: Vec<Hit>) {
     }
 }
 
-/// Hands a planet to `attacker` and stands down fleets that were bombarding it for them.
-/// Hands a planet to `attacker`. Fleets that were bombarding it stand down, except AI fleets,
-/// which move on to the nearest remaining planet in the system they can take (an enemy's or an
-/// unowned one) so the whole system ends up theirs.
+/// Hands a planet to `attacker`: it takes it over if it was unowned or the attacker fights a
+/// total war against its owner, liberates it if the attacker owns it or fights on its owner's
+/// side, and occupies it otherwise. Fleets that were bombarding it stand down, except AI
+/// fleets, which move on to the nearest remaining planet in the system they can take (an
+/// enemy's or an unowned one) so the whole system ends up theirs.
 fn surrender(world: &mut World, planet: PlanetId, attacker: EmpireId) {
-    let old = world.planets[planet.idx()].owner;
-    world.set_planet_owner(planet, Some(attacker));
+    let p = &world.planets[planet.idx()];
+    let (owner, old) = (p.owner, p.controller());
+    let populated = p.pop() > 0;
+    if let Some(o) = old {
+        world.planet_losses.push((o, populated));
+    }
+    let liberated = match owner {
+        None => {
+            world.set_planet_owner(planet, Some(attacker));
+            false
+        }
+        // Taken back by its owner, or freed by someone the owner is not at war with.
+        Some(o) if o == attacker || !world.at_war(attacker, o) => {
+            world.set_planet_occupier(planet, None);
+            true
+        }
+        Some(o) => {
+            if world.goal_against(attacker, o) == Some(crate::world::WarGoal::Total) {
+                world.set_planet_owner(planet, Some(attacker));
+            } else {
+                world.set_planet_occupier(planet, Some(attacker));
+            }
+            false
+        }
+    };
     let ai = world.empires[attacker.idx()].ai.is_some();
     let sys = world.planets[planet.idx()].system;
     // Fleets bombarding the planet move on to the rest of their orders. AI fleets first take
@@ -621,6 +677,10 @@ fn surrender(world: &mut World, planet: PlanetId, attacker: EmpireId) {
     let p = &world.planets[planet.idx()];
     let who = world.empires[attacker.idx()].display_name.clone();
     let msg = match old {
+        Some(_) if liberated => format!("{} is liberated by {who}", p.display_name),
+        Some(_) if p.occupier == Some(attacker) => {
+            format!("{} surrenders to {who}, who occupies it", p.display_name)
+        }
         Some(o) => format!(
             "{} surrenders to {who}, ending {}'s rule",
             p.display_name,
@@ -634,6 +694,8 @@ fn surrender(world: &mut World, planet: PlanetId, attacker: EmpireId) {
             .planet(planet),
     );
     if let Some(o) = old
+        && !liberated
+        && Some(o) == owner
         && !world.planets.iter().any(|p| p.owner == Some(o))
     {
         let msg = format!(

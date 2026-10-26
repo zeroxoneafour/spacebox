@@ -4,10 +4,13 @@
 //! catalog of definitions and planet geometry, which only changes when a world is loaded.
 //! All ids are array indices into the corresponding lists.
 
+use std::sync::Arc;
+
+use rayon::prelude::*;
 use serde_json::{Value, json};
 use spacebox_core::defs::{Cost, Defs, Modifier, ResourceAmount, TargetedModifier, Targets, Yield};
 use spacebox_core::geometry::PlanetSize;
-use spacebox_core::world::{FleetOrder, ProjectKind, Tile, World};
+use spacebox_core::world::{FleetOrder, ProjectKind, Side, Tile, World};
 use spacebox_core::{Event, PlanetId};
 
 /// Rounds for transport: keeps diffs from churning on float noise.
@@ -95,177 +98,257 @@ fn tile(t: &Tile) -> Value {
     Value::Object(o)
 }
 
-pub fn state(w: &World) -> Value {
+/// One version of the game state: small top-level fields, plus every system, planet, empire
+/// and fleet serialized on its own. Entities unchanged since the previous version share its
+/// text, so keeping several versions costs little more than one.
+pub struct Snapshot {
+    pub top: Value,
+    pub lists: [(&'static str, Vec<Arc<str>>); 4],
+}
+
+impl Snapshot {
+    /// Whether nothing changed (cheap: unchanged entities share their text).
+    pub fn same(&self, other: &Snapshot) -> bool {
+        self.top == other.top
+            && self.lists.iter().zip(&other.lists).all(|((_, a), (_, b))| {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y) || x == y)
+            })
+    }
+
+    /// The full state as JSON text.
+    pub fn to_json(&self) -> String {
+        let mut out = self.top.to_string();
+        out.pop(); // the closing brace
+        for (name, items) in &self.lists {
+            let len: usize = items.iter().map(|i| i.len() + 1).sum();
+            out.reserve(len + name.len() + 6);
+            out.push_str(&format!(",\"{name}\":["));
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(item);
+            }
+            out.push(']');
+        }
+        out.push('}');
+        out
+    }
+}
+
+/// Serializes each item (in parallel), reusing the previous version's text where unchanged.
+fn list<T: Sync>(
+    items: &[T],
+    prev: Option<&[Arc<str>]>,
+    f: impl Fn(usize, &T) -> Value + Sync,
+) -> Vec<Arc<str>> {
+    items
+        .par_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let text = f(i, item).to_string();
+            match prev.and_then(|p| p.get(i)) {
+                Some(old) if **old == *text => old.clone(),
+                _ => Arc::from(text),
+            }
+        })
+        .collect()
+}
+
+pub fn state(w: &World, prev: Option<&Snapshot>) -> Snapshot {
+    let prev_list = |k: usize| prev.map(|p| p.lists[k].1.as_slice());
     let n_res = w.defs.resource_count();
     let rules = w.rules();
-    let systems: Vec<Value> = w
-        .systems
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            json!({
-                "id": i,
-                "name": s.name,
-                "display_name": s.display_name,
-                "star_type": s.star_type,
-                "star_count": s.star_count,
-                "owner": s.owner.map(|o| o.0),
-                "links": s.links.iter().map(|l| l.0).collect::<Vec<_>>(),
-                "coordinates": s.coordinates,
-                "planets": s.planet_ids().map(|p| p.0).collect::<Vec<_>>(),
-            })
+    let systems = list(&w.systems, prev_list(0), |i, s| {
+        json!({
+            "id": i,
+            "name": s.name,
+            "display_name": s.display_name,
+            "star_type": s.star_type,
+            "star_count": s.star_count,
+            "owner": s.owner.map(|o| o.0),
+            "occupier": s.occupier.map(|o| o.0),
+            "links": s.links.iter().map(|l| l.0).collect::<Vec<_>>(),
+            "coordinates": s.coordinates,
+            "planets": s.planet_ids().map(|p| p.0).collect::<Vec<_>>(),
         })
-        .collect();
-    let planets: Vec<Value> = w
-        .planets
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let s = &p.stats;
-            let net: Vec<f64> = (0..n_res)
-                .map(|res| p.flows.supply[res] - p.flows.demand[res])
-                .collect();
-            json!({
-                "id": i,
-                "name": p.name,
-                "display_name": p.display_name,
-                "system": p.system.0,
-                "size": p.size.as_str(),
-                "habitable": p.habitable,
-                "coordinates": p.coordinates,
-                "owner": p.owner.map(|o| o.0),
-                "siege": r(p.siege),
-                "siege_threshold": r(rules.surrender_threshold(p.pop(), s.stability)),
-                "pop": p.pop(),
-                "population": p.population.iter().map(|(sp, n)| json!([sp.0, n])).collect::<Vec<_>>(),
-                "terraform": p.terraform.as_ref().map(|t| json!({ "paid": amounts(&t.paid), "remaining": cost(&t.remaining) })),
-                "stats": {
-                    "housing": r(s.housing),
-                    "amenities": r(s.amenities),
-                    "amenities_needed": r(s.amenities_needed),
-                    "stability": r(s.stability),
-                    "jobs": s.jobs,
-                    "employed": s.employed,
-                    "unemployed": s.unemployed,
-                    "homeless": s.homeless,
-                    "free_jobs": s.free_jobs,
-                },
-                "net": vec_r(&net),
-                "tiles": p.tiles.iter().map(tile).collect::<Vec<_>>(),
-            })
+    });
+    let planets = list(&w.planets, prev_list(1), |i, p| {
+        let s = &p.stats;
+        let net: Vec<f64> = (0..n_res).map(|res| p.flows.net(res)).collect();
+        json!({
+            "id": i,
+            "name": p.name,
+            "display_name": p.display_name,
+            "system": p.system.0,
+            "size": p.size.as_str(),
+            "habitable": p.habitable,
+            "coordinates": p.coordinates,
+            "owner": p.owner.map(|o| o.0),
+            "occupier": p.occupier.map(|o| o.0),
+            "siege": r(p.siege),
+            "siege_threshold": r(rules.surrender_threshold(p.pop(), s.stability)),
+            "pop": p.pop(),
+            "population": p.population.iter().map(|(sp, n)| json!([sp.0, n])).collect::<Vec<_>>(),
+            "terraform": p.terraform.as_ref().map(|t| json!({ "paid": amounts(&t.paid), "remaining": cost(&t.remaining) })),
+            "stats": {
+                "housing": r(s.housing),
+                "amenities": r(s.amenities),
+                "amenities_needed": r(s.amenities_needed),
+                "stability": r(s.stability),
+                "jobs": s.jobs,
+                "employed": s.employed,
+                "unemployed": s.unemployed,
+                "homeless": s.homeless,
+                "free_jobs": s.free_jobs,
+            },
+            "net": vec_r(&net),
+            "tiles": p.tiles.iter().map(tile).collect::<Vec<_>>(),
         })
-        .collect();
-    let empires: Vec<Value> = w
-        .empires
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            // Counted here rather than taken from `e.stats`, which is only filled in by a tick.
-            let owned_systems = w.systems.iter().filter(|s| s.owner.map(|o| o.idx()) == Some(i)).count();
-            let mine = || w.planets.iter().filter(|p| p.owner.map(|o| o.idx()) == Some(i));
-            let planets = mine().count();
-            let pop: u64 = mine().map(|p| p.pop()).sum();
-            json!({
-                "id": i,
-                "name": e.name,
-                "display_name": e.display_name,
-                "color": e.color,
-                "dominant_species": e.dominant_species.map(|s| s.0),
-                "ai": e.ai.map(|a| json!({
-                    "militant": a.militant,
-                    "expansionist": a.expansionist,
-                    "scientific": a.scientific,
-                })),
-                "accepts_migrants": e.accepts_migrants,
-                "market_access": e.market_access,
-                "capital": e.capital.map(|c| c.0),
-                "storage": vec_r(&e.storage),
-                "income": vec_r(&e.income),
-                "wasted": vec_r(&e.wasted),
-                "trade": vec_r(&e.trade),
-                "techs": e.techs.iter().enumerate().filter(|(_, k)| **k).map(|(t, _)| t).collect::<Vec<_>>(),
-                "research": e.research.iter().map(|p| json!({
-                    "tech": p.tech.0,
-                    "remaining": cost(&p.remaining),
-                })).collect::<Vec<_>>(),
-                "shipbuilding": e.shipbuilding.iter().map(|p| json!({
-                    "ship": p.ship.0,
-                    "planet": p.planet.0,
-                    "paid": amounts(&p.paid),
-                    "remaining": cost(&p.remaining),
-                })).collect::<Vec<_>>(),
-                "crises": e.crises.iter().map(|c| json!({
-                    "resource": c.resource.0,
-                    "since_day": c.since_day,
-                    "severity": r(c.severity),
-                })).collect::<Vec<_>>(),
-                "at_war": e.wars.iter().map(|w| w.enemy.0).collect::<Vec<_>>(),
-                "wars": e.wars.iter().map(|w| json!({ "enemy": w.enemy.0, "since_day": w.since_day })).collect::<Vec<_>>(),
-                "truces": e.truces.iter().filter(|t| t.until_day > w.day).map(|t| json!({ "with": t.with.0, "until_day": t.until_day })).collect::<Vec<_>>(),
-                "fleet_upkeep": vec_r(&e.fleet_upkeep),
-                "max_fleet_size": e.max_fleet_size(rules),
-                // Effective ship stats with this empire's technologies, per design.
-                "ship_stats": e.ship_stats.iter().map(|s| json!({
-                    "hull": r(s.max_hull),
-                    "shield": r(s.max_shield),
-                    "speed": r(s.speed),
-                    "range": r(s.max_range),
-                })).collect::<Vec<_>>(),
-                "stats": {
-                    "pop": pop,
-                    "planets": planets,
-                    "systems": owned_systems,
-                },
-            })
+    });
+    let empires = list(&w.empires, prev_list(2), |i, e| {
+        // Counted here rather than taken from `e.stats`, which is only filled in by a tick.
+        let id = spacebox_core::EmpireId::from_idx(i);
+        let owned_systems = w.empire_systems(id).len();
+        let planets = w.empire_planets(id).len();
+        let pop: u64 = w
+            .empire_planets(id)
+            .iter()
+            .map(|p| w.planet(*p).pop())
+            .sum();
+        json!({
+            "id": i,
+            "name": e.name,
+            "display_name": e.display_name,
+            "color": e.color,
+            "dominant_species": e.dominant_species.map(|s| s.0),
+            "ai": e.ai.map(|a| json!({
+                "militant": a.militant,
+                "expansionist": a.expansionist,
+                "scientific": a.scientific,
+            })),
+            "accepts_migrants": e.accepts_migrants,
+            "market_access": e.market_access,
+            "capital": e.capital.map(|c| c.0),
+            "storage": vec_r(&e.storage),
+            "income": vec_r(&e.income),
+            "wasted": vec_r(&e.wasted),
+            "trade": vec_r(&e.trade),
+            "techs": e.techs.iter().enumerate().filter(|(_, k)| **k).map(|(t, _)| t).collect::<Vec<_>>(),
+            "research": e.research.iter().map(|p| json!({
+                "tech": p.tech.0,
+                "paid": amounts(&p.paid),
+                "remaining": cost(&p.remaining),
+            })).collect::<Vec<_>>(),
+            "shipbuilding": e.shipbuilding.iter().map(|p| json!({
+                "ship": p.ship.0,
+                "planet": p.planet.0,
+                "paid": amounts(&p.paid),
+                "remaining": cost(&p.remaining),
+            })).collect::<Vec<_>>(),
+            "crises": e.crises.iter().map(|c| json!({
+                "resource": c.resource.0,
+                "since_day": c.since_day,
+                "severity": r(c.severity),
+            })).collect::<Vec<_>>(),
+            "at_war": (0..w.empires.len())
+                .filter(|o| w.at_war(id, spacebox_core::EmpireId::from_idx(*o)))
+                .collect::<Vec<_>>(),
+            "total_war": e.total_war,
+            "humiliated": e.humiliated,
+            "claims": e.claims.iter().map(|c| c.0).collect::<Vec<_>>(),
+            "wars": e.wars.iter().map(|(war, side)| json!({ "war": war.0, "side": side.as_str() })).collect::<Vec<_>>(),
+            "truces": e.truces.iter().filter(|t| w.truces[t.idx()].valid_until > w.day).map(|t| t.0).collect::<Vec<_>>(),
+            "alliances": e.alliances.iter().map(|a| a.0).collect::<Vec<_>>(),
+            "fleet_upkeep": vec_r(&e.fleet_upkeep),
+            "max_fleet_size": e.max_fleet_size(rules),
+            // Effective ship stats with this empire's technologies, per design.
+            "ship_stats": e.ship_stats.iter().map(|s| json!({
+                "hull": r(s.max_hull),
+                "shield": r(s.max_shield),
+                "speed": r(s.speed),
+                "range": r(s.max_range),
+            })).collect::<Vec<_>>(),
+            "stats": {
+                "pop": pop,
+                "planets": planets,
+                "systems": owned_systems,
+            },
         })
-        .collect();
-    let fleets: Vec<Value> = w
-        .fleets
-        .iter()
-        .map(|f| {
-            let orders: Vec<Value> = f
-                .orders
-                .iter()
-                .map(|o| match o {
-                    FleetOrder::Move { coordinates: c } => {
-                        json!({ "order": "move", "coordinates": [r(c[0]), r(c[1])] })
-                    }
-                    FleetOrder::Jump { system } => json!({ "order": "jump", "system": system.0 }),
-                    FleetOrder::Bombard { planet, tile } => {
-                        json!({ "order": "bombard", "planet": planet.0, "tile": tile })
-                    }
+    });
+    let fleets = list(&w.fleets, prev_list(3), |_, f| {
+        let orders: Vec<Value> = f
+            .orders
+            .iter()
+            .map(|o| match o {
+                FleetOrder::Move { coordinates: c } => {
+                    json!({ "order": "move", "coordinates": [r(c[0]), r(c[1])] })
+                }
+                FleetOrder::Jump { system } => json!({ "order": "jump", "system": system.0 }),
+                FleetOrder::Bombard { planet, tile } => {
+                    json!({ "order": "bombard", "planet": planet.0, "tile": tile })
+                }
+            })
+            .collect();
+        json!({
+            "id": f.id.0,
+            "name": f.name,
+            "display_name": f.display_name,
+            "owner": f.owner.0,
+            "system": f.system.0,
+            "coordinates": [r(f.coordinates[0]), r(f.coordinates[1])],
+            "orders": orders,
+            "destination": f.destination().0,
+            "jump_progress": r(f.jump_progress()),
+            "in_combat": f.in_combat,
+            "size": f.size(&w.defs),
+            // [design, hull, shield, x, y, jump charge] with absolute system coordinates.
+            "ships": f.ships.iter().enumerate().map(|(i, s)| {
+                let c = f.ship_coordinates(i);
+                json!([s.def.0, r(s.hull), r(s.shield), r(c[0]), r(c[1]), r(s.jump_charge)])
+            }).collect::<Vec<_>>(),
+        })
+    });
+    Snapshot {
+        top: json!({
+            "day": w.day,
+            "seed": w.seed,
+            "market": w.market.iter().map(|m| json!({ "price": r(m.price), "volume": r(m.volume) })).collect::<Vec<_>>(),
+            "queued_commands": w.pending_commands().len(),
+            "wars": w.wars.iter().enumerate().map(|(i, war)| {
+                let id = spacebox_core::WarId::from_idx(i);
+                json!({
+                    "id": i,
+                    "name": war.name,
+                    "display_name": war.display_name,
+                    "goals": war.goals.map(|g| g.map(|g| g.as_str())),
+                    "starting_day": war.starting_day,
+                    "exhaustion": war.exhaustion.map(r),
+                    "victory": war.victory.map(|v| v.as_str()),
+                    "proposals": war.proposals.map(|p| p.map(|p| p.as_str())),
+                    "offense": w.members(id, Side::Offense).iter().map(|e| e.0).collect::<Vec<_>>(),
+                    "defense": w.members(id, Side::Defense).iter().map(|e| e.0).collect::<Vec<_>>(),
                 })
-                .collect();
-            json!({
-                "id": f.id.0,
-                "name": f.name,
-                "display_name": f.display_name,
-                "owner": f.owner.0,
-                "system": f.system.0,
-                "coordinates": [r(f.coordinates[0]), r(f.coordinates[1])],
-                "orders": orders,
-                "destination": f.destination().0,
-                "jump_progress": r(f.jump_progress()),
-                "in_combat": f.in_combat,
-                "size": f.size(&w.defs),
-                // [design, hull, shield, x, y, jump charge] with absolute system coordinates.
-                "ships": f.ships.iter().enumerate().map(|(i, s)| {
-                    let c = f.ship_coordinates(i);
-                    json!([s.def.0, r(s.hull), r(s.shield), r(c[0]), r(c[1]), r(s.jump_charge)])
-                }).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    json!({
-        "day": w.day,
-        "seed": w.seed,
-        "systems": systems,
-        "planets": planets,
-        "empires": empires,
-        "fleets": fleets,
-        "market": w.market.iter().map(|m| json!({ "price": r(m.price), "volume": r(m.volume) })).collect::<Vec<_>>(),
-        "queued_commands": w.pending_commands().len(),
-    })
+            }).collect::<Vec<_>>(),
+            "alliances": w.alliances.iter().enumerate().map(|(i, a)| json!({
+                "id": i,
+                "name": a.name,
+                "display_name": a.display_name,
+            })).collect::<Vec<_>>(),
+            "truces": w.truces.iter().enumerate().filter(|(_, t)| t.valid_until > w.day).map(|(i, t)| json!({
+                "id": i,
+                "name": t.name,
+                "display_name": t.display_name,
+                "valid_until": t.valid_until,
+            })).collect::<Vec<_>>(),
+        }),
+        lists: [
+            ("systems", systems),
+            ("planets", planets),
+            ("empires", empires),
+            ("fleets", fleets),
+        ],
+    }
 }
 
 /// A tag as `file-stem.name` (reserved tags: just the name).

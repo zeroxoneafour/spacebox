@@ -10,7 +10,7 @@ use crate::defs::{BuildingDef, ResourceAmount};
 use crate::ids::*;
 use crate::sim::commands::{Command, can_afford};
 use crate::sim::economy::next_research;
-use crate::world::{AiPersonality, FleetOrder, ProjectKind, World};
+use crate::world::{AiPersonality, FleetOrder, ProjectKind, Side, WarGoal, WarOutcome, World};
 
 /// Needs, most pressing first.
 struct Needs {
@@ -384,9 +384,10 @@ pub(crate) fn decide(world: &World, empire: EmpireId) -> Vec<Command> {
     }
 
     clear_blocker(world, &planets, &mut budget, &mut cmds);
+    // Diplomacy spends influence before expansion does, so wars and claims get funded.
+    let declared = diplomacy(world, empire, traits, &mut budget, &mut cmds);
     expand(world, empire, traits, &mut budget, &mut cmds);
     choose_research(world, empire, traits, &mut cmds);
-    let declared = diplomacy(world, empire, traits, &mut cmds);
     military(
         world,
         empire,
@@ -546,12 +547,13 @@ fn expand(
     let max_jumps = 1 + (traits.expansionist * 2.0).round() as u32;
     let max_sites = 1 + (traits.expansionist * 2.0).floor() as usize;
     let reserve = 2.0 - traits.expansionist;
-    let dist = world.jumps_from_borders(empire);
+    let (dist, reached) = world.jumps_within(empire, max_jumps + 1);
     let mut pending = 0;
     let mut candidates: Vec<(i64, SystemId)> = Vec::new();
-    for (i, s) in world.systems.iter().enumerate() {
+    for &sid in &reached {
+        let (i, s) = (sid.idx(), world.system(sid));
         let d = dist[i];
-        if s.owner.is_some() || d == 0 || d > max_jumps + 1 || s.planet_range().is_empty() {
+        if s.owner.is_some() || d == 0 || s.planet_range().is_empty() {
             continue;
         }
         let mut staked = false;
@@ -577,6 +579,20 @@ fn expand(
         return;
     }
     candidates.sort_by_key(|(score, s)| (std::cmp::Reverse(*score), *s));
+    // Buildings the empire could put anywhere, cheapest first.
+    let e = world.empire(empire);
+    let mut constructible: Vec<BuildingId> = (0..world.defs.buildings.len())
+        .map(BuildingId::from_idx)
+        .filter(|b| {
+            let d = world.defs.building(*b);
+            !d.blocker && (d.land || d.water) && d.requires_tech.iter().all(|t| e.knows(*t))
+        })
+        .collect();
+    constructible.sort_by(|a, b| {
+        let cost =
+            |x: &BuildingId| cost_value(world, &world.defs.building(*x).build_cost.resources);
+        cost(a).total_cmp(&cost(b)).then(a.cmp(b))
+    });
     for (_, sys) in candidates {
         let mut planets: Vec<PlanetId> = world.system(sys).planet_ids().collect();
         planets.sort_by_key(|p| {
@@ -586,24 +602,20 @@ fn expand(
             )
         });
         for pid in planets {
-            let best = world
-                .planet(pid)
-                .free_tiles()
-                .flat_map(|tile| {
-                    (0..world.defs.buildings.len()).map(move |b| (tile, BuildingId::from_idx(b)))
-                })
-                .filter_map(|(tile, b)| {
-                    world
-                        .can_build_with(empire, pid, tile, b, budget, Some(&dist))
-                        .ok()
-                        .map(|plan| (tile, b, plan))
-                })
-                .min_by(|a, b| {
-                    cost_value(world, &a.2.cost.resources)
-                        .total_cmp(&cost_value(world, &b.2.cost.resources))
-                        .then(a.0.cmp(&b.0))
-                        .then(a.1.cmp(&b.1))
-                });
+            let p = world.planet(pid);
+            // Cheapest building first (the expansion surcharge is the same for all of them),
+            // on the first free tile whose terrain suits it.
+            let best = constructible.iter().find_map(|&b| {
+                let d = world.defs.building(b);
+                if !p.habitable && !d.barren {
+                    return None;
+                }
+                let tile = p.free_tiles().find(|t| d.fits_terrain(p.tiles[*t].water))?;
+                world
+                    .can_build_with(empire, pid, tile, b, budget, Some(&dist))
+                    .ok()
+                    .map(|plan| (tile, b, plan))
+            });
             if let Some((tile, b, plan)) = best {
                 for a in &plan.cost.resources {
                     budget[a.resource.idx()] -= a.count;
@@ -674,6 +686,7 @@ fn choose_research(
         };
         plan.research.push(crate::world::ResearchProject {
             tech,
+            paid: Vec::new(),
             remaining: defs.research_cost(tech),
         });
         cmds.push(Command::Research { empire, tech });
@@ -691,65 +704,202 @@ fn roll(world: &World, salt: &[u64]) -> f64 {
 }
 
 /// Current fighting strength of an empire's fleets (damaged ships count for less).
-fn fleet_power(world: &World, empire: EmpireId) -> f64 {
-    world
-        .fleets
-        .iter()
-        .filter(|f| f.owner == empire)
-        .flat_map(|f| &f.ships)
-        .map(|s| {
-            let max = world.ship_stats(empire, s.def).max_hull;
-            ship_power(world, empire, s.def) * (0.3 + 0.7 * s.hull / max)
-        })
-        .sum()
+/// Fighting strength of every empire's fleets (one pass over all fleets).
+fn fleet_powers(world: &World) -> Vec<f64> {
+    let mut power = vec![0.0; world.empires.len()];
+    for f in &world.fleets {
+        for s in &f.ships {
+            let max = world.ship_stats(f.owner, s.def).max_hull;
+            power[f.owner.idx()] += ship_power(world, f.owner, s.def) * (0.3 + 0.7 * s.hull / max);
+        }
+    }
+    power
 }
 
-/// War and peace. Militant empires declare war on reachable neighbours they believe they can
-/// beat, and fight longer before accepting peace. Every empire sues for peace when it is
-/// clearly losing, once its enemy is gone, or when the war has dragged on past its patience.
+/// War and peace.
+///
+/// The total-war policy follows militancy. Militant empires claim neighbouring systems and
+/// declare war on reachable neighbours they believe they can beat: a claim war if they hold
+/// claims on them, a total war if their policy allows it and they are very militant, and a
+/// humiliation war otherwise. Defenders pick their goal the same way. A side forces its
+/// victory once the enemy is exhausted, offers a status quo when losing or weary (sooner
+/// for peaceful empires), concedes when exhausted, and accepts offers at least that good.
 fn diplomacy(
     world: &World,
     empire: EmpireId,
     traits: AiPersonality,
+    budget: &mut [f64],
     cmds: &mut Vec<Command>,
 ) -> Option<EmpireId> {
     let e = world.empire(empire);
     let day = world.day;
-    let mine = fleet_power(world, empire);
-    for w in &e.wars {
-        let theirs = fleet_power(world, w.enemy);
-        let days = day.saturating_sub(w.since_day) as f64;
-        let enemy_gone = world.empire_planets(w.enemy).is_empty();
-        let losing = days > 120.0 && mine < theirs * 0.6;
-        let weary = days > 360.0 + 1440.0 * traits.militant;
-        if enemy_gone || losing || weary {
-            cmds.push(Command::MakePeace {
+    let rules = world.rules();
+    let power = fleet_powers(world);
+    let side_power = |members: &[EmpireId]| members.iter().map(|m| power[m.idx()]).sum::<f64>();
+    let total_war = traits.militant >= 0.75;
+    if e.total_war != total_war {
+        cmds.push(Command::SetPolicy {
+            empire,
+            accepts_migrants: None,
+            market_access: None,
+            total_war: Some(total_war),
+        });
+    }
+    let goal_for = |enemies: &[EmpireId], total_ok: bool| {
+        if e.claims
+            .iter()
+            .any(|c| world.system(*c).owner.is_some_and(|o| enemies.contains(&o)))
+        {
+            WarGoal::Claim
+        } else if total_ok && traits.militant >= 0.85 {
+            WarGoal::Total
+        } else {
+            WarGoal::Humiliate
+        }
+    };
+
+    let mut active = 0;
+    for (war, side) in world.active_wars(empire) {
+        active += 1;
+        let w = world.war(war);
+        let other = side.other();
+        let enemies = world.members(war, other);
+        let ours = side_power(&world.members(war, side));
+        let theirs = side_power(&enemies);
+        if side == Side::Defense && w.goals[side.idx()].is_none() {
+            let total_ok = w.goals[other.idx()] == Some(WarGoal::Total) || total_war;
+            let goal = goal_for(&enemies, total_ok);
+            if world.can_set_war_goal(empire, war, goal).is_ok() {
+                cmds.push(Command::SetWarGoal { empire, war, goal });
+            }
+        }
+        let (mine, theirs_ex) = (w.exhaustion[side.idx()], w.exhaustion[other.idx()]);
+        if theirs_ex >= 1.0 {
+            cmds.push(Command::EnforcePeace {
                 empire,
-                target: w.enemy,
+                war,
+                outcome: WarOutcome::victory(side),
+            });
+            continue;
+        }
+        let days = day.saturating_sub(w.starting_day);
+        let losing = mine > theirs_ex + 0.25 || (days > 120 && ours < theirs * 0.6);
+        let weary = mine > 0.4 + 0.5 * traits.militant;
+        let beaten = mine >= 0.9 && losing;
+        // The best outcome this empire settles for.
+        let acceptable = |o: WarOutcome| match o.winner() {
+            Some(s) if s == side => true,
+            None => losing || weary,
+            Some(_) => beaten,
+        };
+        if let Some(offer) = w.proposals[other.idx()]
+            && acceptable(offer)
+        {
+            cmds.push(Command::AcceptPeace { empire, war });
+            continue;
+        }
+        let want = if beaten {
+            Some(WarOutcome::victory(other))
+        } else if losing || weary {
+            Some(WarOutcome::StatusQuo)
+        } else if theirs_ex > 0.75 {
+            Some(WarOutcome::victory(side))
+        } else {
+            None
+        };
+        if let Some(outcome) = want
+            && w.proposals[side.idx()] != Some(outcome)
+        {
+            cmds.push(Command::ProposePeace {
+                empire,
+                war,
+                outcome,
             });
         }
     }
 
-    let max_wars = if traits.militant > 0.75 { 2 } else { 1 };
-    if traits.militant < 0.05 || e.wars.len() >= max_wars || mine <= 0.0 {
+    let mine = power[empire.idx()];
+    if traits.militant < 0.05 || mine <= 0.0 {
         return None;
     }
+    let influence = rules.expansion_resource;
+    let spend = |budget: &mut [f64], cost: f64| {
+        if let Some(r) = influence {
+            budget[r.idx()] -= cost;
+        }
+    };
+    let can_pay = |budget: &[f64], cost: f64| influence.is_none_or(|r| budget[r.idx()] >= cost);
     // Neighbours: empires holding a system within three jumps of our borders.
-    let dist = world.jumps_from_borders(empire);
+    let (dist, _) = world.jumps_within(empire, 3);
+    let peaceful = |o: EmpireId| {
+        o != empire
+            && !world.at_war(empire, o)
+            && !world.in_truce(empire, o)
+            && !world.allied(empire, o)
+    };
+
+    // Claims on adjacent systems of neighbours, to fight for later.
+    let max_claims = (traits.militant * 4.0).round() as usize;
+    if e.claims.len() < max_claims
+        && roll(world, &[empire.0 as u64, 0xC1A1]) < traits.militant * 0.5
+        && let Some((sys, cost)) = world
+            .systems
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| dist[*i] == 1 && s.owner.is_some_and(peaceful))
+            .filter_map(|(i, _)| {
+                let sid = SystemId::from_idx(i);
+                world.claim_cost(empire, sid).ok().map(|c| (sid, c))
+            })
+            .max_by_key(|(sid, _)| {
+                let pop: u64 = world
+                    .system(*sid)
+                    .planet_ids()
+                    .map(|p| world.planet(p).pop())
+                    .sum();
+                (pop, std::cmp::Reverse(*sid))
+            })
+        && can_pay(budget, cost)
+    {
+        spend(budget, cost);
+        cmds.push(Command::Claim {
+            empire,
+            system: sys,
+        });
+    }
+
+    let max_wars = if traits.militant > 0.75 { 2 } else { 1 };
+    if active >= max_wars {
+        return None;
+    }
     let needed = 1.8 - 1.2 * traits.militant;
     let target = (0..world.empires.len())
         .map(EmpireId::from_idx)
-        .filter(|o| *o != empire && !e.at_war_with(*o) && !e.in_truce(*o, day))
+        .filter(|o| peaceful(*o))
         .filter(|o| !world.empire_planets(*o).is_empty())
         .filter(|o| world.empire_systems(*o).iter().any(|s| dist[s.idx()] <= 3))
-        .map(|o| (o, mine / fleet_power(world, o).max(1.0)))
+        .map(|o| {
+            let [_, def] = world.war_sides(empire, o);
+            (o, mine / side_power(&def).max(1.0))
+        })
         .filter(|(_, ratio)| *ratio >= needed)
         .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)));
     if let Some((target, _)) = target
         && roll(world, &[empire.0 as u64, target.0 as u64]) < 0.25 + 0.5 * traits.militant
     {
-        cmds.push(Command::DeclareWar { empire, target });
-        return Some(target);
+        let [_, def] = world.war_sides(empire, target);
+        // Policy changes take effect with this tick's commands, before the declaration.
+        let goal = goal_for(&def, total_war);
+        let cost = rules.war_cost(goal);
+        if can_pay(budget, cost) {
+            spend(budget, cost);
+            cmds.push(Command::DeclareWar {
+                empire,
+                target,
+                goal,
+            });
+            return Some(target);
+        }
     }
     None
 }
@@ -780,7 +930,7 @@ fn military(
 ) {
     let e = world.empire(empire);
     let hostile = |o: EmpireId| world.at_war(empire, o) || declared == Some(o);
-    let at_war = !e.wars.is_empty() || declared.is_some();
+    let at_war = world.active_wars(empire).next().is_some() || declared.is_some();
     let own_fleets: Vec<&crate::world::Fleet> =
         world.fleets.iter().filter(|f| f.owner == empire).collect();
     let ships: usize =
@@ -959,11 +1109,12 @@ fn military(
         && fleet.max_range(&e.ship_stats) > 0.0
     {
         let dist = world.distances_from([fleet.system]);
-        let target = world
-            .planets
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.owner.is_some_and(hostile))
+        // Only enemy empires' planets are targets.
+        let target = (0..world.empires.len())
+            .map(EmpireId::from_idx)
+            .filter(|o| hostile(*o))
+            .flat_map(|o| world.empire_planets(o).iter().copied())
+            .map(|id| (id.idx(), world.planet(id)))
             .filter(|(_, p)| dist[p.system.idx()] != u32::MAX)
             .min_by_key(|(i, p)| {
                 // Finish off systems where we already hold a planet before moving on, and go
@@ -971,8 +1122,15 @@ fn military(
                 let foothold = world
                     .system(p.system)
                     .planet_ids()
-                    .any(|q| world.planet(q).owner == Some(empire));
-                let populated_bonus = if p.pop() > 0 { 2 } else { 0 };
+                    .any(|q| world.planet(q).controller() == Some(empire));
+                // Liberating our own worlds comes first.
+                let populated_bonus = if p.owner == Some(empire) {
+                    4
+                } else if p.pop() > 0 {
+                    2
+                } else {
+                    0
+                };
                 (
                     dist[p.system.idx()].saturating_sub(populated_bonus),
                     !foothold,

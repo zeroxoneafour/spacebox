@@ -20,6 +20,7 @@ mod raw;
 pub mod rng;
 pub mod save;
 pub mod sim;
+mod split;
 pub mod world;
 
 pub use defs::Defs;

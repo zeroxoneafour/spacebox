@@ -579,8 +579,26 @@ pub struct Ruleset {
     pub siege_decay: f64,
 
     // diplomacy
-    /// Days after a peace treaty during which AI empires will not renew the war.
+    /// Length of the truce that follows a war.
     pub truce_days: u64,
+
+    // war
+    /// Influence (the expansion resource) to declare a war with each goal; setting a goal as
+    /// the defender is free.
+    pub humiliate_cost: f64,
+    pub claim_cost: f64,
+    pub total_cost: f64,
+    /// Days without influence income for the loser of a humiliation war.
+    pub humiliation_days: u64,
+    /// Exhaustion each side gains per day of war.
+    pub daily_exhaustion: f64,
+    /// Exhaustion per unit of fleet strength lost, relative to the side's whole fleet.
+    pub ship_loss_exhaustion: f64,
+    /// Exhaustion per planet occupied or seized by the enemy (populated ones count more).
+    pub planet_loss_exhaustion: f64,
+    pub populated_planet_loss_exhaustion: f64,
+    /// Exhaustion per day per unit of crisis severity (resource shortages) on the side.
+    pub crisis_exhaustion: f64,
 
     // terraforming
     pub terraform_large: Option<TerraformRule>,
@@ -598,6 +616,15 @@ impl Ruleset {
         let cost = self.expansion_base_cost * 2f64.powf(n);
         let days = (self.expansion_base_days * 2f64.powf(n / 2.0)).round() as u32;
         (cost, days)
+    }
+
+    /// Influence to declare a war with `goal`.
+    pub fn war_cost(&self, goal: crate::world::WarGoal) -> f64 {
+        match goal {
+            crate::world::WarGoal::Humiliate => self.humiliate_cost,
+            crate::world::WarGoal::Claim => self.claim_cost,
+            crate::world::WarGoal::Total => self.total_cost,
+        }
     }
 
     /// Surrender threshold of a planet under bombardment.
@@ -654,6 +681,15 @@ impl Ruleset {
             surrender_resistance: 4000.0,
             siege_decay: 0.02,
             truce_days: 360,
+            humiliate_cost: 250.0,
+            claim_cost: 500.0,
+            total_cost: 1000.0,
+            humiliation_days: 360,
+            daily_exhaustion: 0.0005,
+            ship_loss_exhaustion: 0.5,
+            planet_loss_exhaustion: 0.02,
+            populated_planet_loss_exhaustion: 0.08,
+            crisis_exhaustion: 0.002,
             terraform_large: None,
             terraform_small: None,
         }
@@ -863,11 +899,6 @@ impl Defs {
     /// Like [`Defs::targets`], but empty targets match every building (technology effects).
     pub fn targets_or_all(&self, targets: &Targets, id: BuildingId) -> bool {
         (targets.buildings.is_empty() && targets.tags.is_empty()) || self.targets(targets, id)
-    }
-
-    /// Whether `tech` is not yet known but all of its prerequisites are.
-    pub fn tech_available(&self, tech: TechId, known: &[bool]) -> bool {
-        !known[tech.idx()] && self.tech(tech).prerequisites.iter().all(|p| known[p.idx()])
     }
 
     /// A tech's research cost as a project cost.

@@ -74,8 +74,8 @@ Transient resources (`transient = true`: research, shipbuilding) are never store
 - Whatever no project uses is wasted.
 
 Cancelling a project refunds its `paid` resources, except the expansion resource (influence),
-which is never refunded. Research has no `paid` list; its refund is its cost minus what
-remains.
+which is never refunded. Research is usually paid in transient resources only, so its `paid`
+is usually empty and left out of saves (it defaults to `[]`).
 
 Research is a list of technologies. A technology can be added once its prerequisites are known
 *or* in the list; it waits (unfunded) until they are known. Cancelling one also cancels what
@@ -127,17 +127,34 @@ adjacency and technologies are summed before all multipliers are applied.
 **resource**: `base-value` is relative to the currency's value: a resource worth 1 costs
 `1 / currency base-value` currency on the galactic market (before supply and demand).
 
-**planet**: `siege` and `terraform = { paid, remaining }` *(additions)*. Without an `owner`
-a planet is unowned, even in an owned system.
+**planet**: without an `owner` a planet is unowned, even in an owned system.
+
+- `siege` (default 0) is the bombardment a planet has absorbed. Each day it grows by the hull
+  damage of the weapons hitting the planet; it surrenders once `siege >= surrender-resistance
+  × (1 + pops / 500) × (0.5 + stability / 100)`. On a day without bombardment it shrinks by
+  `siege-decay` (a fraction), snapping to 0 below 1, and it resets when the owner changes.
+  Saves leave it out when it is 0.
+- `terraform = { paid, remaining }` is terraforming in progress (absent: none; only on
+  planets with `habitable = false`). It starts with the ruleset's terraforming `cost` and
+  `days` as `remaining`; when nothing remains the planet becomes habitable. Cancelling
+  refunds `paid`.
+
+Bombarding without a `tile` (or once that tile's building is gone) hits random buildings,
+chosen with a deterministic roll.
 
 **empire AI** (`[empire.x.ai]`): `militant`, `expansionist` and `scientific` are each 0–1
 (default 0.5):
 
 - **militant**: fleet size (0.4×–1.6× the baseline), more ships in production, declaring war
-  on a neighbour within three jumps once its fleet outmatches the target's by
+  on a neighbour within three jumps once its fleet outmatches the target's side by
   `1.8 - 1.2 × militant`, one or (above 0.75) two wars at a time, attacking with smaller
-  fleets, fighting longer before war-weariness (360 + 1440 × militant days), and favouring
-  technologies tagged `military`.
+  fleets, and favouring technologies tagged `military`. The `total-war` policy is on from 0.75
+  militancy. A militant empire claims up to `4 × militant` systems next to its borders, and
+  declares a claim war on an empire it has claims on, a total war at 0.85 militancy and up
+  (with the policy), and a humiliation war otherwise; as a defender it picks its goal the same
+  way. It forces victory once the enemy is exhausted, offers a status quo when losing or once
+  its exhaustion passes `0.4 + 0.5 × militant`, concedes when nearly exhausted and losing, and
+  accepts any offer at least as good.
 - **expansionist**: claims systems up to 1–3 jumps out, keeps less influence in reserve
   (`2 - expansionist` × the cost), and runs up to three claims at once.
 - **scientific**: more technologies in research at once, and a lean towards non-military
@@ -167,6 +184,7 @@ Terraforming makes a planet habitable but does not change its terrain.
   owner can claim them) and cancels every rival project there, refunding what they paid
   except influence.
 - A system only changes owner once its owner holds none of its planets.
+- Claiming another empire's system costs the same influence as expanding there.
 - Fleets of empires at war fight whenever they share a system, in `combat-subticks` steps per
   day, before any economy runs. Shields absorb shield damage first, and whatever breaks
   through hits the hull. Ships regenerate shields, and repair in friendly systems, as long as
@@ -175,6 +193,39 @@ Terraforming makes a planet habitable but does not change its terrain.
   `building-disable-damage`), costs the planet amenities, and builds up siege. A planet
   surrenders once siege exceeds `surrender-resistance * (1 + pops/500) * (0.5 +
   stability/100)`. Barren or empty planets surrender immediately.
+- A surrendering planet becomes the attacker's in a total war against its owner (or if it was
+  unowned); otherwise the attacker occupies it, and it produces for the occupier. A system is
+  occupied once every planet its owner holds there is. The owner's side takes occupied planets
+  back the same way, by bombarding them.
+- Declaring war costs influence by goal; the declarer's and the target's allies join their
+  sides, except those allied to both, who stay out. Allies can't declare war on each other,
+  and nobody can declare war on an empire it has a truce with (or on that empire's allies).
+- Exhaustion rises each day of the war, with fleet slots lost (`ship-loss-exhaustion` ×
+  the share of the side's fleet slots lost that day), planets lost (more for populated
+  ones) and resource crises (summed severity, averaged over the side's members). A war ends
+  when one side accepts the other's proposal (or both propose the same outcome), when a side
+  forces the outcome of its choice on an enemy at exhaustion 1, or as soon as one side has no
+  planets left (an empty side loses).
+- At the end of the war, claimed systems a side occupies become its own if it won a claim
+  war, or in a status quo if it fought for claims or total war; all other occupations are
+  lifted. Winners of a humiliation war cut the losers' influence income for
+  `humiliation-days`. Losers drop their claims on the winners. Every participant enters a
+  truce for `truce-days`. Ended wars are kept in the save with their `victory`.
+
+`[ruleset.x.war]` (all optional; defaults shown):
+
+```toml
+[ruleset.x.war]
+humiliate-cost = 250                     # influence to declare each goal
+claim-cost = 500
+total-cost = 1000
+humiliation-days = 360                   # no influence income for the loser of a humiliation war
+daily-exhaustion = 0.0005                # per day of war
+ship-loss-exhaustion = 0.5               # × share of the side's fleet slots lost that day
+planet-loss-exhaustion = 0.02            # per uninhabited planet lost
+populated-planet-loss-exhaustion = 0.08  # per populated planet lost
+crisis-exhaustion = 0.002                # per day, × summed crisis severity (averaged over members)
+```
 
 ## Tile numbering
 

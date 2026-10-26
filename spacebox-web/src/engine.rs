@@ -1,9 +1,10 @@
 //! The server-side engine: the live [`World`] plus the bookkeeping needed for diffing.
 //!
-//! Every time a client asks for state, a JSON snapshot is taken. If it differs from the latest
-//! one it becomes a new *version*. The last few versions are cached so that a client that
-//! reports the version it holds gets only a diff. A new *epoch* starts whenever the world is
-//! replaced (definitions may differ), which forces clients to refetch everything.
+//! Every time a client asks for state, a snapshot is taken (see [`Snapshot`]). If it differs
+//! from the latest one it becomes a new *version*. The last few versions are kept (sharing the
+//! text of unchanged entities) so that a client that reports the version it holds gets only a
+//! diff. A new *epoch* starts whenever the world is replaced (definitions may differ), which
+//! forces clients to refetch everything.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -13,9 +14,10 @@ use serde_json::{Value, json};
 use spacebox_core::World;
 use spacebox_core::rng::Rng;
 
-use crate::{diff, snapshot};
+use crate::diff;
+use crate::snapshot::{self, Snapshot};
 
-const SNAPSHOTS_KEPT: usize = 32;
+const SNAPSHOTS_KEPT: usize = 8;
 const EVENTS_KEPT: usize = 2000;
 
 pub struct Engine {
@@ -24,7 +26,7 @@ pub struct Engine {
     pub rng: Rng,
     pub epoch: u64,
     version: u64,
-    snapshots: VecDeque<(u64, Arc<Value>)>,
+    snapshots: VecDeque<(u64, Arc<Snapshot>)>,
     defs: Arc<Value>,
     events: VecDeque<Value>,
     next_event: u64,
@@ -90,10 +92,11 @@ impl Engine {
     }
 
     /// Takes a snapshot, registering a new version if anything changed.
-    fn snapshot(&mut self) -> (u64, Arc<Value>) {
-        let state = snapshot::state(&self.world);
+    fn snapshot(&mut self) -> (u64, Arc<Snapshot>) {
+        let prev = self.snapshots.back().map(|(_, s)| &**s);
+        let state = snapshot::state(&self.world, prev);
         if let Some((v, last)) = self.snapshots.back()
-            && **last == state
+            && last.same(&state)
         {
             return (*v, last.clone());
         }
@@ -117,21 +120,22 @@ impl Engine {
             .collect()
     }
 
-    /// Full state for a fresh client.
-    pub fn full(&mut self) -> Value {
+    /// Full state for a fresh client, as JSON text.
+    pub fn full(&mut self) -> String {
         self.collect_events();
         let (version, state) = self.snapshot();
-        json!({
-            "epoch": self.epoch,
-            "version": version,
-            "event_seq": self.next_event - 1,
-            "state": *state,
-            "events": self.events_since(None),
-        })
+        response(&[
+            ("epoch", json!(self.epoch).to_string()),
+            ("version", version.to_string()),
+            ("event_seq", (self.next_event - 1).to_string()),
+            ("state", state.to_json()),
+            ("events", Value::from(self.events_since(None)).to_string()),
+        ])
     }
 
-    /// Diff from the client's version to now, or the full state if that version is gone.
-    pub fn sync(&mut self, known: &Known) -> Value {
+    /// Diff from the client's version to now, or the full state if that version is gone, as
+    /// JSON text.
+    pub fn sync(&mut self, known: &Known) -> String {
         self.collect_events();
         let (version, state) = self.snapshot();
         let base = known
@@ -143,24 +147,28 @@ impl Engine {
                     .find(|(sv, _)| *sv == v)
                     .map(|(_, s)| s.clone())
             });
-        let events = self.events_since(known.since_event);
-        let event_seq = self.next_event - 1;
+        let events = Value::from(self.events_since(known.since_event)).to_string();
+        let event_seq = (self.next_event - 1).to_string();
+        let epoch = self.epoch.to_string();
         match base {
-            Some(base) => json!({
-                "epoch": self.epoch,
-                "version": version,
-                "base": known.since,
-                "ops": diff::diff(&base, &state),
-                "events": events,
-                "event_seq": event_seq,
-            }),
-            None => json!({
-                "epoch": self.epoch,
-                "version": version,
-                "state": *state,
-                "events": events,
-                "event_seq": event_seq,
-            }),
+            Some(base) => response(&[
+                ("epoch", epoch),
+                ("version", version.to_string()),
+                ("base", json!(known.since).to_string()),
+                (
+                    "ops",
+                    Value::from(diff::diff_snapshots(&base, &state)).to_string(),
+                ),
+                ("events", events),
+                ("event_seq", event_seq),
+            ]),
+            None => response(&[
+                ("epoch", epoch),
+                ("version", version.to_string()),
+                ("state", state.to_json()),
+                ("events", events),
+                ("event_seq", event_seq),
+            ]),
         }
     }
 
@@ -183,4 +191,17 @@ impl Engine {
             .map(|s| s.display_name.clone())
             .collect()
     }
+}
+
+/// A JSON object from already-serialized values.
+fn response(fields: &[(&str, String)]) -> String {
+    let mut out = String::from("{");
+    for (i, (k, v)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("\"{k}\":{v}"));
+    }
+    out.push('}');
+    out
 }

@@ -79,15 +79,26 @@ fn condition(inst: &BuildingInstance, rules: &Ruleset) -> f64 {
 }
 
 pub(crate) fn tick(p: &mut Planet, pid: PlanetId, ctx: &PlanetCtx) {
+    let owner_id = ctx.owner.map(|(id, _)| id);
+    let key = (owner_id, ctx.owner.map_or(0, |(_, e)| e.modifier_version));
+    // Most planets in a large galaxy are empty, unowned rocks: skip them while nothing has
+    // changed since a tick that found nothing to do.
+    if p.flags.idle
+        && !p.dirty
+        && p.cache.key == key
+        && p.population.is_empty()
+        && p.terraform.is_none()
+        && !p.flags.bombarded
+    {
+        return;
+    }
     p.events.clear();
     p.flows.clear();
     p.emigrants = 0;
     p.vacancy = None;
-    let owner_id = ctx.owner.map(|(id, _)| id);
 
     advance_projects(p, pid, ctx);
 
-    let key = (owner_id, ctx.owner.map_or(0, |(_, e)| e.modifier_version));
     if p.dirty || !p.cache.valid || p.cache.key != key {
         rebuild_profiles(p, ctx);
         p.cache.key = key;
@@ -193,7 +204,7 @@ pub(crate) fn tick(p: &mut Planet, pid: PlanetId, ctx: &PlanetCtx) {
     let output_mult = (1.0 + (stability - 50.0) * rules.stability_output_factor).max(0.0);
 
     // Production and consumption.
-    let flows = &mut p.flows;
+    let (supply, demand, demand_full) = p.flows.parts_mut();
     for prof in &p.cache.profiles {
         let inst = p.tiles[prof.tile as usize].building.as_ref().unwrap();
         let wf = prof.workforce(inst);
@@ -203,25 +214,25 @@ pub(crate) fn tick(p: &mut Planet, pid: PlanetId, ctx: &PlanetCtx) {
             .iter()
             .fold(1.0f64, |m, r| m.min(sat[r.idx()]));
         for &(r, c) in &prof.upkeep {
-            flows.demand_full[r.idx()] += c;
-            flows.demand[r.idx()] += c * eff;
+            demand_full[r.idx()] += c;
+            demand[r.idx()] += c * eff;
         }
         for &(r, c) in &prof.inputs {
-            flows.demand_full[r.idx()] += c * wf;
-            flows.demand[r.idx()] += c * wf * eff;
+            demand_full[r.idx()] += c * wf;
+            demand[r.idx()] += c * wf * eff;
         }
         for &(r, c) in &prof.outputs {
-            flows.supply[r.idx()] += c * wf * eff * cond * output_mult;
+            supply[r.idx()] += c * wf * eff * cond * output_mult;
         }
         for &(r, c) in &prof.passive {
-            flows.supply[r.idx()] += c * eff * cond * output_mult;
+            supply[r.idx()] += c * eff * cond * output_mult;
         }
     }
     for &(s, n) in &p.population {
         for a in &defs.species_def(s).upkeep {
             let need = a.count * n as f64;
-            flows.demand_full[a.resource.idx()] += need;
-            flows.demand[a.resource.idx()] += need * sat[a.resource.idx()];
+            demand_full[a.resource.idx()] += need;
+            demand[a.resource.idx()] += need * sat[a.resource.idx()];
         }
     }
 
@@ -235,10 +246,15 @@ pub(crate) fn tick(p: &mut Planet, pid: PlanetId, ctx: &PlanetCtx) {
         if p.siege < 1.0 {
             p.siege = 0.0;
         }
-        for t in &mut p.tiles {
-            if let Some(b) = t.building.as_mut().filter(|b| b.damage > 0.0) {
-                b.damage = (b.damage - rules.building_repair_rate).max(0.0);
+        if p.flags.damaged {
+            let mut any = false;
+            for t in &mut p.tiles {
+                if let Some(b) = t.building.as_mut().filter(|b| b.damage > 0.0) {
+                    b.damage = (b.damage - rules.building_repair_rate).max(0.0);
+                    any |= b.damage > 0.0;
+                }
             }
+            p.flags.damaged = any;
         }
     }
 
@@ -294,6 +310,13 @@ pub(crate) fn tick(p: &mut Planet, pid: PlanetId, ctx: &PlanetCtx) {
     p.stats.unemployed = unemployed;
     p.stats.homeless = homeless;
     p.stats.free_jobs = free_jobs;
+    p.flags.idle = p.cache.profiles.is_empty()
+        && p.population.is_empty()
+        && !p.constructing
+        && p.terraform.is_none()
+        && p.siege == 0.0
+        && !p.flags.damaged
+        && p.events.is_empty();
 }
 
 /// Births and starvation per species. Fractional amounts are rounded at random (with a
@@ -393,7 +416,7 @@ fn advance_projects(p: &mut Planet, pid: PlanetId, ctx: &PlanetCtx) {
                     let Some(b) = &mut tile.building else {
                         continue;
                     };
-                    b.upgrades.push(upgrade);
+                    b.add_upgrade(upgrade);
                     format!(
                         "{} upgraded with {} on {}",
                         ctx.defs.building(b.def).display_name,
@@ -568,4 +591,8 @@ fn rebuild_profiles(p: &mut Planet, ctx: &PlanetCtx) {
     p.cache.job_order = order;
     p.cache.profiles = profiles;
     p.constructing = p.tiles.iter().any(|t| t.construction.is_some());
+    p.flags.damaged = p
+        .tiles
+        .iter()
+        .any(|t| t.building.as_ref().is_some_and(|b| b.damage > 0.0));
 }

@@ -32,6 +32,12 @@ use crate::world::{Crisis, Empire, Planet, Pool, ResearchProject, System, World}
 
 /// Phase 3: sum each ownership group's planets and match migrants inside the group.
 pub(crate) fn tick_system(sys: &mut System, planets: &[Planet]) {
+    // Systems of idle planets have nothing to sum: their groups are already zero.
+    let quiet = planets.iter().all(|p| p.flags.idle);
+    if quiet && sys.quiet {
+        return;
+    }
+    sys.quiet = quiet;
     for g in &mut sys.groups {
         g.flows.clear();
         g.emigrants.clear();
@@ -59,13 +65,20 @@ pub(crate) fn tick_system(sys: &mut System, planets: &[Planet]) {
 
 /// Phase 4a: combine system balances into the pool, losing a share of any surplus shipped
 /// out of a non-hub system. Core pools also receive the empire's daily income and pay its
-/// fleet upkeep.
+/// fleet upkeep. A humiliated empire gains no influence (the expansion resource).
 pub(crate) fn aggregate_pool(
     pool: &mut Pool,
     systems: &[System],
     empires: &[Empire],
     rules: &Ruleset,
 ) {
+    // A pool of quiet systems (empty, unowned rocks) stays at zero; core pools always run,
+    // since they also carry empire income and fleet upkeep.
+    let quiet = !pool.core && pool.members.iter().all(|(s, _)| systems[s.idx()].quiet);
+    if quiet && pool.quiet {
+        return;
+    }
+    pool.quiet = quiet;
     pool.net.fill(0.0);
     pool.demand.fill(0.0);
     pool.demand_full.fill(0.0);
@@ -73,15 +86,16 @@ pub(crate) fn aggregate_pool(
     for &(s, g) in &pool.members {
         let f = &systems[s.idx()].groups[g as usize].flows;
         let lossy = shipping && Some(s) != pool.hub;
+        let (supply, demand, full) = (f.supply(), f.demand(), f.demand_full());
         for r in 0..pool.net.len() {
-            let net = f.supply[r] - f.demand[r];
+            let net = supply[r] - demand[r];
             pool.net[r] += if lossy && net > 0.0 {
                 net * (1.0 - rules.logistics_loss)
             } else {
                 net
             };
-            pool.demand[r] += f.demand[r];
-            pool.demand_full[r] += f.demand_full[r];
+            pool.demand[r] += demand[r];
+            pool.demand_full[r] += full[r];
         }
     }
     if let (true, Some(e)) = (pool.core, pool.empire) {
@@ -97,6 +111,11 @@ pub(crate) fn aggregate_pool(
                 pool.net[r] -= paid;
             }
         }
+    }
+    if let (Some(e), Some(r)) = (pool.empire, rules.expansion_resource)
+        && empires[e.idx()].humiliated > 0
+    {
+        pool.net[r.idx()] = pool.net[r.idx()].min(0.0);
     }
 }
 
@@ -221,7 +240,7 @@ pub(crate) fn finalize_empire(
         let p = &planets[p.idx()];
         stats.pop += p.pop();
         for &r in &transient {
-            e.income[r] += (p.flows.supply[r] - p.flows.demand[r]).max(0.0);
+            e.income[r] += p.flows.net(r).max(0.0);
         }
         if last_system != Some(p.system) {
             last_system = Some(p.system);
@@ -378,7 +397,10 @@ pub(crate) fn fund_projects(world: &mut World) {
     let day = world.day;
     let n_res = defs.resource_count();
     let World {
-        empires, planets, ..
+        empires,
+        planets,
+        busy,
+        ..
     } = world;
     let mut transient: Vec<Vec<f64>> = empires
         .iter()
@@ -396,7 +418,8 @@ pub(crate) fn fund_projects(world: &mut World) {
         .collect();
     let before: Vec<Vec<f64>> = empires.iter().map(|e| e.storage.clone()).collect();
 
-    for p in planets.iter_mut() {
+    for &i in busy.iter() {
+        let p = &mut planets[i as usize];
         let owner = p.owner;
         if p.constructing {
             for t in &mut p.tiles {
@@ -445,7 +468,7 @@ pub(crate) fn fund_projects(world: &mut World) {
                     let avail = (0..n_res)
                         .map(|r| {
                             if defs.resources[r].transient && p.owner == Some(id) {
-                                (p.flows.supply[r] - p.flows.demand[r]).max(0.0)
+                                p.flows.net(r).max(0.0)
                             } else {
                                 0.0
                             }
@@ -488,7 +511,7 @@ pub(crate) fn fund_projects(world: &mut World) {
             project.remaining.days = project.remaining.days.saturating_sub(1);
             draw(
                 &mut project.remaining,
-                None,
+                Some(&mut project.paid),
                 &defs,
                 &mut e.storage,
                 pool,
@@ -564,6 +587,10 @@ pub(crate) fn finalize_pool(pool: &mut Pool, empires: &[Empire]) {
         pool.scarcity.copy_from_slice(&empires[e.idx()].scarcity);
         return;
     }
+    // A quiet pool settles at full satisfaction once its scarcity has decayed away.
+    if pool.quiet && pool.scarcity.iter().all(|s| *s == 0.0) && pool.sat.iter().all(|s| *s == 1.0) {
+        return;
+    }
     // Isolated and unowned pools have no storage: only this tick's production counts.
     for r in 0..pool.sat.len() {
         let full = pool.demand_full[r];
@@ -579,6 +606,7 @@ pub(crate) fn finalize_pool(pool: &mut Pool, empires: &[Empire]) {
         } else {
             0.0
         };
-        pool.scarcity[r] = now.max(pool.scarcity[r] * 0.95);
+        let decayed = pool.scarcity[r] * 0.95;
+        pool.scarcity[r] = now.max(if decayed < 1e-3 { 0.0 } else { decayed });
     }
 }

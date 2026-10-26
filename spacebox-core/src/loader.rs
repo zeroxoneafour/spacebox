@@ -18,6 +18,14 @@
 //! `forge` tag of the current file and `"base.forge"` that of the file imported as `base`. The
 //! reserved building tags (`barren`, `blocker`, `land`, `water`, `space`) are global.
 //!
+//! # Large files
+//!
+//! Saves of large galaxies are not parsed in one piece: the `[empire.*]` and `[system.*]`
+//! entries are split out (see [`crate::split`]) and parsed separately, systems in parallel,
+//! so memory use stays close to the size of the world rather than many times the file size.
+//! Files the splitter can't handle unambiguously are parsed whole, and parse errors are always
+//! reported against the whole file.
+//!
 //! # Assets vs. state
 //!
 //! Asset tables are collected from every loaded file. Game state (`game`, `empire`, `system`)
@@ -29,6 +37,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use toml::{Table, Value};
 
 use crate::defs::*;
@@ -70,7 +79,9 @@ pub fn load_world(path: impl AsRef<Path>) -> Result<(World, Vec<String>)> {
     let mut loader = Loader::default();
     let root = loader.load_file(path.as_ref())?;
     let (defs, state) = loader.build_defs(root)?;
-    let world = build_world(defs, root, state, &mut loader.warnings)?;
+    let groups = std::mem::take(&mut loader.groups[root.idx()]);
+    let text = std::mem::take(&mut loader.root_text);
+    let world = build_world(defs, root, state, groups, &text, &mut loader.warnings)?;
     Ok((world, loader.warnings))
 }
 
@@ -78,8 +89,64 @@ pub fn load_world(path: impl AsRef<Path>) -> Result<(World, Vec<String>)> {
 struct Loader {
     files: Vec<SourceFile>,
     tables: Vec<Table>,
+    /// Per file: the `[empire.*]` / `[system.*]` entries, still unparsed where possible.
+    groups: Vec<Vec<Group>>,
+    /// The root file's text, which unparsed groups refer to.
+    root_text: String,
     by_path: HashMap<PathBuf, FileId>,
     warnings: Vec<String>,
+}
+
+/// One `[empire.x]` or `[system.x]` entry of a file.
+struct Group {
+    top: &'static str,
+    name: String,
+    src: GroupSrc,
+}
+
+enum GroupSrc {
+    /// Where the entry's sections are in the file, to be parsed on their own (see
+    /// [`crate::split`]).
+    Ranges(Vec<std::ops::Range<usize>>),
+    /// Already parsed, when the file had to be parsed as a whole.
+    Value(Value),
+}
+
+impl Group {
+    /// The entry's table. Parse errors are reported against the whole file, so that line
+    /// numbers are right.
+    fn parse(self, path: &Path, file_text: &str) -> Result<Value> {
+        match self.src {
+            GroupSrc::Value(v) => Ok(v),
+            GroupSrc::Ranges(ranges) => {
+                let piece = crate::split::Group {
+                    top: self.top,
+                    name: self.name.clone(),
+                    ranges,
+                };
+                let parsed: std::result::Result<Table, _> = piece.text(file_text).parse();
+                let mut t = parsed.map_err(|e| whole_file_error(path, e))?;
+                match t.remove(self.top) {
+                    Some(Value::Table(mut entries)) => entries
+                        .remove(&self.name)
+                        .ok_or_else(|| Error::invalid(path, format!("[{}] is missing", self.name))),
+                    _ => Err(Error::invalid(path, format!("[{}] is missing", self.top))),
+                }
+            }
+        }
+    }
+}
+
+/// The error of parsing the whole file (with correct line numbers), falling back to a piece's
+/// own error.
+fn whole_file_error(path: &Path, piece: toml::de::Error) -> Error {
+    let whole = fs::read_to_string(path)
+        .ok()
+        .and_then(|t| t.parse::<Table>().err());
+    Error::Parse {
+        path: path.to_path_buf(),
+        message: whole.unwrap_or(piece).to_string(),
+    }
 }
 
 impl Loader {
@@ -90,10 +157,53 @@ impl Loader {
         }
         let text = fs::read_to_string(&canon).map_err(|e| Error::io(&canon, e))?;
         check_import_header(&text, &canon)?;
-        let mut table: Table = text.parse().map_err(|e: toml::de::Error| Error::Parse {
+        let parse_error = |e: toml::de::Error| Error::Parse {
             path: canon.clone(),
             message: e.to_string(),
-        })?;
+        };
+        // Large saves are parsed piecewise; anything unusual is parsed as a whole.
+        let split = crate::split::split(&text).and_then(|sp| {
+            let head: Table = sp.head.parse().ok()?;
+            let grouped = crate::split::GROUPED.iter().any(|g| head.contains_key(*g));
+            (!grouped).then_some((head, sp.groups))
+        });
+        let (mut table, groups) = match split {
+            Some((head, groups)) => {
+                let groups = groups
+                    .into_iter()
+                    .map(|g| Group {
+                        top: g.top,
+                        name: g.name,
+                        src: GroupSrc::Ranges(g.ranges),
+                    })
+                    .collect();
+                (head, groups)
+            }
+            None => {
+                let mut table: Table = text.parse().map_err(parse_error)?;
+                let mut groups = Vec::new();
+                for top in crate::split::GROUPED {
+                    match table.remove(top) {
+                        None => {}
+                        Some(Value::Table(entries)) => {
+                            groups.extend(entries.into_iter().map(|(name, v)| Group {
+                                top,
+                                name,
+                                src: GroupSrc::Value(v),
+                            }))
+                        }
+                        Some(_) => {
+                            return Err(Error::invalid(&canon, format!("[{top}] must be a table")));
+                        }
+                    }
+                }
+                (table, groups)
+            }
+        };
+        // Only the root file's state is read; its unparsed groups point into its text.
+        if self.files.is_empty() {
+            self.root_text = text;
+        }
 
         let id = FileId::from_idx(self.files.len());
         self.files.push(SourceFile {
@@ -101,6 +211,7 @@ impl Loader {
             imports: Vec::new(),
         });
         self.tables.push(Table::new());
+        self.groups.push(groups);
         self.by_path.insert(canon.clone(), id);
 
         let imports = match table.remove("import") {
@@ -191,7 +302,7 @@ impl Loader {
             let state = std::mem::take(table);
             if file == root {
                 root_state = state;
-            } else if !state.is_empty() {
+            } else if !state.is_empty() || !self.groups[fi].is_empty() {
                 self.warnings.push(format!(
                     "{}: game state tables ignored (only read from the root file)",
                     path.display()
@@ -915,6 +1026,7 @@ fn parse_ruleset(defs: &Defs, file: FileId, name: String, value: Value) -> Resul
     for a in ctx.amounts(&raw.resources.storage_caps)? {
         storage_caps[a.resource.idx()] = Some(a.count.max(0.0));
     }
+    let wr = &raw.war;
     let (am, ec, ex, sh, inv) = (
         &raw.amenities,
         &raw.economy,
@@ -979,6 +1091,19 @@ fn parse_ruleset(defs: &Defs, file: FileId, name: String, value: Value) -> Resul
         surrender_resistance: inv.surrender_resistance.unwrap_or(b.surrender_resistance),
         siege_decay: inv.siege_decay.unwrap_or(b.siege_decay),
         truce_days: raw.diplomacy.truce_days.unwrap_or(b.truce_days),
+        humiliate_cost: wr.humiliate_cost.unwrap_or(b.humiliate_cost),
+        claim_cost: wr.claim_cost.unwrap_or(b.claim_cost),
+        total_cost: wr.total_cost.unwrap_or(b.total_cost),
+        humiliation_days: wr.humiliation_days.unwrap_or(b.humiliation_days),
+        daily_exhaustion: wr.daily_exhaustion.unwrap_or(b.daily_exhaustion),
+        ship_loss_exhaustion: wr.ship_loss_exhaustion.unwrap_or(b.ship_loss_exhaustion),
+        planet_loss_exhaustion: wr
+            .planet_loss_exhaustion
+            .unwrap_or(b.planet_loss_exhaustion),
+        populated_planet_loss_exhaustion: wr
+            .populated_planet_loss_exhaustion
+            .unwrap_or(b.populated_planet_loss_exhaustion),
+        crisis_exhaustion: wr.crisis_exhaustion.unwrap_or(b.crisis_exhaustion),
         terraform_large: terraform(&raw.terraforming.large)?,
         terraform_small: terraform(&raw.terraforming.small)?,
         key: DefKey { file, name },
@@ -1118,20 +1243,12 @@ fn build_world(
     mut defs: Defs,
     root: FileId,
     mut state: Table,
+    groups: Vec<Group>,
+    text: &str,
     warnings: &mut Vec<String>,
 ) -> Result<World> {
     let root_path = defs.files[root.idx()].path.clone();
     let invalid = |m: String| Error::invalid(&root_path, m);
-    let as_table = |v: Option<Value>, what: &str| -> Result<Table> {
-        match v {
-            None => Ok(Table::new()),
-            Some(Value::Table(t)) => Ok(t),
-            Some(_) => Err(Error::invalid(
-                &root_path,
-                format!("[{what}] must be a table"),
-            )),
-        }
-    };
 
     let game: RawGame = match state.remove("game") {
         None => RawGame::default(),
@@ -1154,20 +1271,20 @@ fn build_world(
         }
     };
 
-    let empire_tables = as_table(state.remove("empire"), "empire")?;
-    let system_tables = as_table(state.remove("system"), "system")?;
-    let empire_ids: HashMap<String, EmpireId> = empire_tables
-        .keys()
+    let (empire_groups, system_groups): (Vec<Group>, Vec<Group>) =
+        groups.into_iter().partition(|g| g.top == "empire");
+    let empire_ids: HashMap<String, EmpireId> = empire_groups
+        .iter()
         .enumerate()
-        .map(|(i, k)| (k.clone(), EmpireId::from_idx(i)))
+        .map(|(i, g)| (g.name.clone(), EmpireId::from_idx(i)))
         .collect();
-    let system_ids: HashMap<String, SystemId> = system_tables
-        .keys()
+    let system_ids: HashMap<String, SystemId> = system_groups
+        .iter()
         .enumerate()
-        .map(|(i, k)| (k.clone(), SystemId::from_idx(i)))
+        .map(|(i, g)| (g.name.clone(), SystemId::from_idx(i)))
         .collect();
-    for name in empire_tables.keys().chain(system_tables.keys()) {
-        validate_name(name).map_err(|m| invalid(format!("'{name}': {m}")))?;
+    for g in empire_groups.iter().chain(&system_groups) {
+        validate_name(&g.name).map_err(|m| invalid(format!("'{}': {m}", g.name)))?;
     }
 
     let defs = Arc::new(defs);
@@ -1176,19 +1293,79 @@ fn build_world(
     world.seed = game.seed;
     world.root_file = Some(root);
 
+    let gctx = Ctx::with_header(&defs, root, "[game]".into());
+    let mut war_ids = HashMap::new();
+    for (name, w) in game.wars.0 {
+        validate_name(&name).map_err(|m| gctx.err(format!("war '{name}': {m}")))?;
+        let goal = |g: &str| {
+            WarGoal::parse(g).ok_or_else(|| {
+                gctx.err(format!(
+                    "war '{name}': unknown goal '{g}' (expected humiliate, claim or total)"
+                ))
+            })
+        };
+        let offensive = goal(&w.offensive_goal)?;
+        let defensive = w.defensive_goal.as_deref().map(goal).transpose()?;
+        let victory = w
+            .victory
+            .as_deref()
+            .map(|v| {
+                WarOutcome::parse(v).ok_or_else(|| {
+                    gctx.err(format!(
+                        "war '{name}': unknown victory '{v}' (expected offensive, defensive or status quo)"
+                    ))
+                })
+            })
+            .transpose()?;
+        for x in [w.offensive_exhaustion, w.defensive_exhaustion] {
+            if !(0.0..=1.0).contains(&x) {
+                return Err(gctx.err(format!("war '{name}': exhaustion {x} is not within 0..1")));
+            }
+        }
+        war_ids.insert(name.clone(), WarId::from_idx(world.wars.len()));
+        world.wars.push(War {
+            name,
+            display_name: w.display_name,
+            goals: [Some(offensive), defensive],
+            starting_day: w.starting_day,
+            exhaustion: [w.offensive_exhaustion, w.defensive_exhaustion],
+            victory,
+            proposals: [None, None],
+        });
+    }
+    let mut alliance_ids = HashMap::new();
+    for (name, a) in game.alliances.0 {
+        validate_name(&name).map_err(|m| gctx.err(format!("alliance '{name}': {m}")))?;
+        alliance_ids.insert(name.clone(), AllianceId::from_idx(world.alliances.len()));
+        world.alliances.push(Alliance {
+            name,
+            display_name: a.display_name,
+        });
+    }
+    let mut truce_ids = HashMap::new();
+    for (name, t) in game.truces.0 {
+        validate_name(&name).map_err(|m| gctx.err(format!("truce '{name}': {m}")))?;
+        truce_ids.insert(name.clone(), TruceId::from_idx(world.truces.len()));
+        world.truces.push(Truce {
+            name,
+            display_name: t.display_name,
+            valid_until: t.valid_until,
+        });
+    }
+
     let mut deferred = Vec::new();
-    for (name, value) in empire_tables {
+    for g in empire_groups {
+        let name = g.name.clone();
+        let value = g.parse(&root_path, text)?;
         let ctx = Ctx::with_header(&defs, root, format!("[empire.{name}]"));
         let raw: RawEmpire = ctx.de(value)?;
         let mut e = Empire::new(name.clone(), raw.display_name, &defs);
         for a in ctx.amounts(&raw.resource_stores)? {
             if defs.is_transient(a.resource) {
-                warnings.push(format!(
-                    "{}: {} is transient and cannot be stored; ignored",
-                    ctx.header,
+                return Err(ctx.err(format!(
+                    "resource-stores: {} is transient and cannot be stored",
                     defs.resource(a.resource).key.name
-                ));
-                continue;
+                )));
             }
             e.storage[a.resource.idx()] += a.count;
         }
@@ -1198,17 +1375,20 @@ fn build_world(
         for r in &raw.current_research {
             let tech = ctx.tech(&r.technology)?;
             if e.techs[tech.idx()] || e.is_researching(tech) {
-                warnings.push(format!(
-                    "{}: {} is already known or listed; ignored",
-                    ctx.header, r.technology
-                ));
-                continue;
+                return Err(ctx.err(format!(
+                    "current-research: {} is already known or listed twice",
+                    r.technology
+                )));
             }
             let remaining = match &r.remaining {
                 Some(list) => ctx.cost("current-research remaining", list)?,
                 None => defs.research_cost(tech),
             };
-            e.research.push(ResearchProject { tech, remaining });
+            e.research.push(ResearchProject {
+                tech,
+                paid: paid_list(&ctx, &r.paid)?,
+                remaining,
+            });
         }
         e.capital = raw
             .capital
@@ -1246,23 +1426,47 @@ fn build_world(
         e.accepts_migrants = raw.policy.accepts_migrants;
         e.market_access = raw.policy.market_access;
         e.color = raw.color;
-        let empire = |name: &str, what: &str| {
-            empire_ids
-                .get(name)
-                .copied()
-                .ok_or_else(|| ctx.err(format!("unknown empire '{name}' in {what}")))
-        };
-        for w in &raw.diplomacy.wars {
-            e.wars.push(War {
-                enemy: empire(&w.empire, "wars")?,
-                since_day: w.since_day,
-            });
+        e.total_war = raw.policy.total_war;
+        let d = raw.diplomacy;
+        e.humiliated = d.humiliated;
+        for c in &d.claims {
+            let sys = *system_ids
+                .get(c)
+                .ok_or_else(|| ctx.err(format!("unknown system '{c}' in claims")))?;
+            if !e.claims.contains(&sys) {
+                e.claims.push(sys);
+            }
         }
-        for t in &raw.diplomacy.truces {
-            e.truces.push(Truce {
-                with: empire(&t.empire, "truces")?,
-                until_day: t.until_day,
-            });
+        for w in &d.wars {
+            let war = *war_ids
+                .get(&w.war)
+                .ok_or_else(|| ctx.err(format!("unknown war '{}' in wars", w.war)))?;
+            let side = Side::parse(&w.side).ok_or_else(|| {
+                ctx.err(format!(
+                    "war '{}': unknown side '{}' (expected offense or defense)",
+                    w.war, w.side
+                ))
+            })?;
+            if e.wars.iter().any(|(x, _)| *x == war) {
+                return Err(ctx.err(format!("war '{}' is listed twice", w.war)));
+            }
+            e.wars.push((war, side));
+        }
+        for t in &d.truces {
+            let truce = *truce_ids
+                .get(t)
+                .ok_or_else(|| ctx.err(format!("unknown truce '{t}' in truces")))?;
+            if !e.truces.contains(&truce) {
+                e.truces.push(truce);
+            }
+        }
+        for a in &d.alliances {
+            let alliance = *alliance_ids
+                .get(a)
+                .ok_or_else(|| ctx.err(format!("unknown alliance '{a}' in alliances")))?;
+            if !e.alliances.contains(&alliance) {
+                e.alliances.push(alliance);
+            }
         }
         let id = world.add_empire(e);
         deferred.push(Deferred {
@@ -1273,42 +1477,21 @@ fn build_world(
         });
     }
 
+    // Systems are parsed and built in parallel, then added in file order.
+    let built: Vec<Result<ParsedSystem>> = system_groups
+        .into_par_iter()
+        .map(|g| {
+            let name = g.name.clone();
+            let value = g.parse(&root_path, text)?;
+            parse_system(&defs, root, &empire_ids, &system_ids, name, value)
+        })
+        .collect();
     let mut links = Vec::new();
-    for (name, value) in system_tables {
-        let ctx = Ctx::with_header(&defs, root, format!("[system.{name}]"));
-        let raw: RawSystem = ctx.de(value)?;
-        let mut sys = System::new(name.clone(), raw.display_name);
-        sys.star_type = raw.star_type;
-        sys.star_count = raw.star_count;
-        sys.coordinates = raw.coords;
-        sys.owner = raw
-            .owner
-            .as_deref()
-            .map(|o| {
-                empire_ids
-                    .get(o)
-                    .copied()
-                    .ok_or_else(|| ctx.err(format!("unknown empire '{o}' in owner")))
-            })
-            .transpose()?;
-        let id = system_ids[&name];
-        for l in &raw.linked_systems {
-            let other = system_ids
-                .get(l)
-                .copied()
-                .ok_or_else(|| ctx.err(format!("unknown linked system '{l}'")))?;
-            links.push((id, other));
-        }
-        let mut planets = Vec::new();
-        for (pname, pvalue) in raw.planets {
-            validate_name(&pname).map_err(|m| ctx.err(format!("planet '{pname}': {m}")))?;
-            let pctx = PlanetCtx {
-                header: format!("[system.{name}.planets.{pname}]"),
-                empires: &empire_ids,
-            };
-            planets.push(parse_planet(&defs, root, &pctx, pname, pvalue, warnings)?);
-        }
-        world.add_system(sys, planets);
+    for b in built {
+        let (sys, planets, linked, w) = b?;
+        warnings.extend(w);
+        let id = world.add_system(sys, planets);
+        links.extend(linked.into_iter().map(|other| (id, other)));
     }
     for (a, b) in links {
         world.link(a, b);
@@ -1377,9 +1560,9 @@ fn build_world(
                 Some(list) => ctx.cost("current-shipbuilding remaining", list)?,
                 None => defs.ship(ship).build_cost.clone(),
             };
-            if world.planet(planet).owner != Some(d.id) {
+            if world.planet(planet).controller() != Some(d.id) {
                 warnings.push(format!(
-                    "{}: ship under construction at {}/{}, which the empire does not own",
+                    "{}: ship under construction at {}/{}, which the empire does not control",
                     ctx.header, o.system, o.planet
                 ));
             }
@@ -1389,18 +1572,6 @@ fn build_world(
                 paid: paid_list(&ctx, &o.paid)?,
                 remaining,
             });
-        }
-    }
-    // Keep wars symmetric even if only one side lists them.
-    for a in 0..world.empires.len() {
-        for w in world.empires[a].wars.clone() {
-            let other = &mut world.empires[w.enemy.idx()];
-            if !other.at_war_with(EmpireId::from_idx(a)) {
-                other.wars.push(War {
-                    enemy: EmpireId::from_idx(a),
-                    since_day: w.since_day,
-                });
-            }
         }
     }
     Ok(world)
@@ -1420,6 +1591,78 @@ fn paid_list(ctx: &Ctx, raw: &[RawAmount]) -> Result<Vec<ResourceAmount>> {
 }
 
 /// Parses one fleet order; `at` is the system the fleet will be in when it carries it out.
+/// A parsed `[system.x]`: the system, its planets, the systems it links to and any warnings.
+type ParsedSystem = (System, Vec<Planet>, Vec<SystemId>, Vec<String>);
+
+/// Parses one `[system.x]` with its planets: the system, its planets, the systems it links to
+/// and any warnings.
+fn parse_system(
+    defs: &Defs,
+    root: FileId,
+    empire_ids: &HashMap<String, EmpireId>,
+    system_ids: &HashMap<String, SystemId>,
+    name: String,
+    value: Value,
+) -> Result<ParsedSystem> {
+    let ctx = Ctx::with_header(defs, root, format!("[system.{name}]"));
+    let raw: RawSystem = ctx.de(value)?;
+    let mut sys = System::new(name.clone(), raw.display_name);
+    sys.star_type = raw.star_type;
+    sys.star_count = raw.star_count;
+    sys.coordinates = raw.coords;
+    sys.owner = raw
+        .owner
+        .as_deref()
+        .map(|o| {
+            empire_ids
+                .get(o)
+                .copied()
+                .ok_or_else(|| ctx.err(format!("unknown empire '{o}' in owner")))
+        })
+        .transpose()?;
+    sys.occupier = raw
+        .occupier
+        .as_deref()
+        .map(|o| {
+            empire_ids
+                .get(o)
+                .copied()
+                .ok_or_else(|| ctx.err(format!("unknown empire '{o}' in occupier")))
+        })
+        .transpose()?;
+    if sys.occupier.is_some() && (sys.owner.is_none() || sys.occupier == sys.owner) {
+        return Err(ctx.err("`occupier` needs an owner other than the occupier"));
+    }
+    let links = raw
+        .linked_systems
+        .iter()
+        .map(|l| {
+            system_ids
+                .get(l)
+                .copied()
+                .ok_or_else(|| ctx.err(format!("unknown linked system '{l}'")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut warnings = Vec::new();
+    let mut planets = Vec::with_capacity(raw.planets.len());
+    for (pname, pvalue) in raw.planets {
+        validate_name(&pname).map_err(|m| ctx.err(format!("planet '{pname}': {m}")))?;
+        let pctx = PlanetCtx {
+            header: format!("[system.{name}.planets.{pname}]"),
+            empires: empire_ids,
+        };
+        planets.push(parse_planet(
+            defs,
+            root,
+            &pctx,
+            pname,
+            pvalue,
+            &mut warnings,
+        )?);
+    }
+    Ok((sys, planets, links, warnings))
+}
+
 fn parse_fleet_order(
     ctx: &Ctx,
     world: &World,
@@ -1544,10 +1787,10 @@ fn parse_planet(
         if p.habitable {
             return Err(ctx.err("a habitable planet cannot be terraformed"));
         }
-        p.terraform = Some(TerraformProject {
+        p.terraform = Some(Box::new(TerraformProject {
             paid: paid_list(&ctx, &t.paid)?,
             remaining: ctx.cost("terraform remaining", &t.remaining)?,
-        });
+        }));
     }
     let empire = |e: &str| {
         pctx.empires
@@ -1556,6 +1799,10 @@ fn parse_planet(
             .ok_or_else(|| ctx.err(format!("unknown empire '{e}'")))
     };
     p.owner = raw.owner.as_deref().map(empire).transpose()?;
+    p.occupier = raw.occupier.as_deref().map(empire).transpose()?;
+    if p.occupier.is_some() && (p.owner.is_none() || p.occupier == p.owner) {
+        return Err(ctx.err("`occupier` needs an owner other than the occupier"));
+    }
 
     for (key, tvalue) in tiles {
         let tctx = Ctx::with_header(defs, root, format!("{header}.{key}"));
@@ -1572,10 +1819,11 @@ fn parse_planet(
         let raw_tile: RawTile = tctx.de(tvalue)?;
         let tile = &mut p.tiles[index];
         tile.water = raw_tile.water;
-        for m in &raw_tile.resource_multipliers {
-            tile.resource_mults
-                .push((tctx.resource(&m.resource)?, m.mult));
-        }
+        tile.resource_mults = raw_tile
+            .resource_multipliers
+            .iter()
+            .map(|m| Ok((tctx.resource(&m.resource)?, m.mult)))
+            .collect::<Result<_>>()?;
         if let Some(b) = raw_tile.building {
             let inst = parse_tile_building(&tctx, b)?;
             let def = defs.building(inst.def);
@@ -1624,12 +1872,12 @@ fn parse_planet(
                     ));
                 }
             };
-            tile.construction = Some(Construction {
+            tile.construction = Some(Box::new(Construction {
                 kind,
                 paid: paid_list(&tctx, &c.paid)?,
                 remaining,
                 empire: c.empire.as_deref().map(empire).transpose()?,
-            });
+            }));
         }
     }
     Ok(p)
@@ -1656,9 +1904,11 @@ fn parse_tile_building(ctx: &Ctx, value: Value) -> Result<BuildingInstance> {
             let raw: RawTileBuilding = ctx.de(v)?;
             let def = BuildingId(ctx.lookup(Kind::Building, &raw.building)?);
             let mut inst = BuildingInstance::new(def);
-            for u in &raw.upgrades {
-                inst.upgrades.push(resolve_tile_upgrade(ctx, def, u)?);
-            }
+            inst.upgrades = raw
+                .upgrades
+                .iter()
+                .map(|u| resolve_tile_upgrade(ctx, def, u))
+                .collect::<Result<_>>()?;
             for u in &inst.upgrades {
                 for need in &ctx.defs.upgrade(*u).after_upgrades {
                     if !inst.upgrades.contains(need) {

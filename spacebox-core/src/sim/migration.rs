@@ -5,6 +5,8 @@
 //! owning empire, and the remainder across the whole galaxy. Moves are committed at the end of
 //! the tick, so every level only ever reads state from the level below it.
 
+use rayon::prelude::*;
+
 use crate::ids::*;
 use crate::sim::events::{Event, EventKind};
 use crate::world::{Empire, System, World};
@@ -104,14 +106,17 @@ pub(crate) fn galaxy_level(world: &mut World) {
             vac.extend_from_slice(&e.vacancies);
         }
     }
-    for g in world
+    // Unowned groups, gathered in parallel (most systems have nothing to offer).
+    let unowned: Vec<(Vec<Emigrants>, Vec<Vacancy>)> = world
         .systems
-        .iter()
-        .flat_map(|s| &s.groups)
-        .filter(|g| g.owner.is_none())
-    {
-        em.extend_from_slice(&g.emigrants);
-        vac.extend_from_slice(&g.vacancies);
+        .par_iter()
+        .flat_map_iter(|s| &s.groups)
+        .filter(|g| g.owner.is_none() && !(g.emigrants.is_empty() && g.vacancies.is_empty()))
+        .map(|g| (g.emigrants.clone(), g.vacancies.clone()))
+        .collect();
+    for (e, v) in unowned {
+        em.extend(e);
+        vac.extend(v);
     }
     world.galaxy_moves.clear();
     match_migrants(&mut em, &mut vac, &mut world.galaxy_moves);
@@ -128,9 +133,12 @@ pub(crate) fn commit(world: &mut World) {
         events,
         ..
     } = world;
-    let all = systems
+    let local: Vec<Move> = systems
+        .par_iter()
+        .flat_map_iter(|s| s.groups.iter().flat_map(|g| g.moves.iter().copied()))
+        .collect();
+    let all = local
         .iter()
-        .flat_map(|s| s.groups.iter().flat_map(|g| g.moves.iter()))
         .chain(empires.iter().flat_map(|e| e.moves.iter()))
         .chain(galaxy_moves.iter());
     for m in all {

@@ -12,10 +12,10 @@
 //!
 //! When it ends:
 //! * the losers of a humiliation war get no influence income for `humiliation-days`;
-//! * in a claim war, systems the winners claim and occupy become theirs (with a status quo,
-//!   both sides' claim and total goals keep what they occupied that way), and the losers drop
+//! * in a claim war, systems the winners claim and occupy become theirs, and the losers drop
 //!   their claims on the winners;
-//! * every other occupation is lifted;
+//! * every other occupation is lifted (in a status quo, all of them); what changed hands in a
+//!   total war stays changed;
 //! * all participants enter a truce for `truce-days`.
 
 use crate::ids::*;
@@ -82,6 +82,27 @@ pub(crate) fn tick(world: &mut World) {
                 continue;
             }
         }
+        // A claim goal whose claims are gone (say, taken by an ally) becomes humiliation.
+        for side in [Side::Offense, Side::Defense] {
+            let (mine, theirs) = (&sides[side.idx()], &sides[side.other().idx()]);
+            if world.wars[w].goals[side.idx()] == Some(WarGoal::Claim)
+                && !mine.iter().any(|m| world.claims_on(*m, theirs))
+            {
+                world.wars[w].goals[side.idx()] = Some(WarGoal::Humiliate);
+                world.events.push(
+                    Event::new(
+                        world.day,
+                        EventKind::Command,
+                        format!(
+                            "{}: with no claims left to fight for, the {} now seeks humiliation",
+                            world.wars[w].display_name,
+                            side.as_str()
+                        ),
+                    )
+                    .empire(mine.first().copied()),
+                );
+            }
+        }
         for side in [Side::Offense, Side::Defense] {
             let members = &sides[side.idx()];
             let lost: f64 = members.iter().map(|e| ship_losses[e.idx()]).sum();
@@ -126,15 +147,9 @@ pub(crate) fn end_war(world: &mut World, war: WarId, outcome: WarOutcome) {
     let goals = world.wars[war.idx()].goals;
     let winner = outcome.winner();
 
-    // Occupations: claimed systems the winners (or, in a status quo, either side fighting for
-    // claims or total war) occupy change hands; everything else goes back to its owner.
-    let keeps = |s: Side| {
-        let goal = goals[s.idx()];
-        match winner {
-            Some(w) => w == s && goal == Some(WarGoal::Claim),
-            None => matches!(goal, Some(WarGoal::Claim | WarGoal::Total)),
-        }
-    };
+    // Occupations: claimed systems the winners of a claim war occupy change hands; everything
+    // else (all of it in a status quo) goes back to its owner.
+    let keeps = |s: Side| winner == Some(s) && goals[s.idx()] == Some(WarGoal::Claim);
     for sys in 0..world.systems.len() {
         let sid = SystemId::from_idx(sys);
         let s = &world.systems[sys];
@@ -305,8 +320,57 @@ impl World {
         }
     }
 
+    /// Checks that each side's goal in an ongoing war meets its prerequisites: a claim goal
+    /// needs a member with claims on the other side, a total goal a member with the
+    /// `total-war` policy (or, for the defense, a total war declared on it).
+    pub fn check_war_goals(&self, war: WarId) -> Result<(), String> {
+        let w = &self.wars[war.idx()];
+        if !w.is_active() {
+            return Ok(());
+        }
+        let sides = [
+            self.members(war, Side::Offense),
+            self.members(war, Side::Defense),
+        ];
+        for side in [Side::Offense, Side::Defense] {
+            let (mine, theirs) = (&sides[side.idx()], &sides[side.other().idx()]);
+            if mine.is_empty() || theirs.is_empty() {
+                continue;
+            }
+            match w.goals[side.idx()] {
+                Some(WarGoal::Claim) if !mine.iter().any(|m| self.claims_on(*m, theirs)) => {
+                    return Err(format!(
+                        "{}: the {} fights for claims without holding any on the {}",
+                        w.display_name,
+                        side.as_str(),
+                        side.other().as_str()
+                    ));
+                }
+                Some(WarGoal::Total)
+                    if !(side == Side::Defense
+                        && w.goals[Side::Offense.idx()] == Some(WarGoal::Total))
+                        && !mine.iter().any(|m| self.empires[m.idx()].total_war) =>
+                {
+                    return Err(format!(
+                        "{}: the {} fights a total war without the total-war policy",
+                        w.display_name,
+                        side.as_str()
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks `empire`'s ongoing wars after a change of its policy or claims.
+    pub(crate) fn check_wars_of(&self, empire: EmpireId) -> Result<(), String> {
+        self.active_wars(empire)
+            .try_for_each(|(w, _)| self.check_war_goals(w))
+    }
+
     /// Whether `empire` claims a system owned by one of `enemies`.
-    fn claims_on(&self, empire: EmpireId, enemies: &[EmpireId]) -> bool {
+    pub(crate) fn claims_on(&self, empire: EmpireId, enemies: &[EmpireId]) -> bool {
         self.empires[empire.idx()].claims.iter().any(|c| {
             self.systems[c.idx()]
                 .owner
@@ -315,7 +379,7 @@ impl World {
     }
 
     /// Who would fight on each side if `empire` attacked `target`: each of them with their
-    /// allies, except allies of someone on the other side.
+    /// allies, except allies of someone on the other side or with a truce with someone there.
     pub fn war_sides(&self, empire: EmpireId, target: EmpireId) -> [Vec<EmpireId>; 2] {
         let n = self.empires.len();
         let allies = |e: EmpireId| {
@@ -325,15 +389,18 @@ impl World {
         };
         let mut off: Vec<EmpireId> = std::iter::once(empire).chain(allies(empire)).collect();
         let mut def: Vec<EmpireId> = std::iter::once(target).chain(allies(target)).collect();
-        // Allies of both sides stay out; then so does anyone allied to the other side.
+        // Allies of both sides stay out; then so does anyone allied to, or in a truce with,
+        // someone on the other side.
         let both: Vec<EmpireId> = off.iter().copied().filter(|e| def.contains(e)).collect();
         off.retain(|e| !both.contains(e));
         def.retain(|e| !both.contains(e));
         loop {
             let before = off.len() + def.len();
             let (o2, d2) = (off.clone(), def.clone());
-            off.retain(|e| *e == empire || !d2.iter().any(|d| *d == *e || self.allied(*e, *d)));
-            def.retain(|e| *e == target || !o2.iter().any(|o| *o == *e || self.allied(*e, *o)));
+            let bound =
+                |e: EmpireId, o: EmpireId| e == o || self.allied(e, o) || self.in_truce(e, o);
+            off.retain(|e| *e == empire || !d2.iter().any(|d| bound(*e, *d)));
+            def.retain(|e| *e == target || !o2.iter().any(|o| bound(*e, *o)));
             if off.len() + def.len() == before {
                 break;
             }
@@ -363,14 +430,10 @@ impl World {
         if self.allied(empire, target) {
             return Err(format!("{} is allied with {b}", a.display_name));
         }
-        let [_, def] = self.war_sides(empire, target);
-        if let Some(t) = def.iter().find(|d| self.in_truce(empire, **d)) {
-            return Err(format!(
-                "{} has a truce with {}",
-                a.display_name,
-                self.empires[t.idx()].display_name
-            ));
+        if self.in_truce(empire, target) {
+            return Err(format!("{} has a truce with {b}", a.display_name));
         }
+        let [_, def] = self.war_sides(empire, target);
         match goal {
             WarGoal::Humiliate => {}
             WarGoal::Claim if !self.claims_on(empire, &def) => {
@@ -593,11 +656,14 @@ pub(crate) fn claim(world: &mut World, empire: EmpireId, system: SystemId) -> Cm
 
 pub(crate) fn drop_claim(world: &mut World, empire: EmpireId, system: SystemId) -> CmdResult {
     world.check_empire(empire)?;
-    let claims = &mut world.empires[empire.idx()].claims;
-    let before = claims.len();
-    claims.retain(|c| *c != system);
-    if claims.len() == before {
+    let old = world.empires[empire.idx()].claims.clone();
+    world.empires[empire.idx()].claims.retain(|c| *c != system);
+    if world.empires[empire.idx()].claims.len() == old.len() {
         return Err("no such claim".into());
+    }
+    if let Err(e) = world.check_wars_of(empire) {
+        world.empires[empire.idx()].claims = old;
+        return Err(format!("this claim is needed: {e}"));
     }
     Ok(None)
 }
@@ -606,15 +672,24 @@ pub(crate) fn create_alliance(
     world: &mut World,
     empire: EmpireId,
     display_name: String,
+    invite: Vec<EmpireId>,
 ) -> CmdResult {
     world.check_empire(empire)?;
+    for i in &invite {
+        world.check_empire(*i)?;
+    }
     let id = AllianceId::from_idx(world.alliances.len());
     let base = format!("alliance-{}", world.empires[empire.idx()].name);
     world.alliances.push(Alliance {
         name: unique_name(world.alliances.iter().map(|a| a.name.as_str()), &base),
         display_name: display_name.clone(),
+        invites: Vec::new(),
     });
     world.empires[empire.idx()].alliances.push(id);
+    // Invitations that can't stand (e.g. to an enemy) are dropped.
+    for i in invite {
+        let _ = invite_to_alliance(world, empire, id, i);
+    }
     let msg = format!(
         "{} founds the {display_name}",
         world.empires[empire.idx()].display_name
@@ -624,36 +699,86 @@ pub(crate) fn create_alliance(
     ))
 }
 
-/// Joining needs peace with every member (allies cannot fight each other).
+impl World {
+    /// The members of an alliance.
+    pub fn alliance_members(&self, alliance: AllianceId) -> Vec<EmpireId> {
+        (0..self.empires.len())
+            .map(EmpireId::from_idx)
+            .filter(|e| self.empires[e.idx()].alliances.contains(&alliance))
+            .collect()
+    }
+
+    /// Whether `empire` could join `alliance` (allies cannot fight each other).
+    pub fn can_join_alliance(&self, empire: EmpireId, alliance: AllianceId) -> Result<(), String> {
+        self.check_empire(empire)?;
+        let a = self
+            .alliances
+            .get(alliance.idx())
+            .ok_or("no such alliance")?;
+        if self.empires[empire.idx()].alliances.contains(&alliance) {
+            return Err(format!("already in the {}", a.display_name));
+        }
+        if let Some(m) = self
+            .alliance_members(alliance)
+            .into_iter()
+            .find(|m| self.at_war(empire, *m))
+        {
+            return Err(format!(
+                "at war with {}, a member of the {}",
+                self.empires[m.idx()].display_name,
+                a.display_name
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A member invites `invitee`, who may then join.
+pub(crate) fn invite_to_alliance(
+    world: &mut World,
+    empire: EmpireId,
+    alliance: AllianceId,
+    invitee: EmpireId,
+) -> CmdResult {
+    world.check_empire(empire)?;
+    world.can_join_alliance(invitee, alliance)?;
+    if !world.empires[empire.idx()].alliances.contains(&alliance) {
+        return Err("only members can invite".into());
+    }
+    let a = &mut world.alliances[alliance.idx()];
+    if !a.invites.contains(&invitee) {
+        a.invites.push(invitee);
+    }
+    let msg = format!(
+        "{} invites {} into the {}",
+        world.empires[empire.idx()].display_name,
+        world.empires[invitee.idx()].display_name,
+        world.alliances[alliance.idx()].display_name
+    );
+    Ok(Some(
+        Event::new(world.day, EventKind::Command, msg).empire(Some(invitee)),
+    ))
+}
+
+/// Joining takes an invitation from a member (or an alliance with no members left).
 pub(crate) fn join_alliance(
     world: &mut World,
     empire: EmpireId,
     alliance: AllianceId,
 ) -> CmdResult {
-    world.check_empire(empire)?;
-    let a = world
-        .alliances
-        .get(alliance.idx())
-        .ok_or("no such alliance")?;
-    if world.empires[empire.idx()].alliances.contains(&alliance) {
-        return Err(format!("already in the {}", a.display_name));
-    }
-    let members: Vec<EmpireId> = (0..world.empires.len())
-        .map(EmpireId::from_idx)
-        .filter(|e| world.empires[e.idx()].alliances.contains(&alliance))
-        .collect();
-    if let Some(m) = members.iter().find(|m| world.at_war(empire, **m)) {
-        return Err(format!(
-            "at war with {}, a member of the {}",
-            world.empires[m.idx()].display_name,
-            a.display_name
-        ));
+    world.can_join_alliance(empire, alliance)?;
+    let a = &world.alliances[alliance.idx()];
+    if !a.invites.contains(&empire) && !world.alliance_members(alliance).is_empty() {
+        return Err(format!("not invited into the {}", a.display_name));
     }
     let msg = format!(
         "{} joins the {}",
         world.empires[empire.idx()].display_name,
         a.display_name
     );
+    world.alliances[alliance.idx()]
+        .invites
+        .retain(|i| *i != empire);
     world.empires[empire.idx()].alliances.push(alliance);
     Ok(Some(
         Event::new(world.day, EventKind::Command, msg).empire(Some(empire)),
@@ -671,6 +796,10 @@ pub(crate) fn leave_alliance(
     list.retain(|a| *a != alliance);
     if list.len() == before {
         return Err("not a member of that alliance".into());
+    }
+    // An invitation stands only while the inviting side is still there.
+    if world.alliance_members(alliance).is_empty() {
+        world.alliances[alliance.idx()].invites.clear();
     }
     Ok(None)
 }

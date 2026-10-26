@@ -358,14 +358,22 @@ function diplomacy(id) {
       ${canDeclare ? `<select id="dw-${o.id}">${GOALS.map((g) => `<option>${g}</option>`).join('')}</select><button class="small danger" data-act="declare-war" data-id="${id}" data-other="${o.id}">declare war</button>` : ''}</div>`;
   }).join('') || '<p class="muted">No other empires.</p>';
   const claims = e.claims.map((c) => `<div class="row"><a class="list-item" data-act="select-system" data-id="${c}">${esc(s.systems[c].display_name)}</a><button class="small" data-act="claim-drop" data-id="${id}" data-system="${c}">drop</button></div>`).join('') || '<p class="muted">No claims (claim systems from the system panel).</p>';
-  const mine = e.alliances.map((a) => `<div class="row">${esc(s.alliances[a].display_name)} <span class="muted">${names(s.empires.filter((o) => o.alliances.includes(a)).map((o) => o.id))}</span><button class="small" data-act="alliance-leave" data-id="${id}" data-alliance="${a}">leave</button></div>`).join('');
-  const joinable = s.alliances.filter((a) => !e.alliances.includes(a.id));
+  const mine = e.alliances.map((a) => {
+    const members = s.empires.filter((o) => o.alliances.includes(a));
+    const invitable = s.empires.filter((o) => !o.alliances.includes(a) && !s.alliances[a].invites.includes(o.id) && !members.some((m) => m.at_war.includes(o.id)));
+    return `<div class="row">${esc(s.alliances[a].display_name)} <span class="muted">${names(members.map((o) => o.id))}</span><button class="small" data-act="alliance-leave" data-id="${id}" data-alliance="${a}">leave</button></div>
+      ${s.alliances[a].invites.length ? `<div class="muted">Invited: ${names(s.alliances[a].invites)}</div>` : ''}
+      ${invitable.length ? `<div class="row"><select id="al-inv-${a}">${invitable.map((o) => `<option value="${o.id}">${esc(o.display_name)}</option>`).join('')}</select><button class="small" data-act="alliance-invite" data-id="${id}" data-alliance="${a}">invite</button></div>` : ''}`;
+  }).join('');
+  // Joining takes an invitation (or an alliance nobody is left in).
+  const joinable = s.alliances.filter((a) => !e.alliances.includes(a.id)
+    && (a.invites.includes(id) || !s.empires.some((o) => o.alliances.includes(a.id))));
   return `${e.humiliated > 0 ? `<div class="neg">Humiliated: no influence income for ${e.humiliated} more days</div>` : ''}
     ${warHtml}
     ${others}
     <h3>Claims</h3>${claims}
     <h3>Alliances</h3>${mine || '<p class="muted">None</p>'}
-    ${joinable.length ? `<div class="row"><select id="al-join">${joinable.map((a) => `<option value="${a.id}">${esc(a.display_name)}</option>`).join('')}</select><button class="small" data-act="alliance-join" data-id="${id}">join</button></div>` : ''}
+    ${joinable.length ? `<div class="row"><select id="al-join">${joinable.map((a) => `<option value="${a.id}">${esc(a.display_name)}</option>`).join('')}</select><button class="small" data-act="alliance-join" data-id="${id}">join</button></div>` : '<p class="muted">No invitations.</p>'}
     <div class="row"><input type="text" id="al-name" placeholder="New alliance"><button class="small" data-act="alliance-create" data-id="${id}">found</button></div>`;
 }
 
@@ -719,6 +727,7 @@ const actions = {
   'claim': (el) => api.command({ type: 'claim', empire: +$('#cl-empire').value, system: +el.dataset.id }),
   'claim-drop': (el) => api.command({ type: 'drop_claim', empire: +el.dataset.id, system: +el.dataset.system }),
   'alliance-create': (el) => api.command({ type: 'create_alliance', empire: +el.dataset.id, display_name: $('#al-name').value || 'Alliance' }),
+  'alliance-invite': (el) => api.command({ type: 'invite_to_alliance', empire: +el.dataset.id, alliance: +el.dataset.alliance, invitee: +$(`#al-inv-${el.dataset.alliance}`).value }),
   'alliance-join': (el) => api.command({ type: 'join_alliance', empire: +el.dataset.id, alliance: +$('#al-join').value }),
   'alliance-leave': (el) => api.command({ type: 'leave_alliance', empire: +el.dataset.id, alliance: +el.dataset.alliance }),
   'cancel-ship': (el) => api.command({ type: 'cancel_ship', empire: +el.dataset.id, index: +el.dataset.index }),
@@ -1057,5 +1066,14 @@ document.addEventListener('keydown', (ev) => {
 window.spacebox = { ui, store, render, inspector };
 
 scene = new Scene($('#view'), { onPick, onOpen, onContext, describe, tooltip: $('#tooltip') });
+// The system-name toggle is remembered between visits.
+const namesBox = $('#show-names');
+namesBox.checked = localStorage.getItem('spacebox.systemNames') !== 'false';
+scene.systemNames = namesBox.checked;
+namesBox.addEventListener('change', () => {
+  scene.systemNames = namesBox.checked;
+  localStorage.setItem('spacebox.systemNames', String(namesBox.checked));
+  render();
+});
 subscribe(() => render());
 loadAll().catch((e) => toast(`Could not reach the server: ${e.message}`, true));

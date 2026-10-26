@@ -66,7 +66,11 @@ export class Scene {
     container.appendChild(this.renderer.domElement);
 
     this.labels = new CSS2DRenderer();
-    Object.assign(this.labels.domElement.style, { position: 'absolute', top: '0', left: '0', pointerEvents: 'none' });
+    // The renderer gives every label its own z-index for depth sorting; the layer's z-index
+    // makes it a stacking context of its own, so labels never rise above modals or tooltips.
+    Object.assign(this.labels.domElement.style, { position: 'absolute', top: '0', left: '0', pointerEvents: 'none', zIndex: '1' });
+    /// Whether system names are drawn (galaxy labels and the star's label in a system).
+    this.systemNames = true;
     container.appendChild(this.labels.domElement);
 
     this.scene = new THREE.Scene();
@@ -132,7 +136,7 @@ export class Scene {
     const el = this.renderer.domElement;
     let down = null;
     const pick = (ev) => {
-      const r = el.getBoulabelsndingClientRect();
+      const r = el.getBoundingClientRect();
       this.pointer.set(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
       this.raycaster.setFromCamera(this.pointer, this.camera);
       this.raycaster.params.Line = { threshold: 0 };
@@ -255,7 +259,7 @@ export class Scene {
         ring.scale.setScalar(selected ? 1.5 : 1);
         g.add(ring);
       }
-      if (showAll || owned || (sel.kind === 'system' && sel.id === s.id)) {
+      if (this.systemNames && (showAll || owned || (sel.kind === 'system' && sel.id === s.id))) {
         this.label(`sys:${s.id}`, s.display_name, !owned).position.set(x, 0, z);
       }
     }
@@ -327,7 +331,9 @@ export class Scene {
       this.pickables.push(star);
     }
     g.add(new THREE.PointLight(starColor, 60, 0, 1.2));
-    this.label('star', `${s.display_name}${s.owner != null ? ' — ' + state.empires[s.owner].display_name : ''}`).position.set(0, 1.4, 0);
+    if (this.systemNames) {
+      this.label('star', `${s.display_name}${s.owner != null ? ' — ' + state.empires[s.owner].display_name : ''}`).position.set(0, 1.4, 0);
+    }
     // The hyperjump arrival rim.
     const rim = new THREE.EllipseCurve(0, 0, 90 * S, 90 * S).getPoints(128).map((v) => new THREE.Vector3(v.x, 0, v.y));
     g.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(rim), new THREE.LineDashedMaterial({ color: 0x1d2538 })));

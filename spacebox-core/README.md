@@ -70,7 +70,8 @@ One tick is one day (`src/sim/mod.rs`):
 7. **Governors** (parallel). AI empires (those with an `[empire.x.ai]` personality) queue
    housing on empty worlds, construction, upgrades, terraforming, expansion claims, research
    and shipbuilding, and switch off labs and shipyards whose output nothing would use. They
-   set their total-war policy from their militancy, claim neighbouring systems, declare
+   set their total-war policy from their militancy, form alliances against common enemies,
+   claim neighbouring systems, declare
    humiliation, claim or total wars on neighbours they can beat (depending on how militant
    they are), choose their goal when attacked, force, propose and accept peace by
    exhaustion, defend their systems, liberate occupied worlds, merge their fleets, and send them to

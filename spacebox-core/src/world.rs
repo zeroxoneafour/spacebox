@@ -817,6 +817,8 @@ impl War {
 pub struct Alliance {
     pub name: String,
     pub display_name: String,
+    /// Empires a member has invited, who may join (not saved).
+    pub invites: Vec<EmpireId>,
 }
 
 /// A truce (`[game.truces.x]`) between the empires that list it in `diplomacy.truces`: none of

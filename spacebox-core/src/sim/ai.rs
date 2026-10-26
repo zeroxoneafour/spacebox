@@ -6,11 +6,16 @@
 //! barren-world buildings, the occasional upgrade and terraforming project. Decisions only read
 //! the world, so all empires decide in parallel.
 
+use std::collections::HashMap;
+
 use crate::defs::{BuildingDef, ResourceAmount};
 use crate::ids::*;
 use crate::sim::commands::{Command, can_afford};
 use crate::sim::economy::next_research;
-use crate::world::{AiPersonality, FleetOrder, ProjectKind, Side, WarGoal, WarOutcome, World};
+
+use crate::world::{
+    AiPersonality, Fleet, FleetOrder, ProjectKind, Side, WarGoal, WarOutcome, World,
+};
 
 /// Needs, most pressing first.
 struct Needs {
@@ -774,7 +779,27 @@ fn diplomacy(
             }
         }
         let (mine, theirs_ex) = (w.exhaustion[side.idx()], w.exhaustion[other.idx()]);
-        if theirs_ex >= 1.0 {
+        let days = day.saturating_sub(w.starting_day);
+        let losing = mine > theirs_ex + 0.25 || (days > 120 && ours < theirs * 0.6);
+        let weary = mine > 0.4 + 0.5 * traits.militant;
+        let beaten = mine >= 0.9 && losing;
+        // Whether a victory now would get what the war is for: every claim on the enemy
+        // occupied (or already ours) in a claim war; in a total war, as much as the empire
+        // cares to take before it tires.
+        let allies = world.members(war, side);
+        let achieved = weary
+            || match w.goals[side.idx()] {
+                Some(WarGoal::Claim) => allies.iter().all(|a| {
+                    world.empire(*a).claims.iter().all(|c| {
+                        let s = world.system(*c);
+                        !s.owner.is_some_and(|o| enemies.contains(&o))
+                            || s.occupier.is_some_and(|o| allies.contains(&o))
+                    })
+                }),
+                Some(WarGoal::Total) => mine > 0.2 + 0.4 * traits.militant,
+                _ => true,
+            };
+        if theirs_ex >= 1.0 && achieved {
             cmds.push(Command::EnforcePeace {
                 empire,
                 war,
@@ -782,13 +807,9 @@ fn diplomacy(
             });
             continue;
         }
-        let days = day.saturating_sub(w.starting_day);
-        let losing = mine > theirs_ex + 0.25 || (days > 120 && ours < theirs * 0.6);
-        let weary = mine > 0.4 + 0.5 * traits.militant;
-        let beaten = mine >= 0.9 && losing;
         // The best outcome this empire settles for.
         let acceptable = |o: WarOutcome| match o.winner() {
-            Some(s) if s == side => true,
+            Some(s) if s == side => achieved,
             None => losing || weary,
             Some(_) => beaten,
         };
@@ -802,7 +823,7 @@ fn diplomacy(
             Some(WarOutcome::victory(other))
         } else if losing || weary {
             Some(WarOutcome::StatusQuo)
-        } else if theirs_ex > 0.75 {
+        } else if theirs_ex > 0.75 && achieved {
             Some(WarOutcome::victory(side))
         } else {
             None
@@ -817,6 +838,8 @@ fn diplomacy(
             });
         }
     }
+
+    alliances(world, empire, cmds);
 
     let mine = power[empire.idx()];
     if traits.militant < 0.05 || mine <= 0.0 {
@@ -904,6 +927,56 @@ fn diplomacy(
     None
 }
 
+/// Alliances: an empire at war invites those fighting one of its enemies into its alliance
+/// (founding one if it has none), and accepts invitations into alliances that share an enemy
+/// with it, or when it has no wars of its own to worry about.
+fn alliances(world: &World, empire: EmpireId, cmds: &mut Vec<Command>) {
+    let e = world.empire(empire);
+    let enemies: Vec<EmpireId> = (0..world.empires.len())
+        .map(EmpireId::from_idx)
+        .filter(|o| world.at_war(empire, *o))
+        .collect();
+    let shares_enemy = |o: EmpireId| enemies.iter().any(|x| world.at_war(o, *x));
+    for (a, alliance) in world.alliances.iter().enumerate() {
+        let a = AllianceId::from_idx(a);
+        if !alliance.invites.contains(&empire) || world.can_join_alliance(empire, a).is_err() {
+            continue;
+        }
+        let members = world.alliance_members(a);
+        if members.iter().any(|m| shares_enemy(*m)) || enemies.is_empty() {
+            cmds.push(Command::JoinAlliance {
+                empire,
+                alliance: a,
+            });
+            return;
+        }
+    }
+    let invited = |o: EmpireId| {
+        world.alliances.iter().any(|a| a.invites.contains(&o)) || world.allied(empire, o)
+    };
+    let Some(friend) = (0..world.empires.len())
+        .map(EmpireId::from_idx)
+        .find(|o| *o != empire && shares_enemy(*o) && !world.at_war(empire, *o) && !invited(*o))
+    else {
+        return;
+    };
+    match e.alliances.first() {
+        Some(a) if world.can_join_alliance(friend, *a).is_ok() => {
+            cmds.push(Command::InviteToAlliance {
+                empire,
+                alliance: *a,
+                invitee: friend,
+            })
+        }
+        Some(_) => {}
+        None => cmds.push(Command::CreateAlliance {
+            empire,
+            display_name: format!("{} Pact", e.display_name),
+            invite: vec![friend],
+        }),
+    }
+}
+
 /// A rough measure of a ship's fighting strength for an empire.
 fn ship_power(world: &World, empire: EmpireId, ship: ShipId) -> f64 {
     let d = world.ship_stats(empire, ship);
@@ -929,7 +1002,6 @@ fn military(
     cmds: &mut Vec<Command>,
 ) {
     let e = world.empire(empire);
-    let hostile = |o: EmpireId| world.at_war(empire, o) || declared == Some(o);
     let at_war = world.active_wars(empire).next().is_some() || declared.is_some();
     let own_fleets: Vec<&crate::world::Fleet> =
         world.fleets.iter().filter(|f| f.owner == empire).collect();
@@ -1014,28 +1086,188 @@ fn military(
         }
     }
 
-    // Defence: send idle fleets to own systems where enemy fleets are present.
-    let mut busy: Vec<FleetId> = Vec::new();
-    let threatened: Vec<SystemId> = world
-        .fleets
+    command_fleets(world, empire, traits, declared, cmds);
+}
+
+/// Fleet command alone, for the days between full decisions in wartime.
+pub(crate) fn fleets(world: &World, empire: EmpireId) -> Vec<Command> {
+    let traits = world.empire(empire).ai.unwrap_or_default();
+    let mut cmds = Vec::new();
+    command_fleets(world, empire, traits, None, &mut cmds);
+    cmds
+}
+
+/// Fighting strength of one fleet (damaged ships count for less).
+fn fleet_power(world: &World, f: &Fleet) -> f64 {
+    f.ships
         .iter()
-        .filter(|f| hostile(f.owner))
-        .map(|f| f.system)
-        .filter(|s| world.system(*s).owner == Some(empire))
+        .map(|s| {
+            let max = world.ship_stats(f.owner, s.def).max_hull;
+            ship_power(world, f.owner, s.def) * (0.3 + 0.7 * s.hull / max)
+        })
+        .sum()
+}
+
+/// Share of its hull a fleet has left.
+fn hull_left(world: &World, f: &Fleet) -> f64 {
+    let (hull, max) = f.ships.iter().fold((0.0, 0.0), |(h, m), s| {
+        (h + s.hull, m + world.ship_stats(f.owner, s.def).max_hull)
+    });
+    if max > 0.0 { hull / max } else { 1.0 }
+}
+
+/// The planet a fleet should attack next: the nearest one an enemy controls that the fleet
+/// can take on. Worlds of our own under occupation come first, then systems we fight a claim
+/// war for, systems where we or our allies already attack (so fleets fight together) or hold
+/// a planet, then populated worlds.
+fn war_target(
+    world: &World,
+    hostile: &dyn Fn(EmpireId) -> bool,
+    fleet: &Fleet,
+    power: f64,
+    focus: &[SystemId],
+    enemy_at: &HashMap<SystemId, f64>,
+) -> Option<PlanetId> {
+    let empire = fleet.owner;
+    // Systems we fight a claim war for.
+    let claims: Vec<SystemId> = world
+        .active_wars(empire)
+        .filter(|(w, s)| world.war(*w).goals[s.idx()] == Some(WarGoal::Claim))
+        .flat_map(|_| world.empire(empire).claims.iter().copied())
         .collect();
-    for sys in threatened {
-        if own_fleets
+    let dist = world.distances_from([fleet.system]);
+    (0..world.empires.len())
+        .map(EmpireId::from_idx)
+        .filter(|o| hostile(*o))
+        .flat_map(|o| world.empire_planets(o).iter().copied())
+        .map(|id| (id, world.planet(id)))
+        .filter(|(_, p)| dist[p.system.idx()] != u32::MAX)
+        // Leave systems guarded by much stronger fleets alone.
+        .filter(|(_, p)| enemy_at.get(&p.system).copied().unwrap_or(0.0) <= power * 1.25)
+        .min_by_key(|(id, p)| {
+            let foothold = world
+                .system(p.system)
+                .planet_ids()
+                .any(|q| world.planet(q).controller() == Some(empire));
+            let bonus = if p.owner == Some(empire) {
+                4
+            } else if p.pop() > 0 {
+                2
+            } else {
+                0
+            } + if focus.contains(&p.system) { 2 } else { 0 }
+                + if claims.contains(&p.system) { 3 } else { 0 };
+            (
+                dist[p.system.idx()].saturating_sub(bonus),
+                !foothold,
+                std::cmp::Reverse(p.pop()),
+                *id,
+            )
+        })
+        .map(|(id, _)| id)
+}
+
+/// Fleet command, run daily while the empire is at war (and with the other decisions in
+/// peacetime):
+///
+/// * damaged fleets outside our territory fall back to the nearest own system to repair;
+/// * own systems with enemy fleets get the nearest fleets sent to them, until what is there
+///   or on the way matches the invaders;
+/// * idle fleets sharing a system with a bigger one (or one on the attack) merge into it;
+/// * every idle fleet of at least the attack size (smaller for militant empires) attacks,
+///   as do fleets whose target is guarded by an overwhelming enemy (they pick another);
+/// * smaller fleets gather at the own system closest to the front, where they merge into
+///   attack-sized fleets; in peacetime they gather at the capital.
+pub(crate) fn command_fleets(
+    world: &World,
+    empire: EmpireId,
+    traits: AiPersonality,
+    declared: Option<EmpireId>,
+    cmds: &mut Vec<Command>,
+) {
+    let e = world.empire(empire);
+    let hostile = |o: EmpireId| o != empire && (world.at_war(empire, o) || declared == Some(o));
+    let at_war = world.active_wars(empire).next().is_some() || declared.is_some();
+    let own: Vec<&Fleet> = world.fleets.iter().filter(|f| f.owner == empire).collect();
+    if own.is_empty() {
+        return;
+    }
+    let power: HashMap<FleetId, f64> = own.iter().map(|f| (f.id, fleet_power(world, f))).collect();
+    let armed = |f: &Fleet| f.max_range(&e.ship_stats) > 0.0;
+    let mut enemy_at: HashMap<SystemId, f64> = HashMap::new();
+    for f in world.fleets.iter().filter(|f| hostile(f.owner)) {
+        *enemy_at.entry(f.system).or_default() += fleet_power(world, f);
+    }
+    let target_system = |f: &Fleet| {
+        f.orders.iter().find_map(|o| match o {
+            FleetOrder::Bombard { planet, .. } => Some(world.planet(*planet).system),
+            _ => None,
+        })
+    };
+    let mut busy: Vec<FleetId> = Vec::new();
+
+    // Retreat.
+    for f in &own {
+        let home = |s: SystemId| world.system(s).owner == Some(empire);
+        if f.in_combat || home(f.system) || home(f.destination()) || hull_left(world, f) >= 0.4 {
+            continue;
+        }
+        let dist = world.distances_from([f.system]);
+        if let Some(to) = world
+            .empire_systems(empire)
             .iter()
-            .any(|f| f.system == sys || f.destination() == sys)
+            .copied()
+            .filter(|s| dist[s.idx()] != u32::MAX)
+            .min_by_key(|s| (dist[s.idx()], *s))
         {
+            busy.push(f.id);
+            cmds.push(Command::MoveFleet {
+                fleet: f.id,
+                system: to,
+                coordinates: None,
+            });
+        }
+    }
+
+    // Defence.
+    let mut threats: Vec<(SystemId, f64)> = enemy_at
+        .iter()
+        .filter(|(s, _)| world.system(**s).owner == Some(empire))
+        .map(|(s, p)| (*s, *p))
+        .collect();
+    threats.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (sys, threat) in threats {
+        let mut defending: f64 = own
+            .iter()
+            .filter(|f| f.system == sys || f.destination() == sys)
+            .map(|f| power[&f.id])
+            .sum();
+        if defending >= threat {
             continue;
         }
         let dist = world.distances_from([sys]);
-        if let Some(f) = own_fleets
+        let mut free: Vec<&&Fleet> = own
             .iter()
-            .filter(|f| f.is_idle() && !busy.contains(&f.id) && dist[f.system.idx()] != u32::MAX)
-            .min_by_key(|f| (dist[f.system.idx()], f.id))
-        {
+            .filter(|f| {
+                !busy.contains(&f.id)
+                    && armed(f)
+                    && !f.in_combat
+                    && f.system != sys
+                    && dist[f.system.idx()] <= 4
+                    && (f.is_idle() || target_system(f).is_some())
+            })
+            .collect();
+        free.sort_by_key(|f| (dist[f.system.idx()], f.id));
+        // Feeding fleets in one by one only loses them: commit only if together they can
+        // match the invaders.
+        if defending + free.iter().map(|f| power[&f.id]).sum::<f64>() < threat * 0.8 {
+            continue;
+        }
+        for f in free {
+            if defending >= threat {
+                break;
+            }
+            defending += power[&f.id];
             busy.push(f.id);
             cmds.push(Command::MoveFleet {
                 fleet: f.id,
@@ -1045,45 +1277,35 @@ fn military(
         }
     }
 
-    // New ships start as fleets of their own: idle fleets gather at the capital and merge,
-    // in peace as in war.
-    let idle: Vec<&&crate::world::Fleet> = own_fleets
-        .iter()
-        .filter(|f| f.is_idle() && !busy.contains(&f.id))
-        .collect();
-
-    // Merge idle fleets that share a system into the largest one with room.
+    // Merge idle fleets into a bigger (or attacking) fleet in the same system.
     let limit = e.max_fleet_size(world.rules());
-    let mut sizes: Vec<(FleetId, usize)> =
-        idle.iter().map(|f| (f.id, f.size(&world.defs))).collect();
-    let size = |id: FleetId, sizes: &[(FleetId, usize)]| {
-        sizes.iter().find(|(i, _)| *i == id).map_or(0, |(_, n)| *n)
-    };
-    for f in &idle {
-        let mine = size(f.id, &sizes);
-        if mine == 0 || busy.contains(&f.id) {
+    let mut sizes: HashMap<FleetId, usize> =
+        own.iter().map(|f| (f.id, f.size(&world.defs))).collect();
+    for f in &own {
+        if !f.is_idle() || busy.contains(&f.id) {
             continue;
         }
-        if let Some(big) = idle
+        let mine = sizes[&f.id];
+        if let Some(big) = own
             .iter()
             .filter(|o| {
                 o.system == f.system
                     && o.id != f.id
                     && !busy.contains(&o.id)
-                    && size(o.id, &sizes) >= mine
-                    && size(o.id, &sizes) + mine <= limit
+                    && sizes[&o.id] + mine <= limit
+                    && (target_system(o).is_some() || (o.is_idle() && sizes[&o.id] >= mine))
             })
-            .max_by_key(|o| (size(o.id, &sizes), std::cmp::Reverse(o.id)))
+            .max_by_key(|o| {
+                (
+                    target_system(o).is_some(),
+                    sizes[&o.id],
+                    std::cmp::Reverse(o.id),
+                )
+            })
         {
             busy.push(f.id);
-            let total = size(big.id, &sizes) + mine;
-            for s in sizes.iter_mut() {
-                if s.0 == big.id {
-                    s.1 = total;
-                } else if s.0 == f.id {
-                    s.1 = 0;
-                }
-            }
+            *sizes.get_mut(&big.id).unwrap() += mine;
+            sizes.insert(f.id, 0);
             cmds.push(Command::MergeFleets {
                 into: big.id,
                 from: f.id,
@@ -1091,75 +1313,90 @@ fn military(
         }
     }
 
-    // Offence: the largest idle fleet bombards the nearest enemy world once big enough.
-    let attacking = own_fleets.iter().any(|f| {
-        f.orders
-            .iter()
-            .any(|o| matches!(o, FleetOrder::Bombard { .. }))
-    });
-    let threshold = (6.0 - 4.0 * traits.militant).round().max(2.0) as usize;
-    let main = idle
+    // Offence.
+    let attack_size = ((6.0 - 4.0 * traits.militant).round().max(2.0) as usize).min(limit);
+    // Systems our side is already attacking: ours and our co-belligerents'.
+    let mut focus: Vec<SystemId> = world
+        .fleets
         .iter()
-        .filter(|f| !busy.contains(&f.id))
-        .max_by_key(|f| (f.ships.len(), std::cmp::Reverse(f.id)));
-    if at_war
-        && !attacking
-        && let Some(fleet) = main
-        && fleet.size(&world.defs) >= threshold.min(limit)
-        && fleet.max_range(&e.ship_stats) > 0.0
-    {
-        let dist = world.distances_from([fleet.system]);
-        // Only enemy empires' planets are targets.
-        let target = (0..world.empires.len())
-            .map(EmpireId::from_idx)
-            .filter(|o| hostile(*o))
-            .flat_map(|o| world.empire_planets(o).iter().copied())
-            .map(|id| (id.idx(), world.planet(id)))
-            .filter(|(_, p)| dist[p.system.idx()] != u32::MAX)
-            .min_by_key(|(i, p)| {
-                // Finish off systems where we already hold a planet before moving on, and go
-                // for populated worlds (the ones that matter) over empty outposts nearby.
-                let foothold = world
-                    .system(p.system)
-                    .planet_ids()
-                    .any(|q| world.planet(q).controller() == Some(empire));
-                // Liberating our own worlds comes first.
-                let populated_bonus = if p.owner == Some(empire) {
-                    4
-                } else if p.pop() > 0 {
-                    2
-                } else {
-                    0
-                };
-                (
-                    dist[p.system.idx()].saturating_sub(populated_bonus),
-                    !foothold,
-                    std::cmp::Reverse(p.pop()),
-                    *i,
-                )
+        .filter(|f| !hostile(f.owner))
+        .filter_map(|f| {
+            let sys = target_system(f)?;
+            let p = f.orders.iter().find_map(|o| match o {
+                FleetOrder::Bombard { planet, .. } => Some(*planet),
+                _ => None,
+            })?;
+            world
+                .planet(p)
+                .controller()
+                .filter(|c| hostile(*c))
+                .map(|_| sys)
+        })
+        .collect();
+    let mut gathering: Vec<&&Fleet> = Vec::new();
+    if at_war {
+        let mut strike: Vec<&&Fleet> = own
+            .iter()
+            .filter(|f| !busy.contains(&f.id) && sizes[&f.id] > 0 && armed(f) && !f.in_combat)
+            .filter(|f| {
+                // Idle, or attacking a target that has become too well guarded.
+                f.is_idle()
+                    || target_system(f).is_some_and(|s| {
+                        enemy_at.get(&s).copied().unwrap_or(0.0) > power[&f.id] * 1.5
+                    })
             })
-            .map(|(i, _)| PlanetId::from_idx(i));
-        if let Some(planet) = target {
-            busy.push(fleet.id);
-            cmds.push(Command::Bombard {
-                fleet: fleet.id,
-                planet,
-                tile: None,
-            });
+            .collect();
+        strike.sort_by_key(|f| (std::cmp::Reverse(sizes[&f.id]), f.id));
+        for f in strike {
+            if sizes[&f.id] < attack_size {
+                if f.is_idle() {
+                    gathering.push(f);
+                }
+                continue;
+            }
+            match war_target(world, &hostile, f, power[&f.id], &focus, &enemy_at) {
+                Some(planet) => {
+                    busy.push(f.id);
+                    focus.push(world.planet(planet).system);
+                    cmds.push(Command::Bombard {
+                        fleet: f.id,
+                        planet,
+                        tile: None,
+                    });
+                }
+                None if f.is_idle() => gathering.push(f),
+                None => {}
+            }
         }
+    } else {
+        gathering = own
+            .iter()
+            .filter(|f| f.is_idle() && !busy.contains(&f.id) && sizes[&f.id] > 0)
+            .collect();
     }
 
-    // Rally the remaining idle fleets at the capital so they can merge next time.
-    if let Some(capital) = e.capital {
-        for f in idle
-            .iter()
-            .filter(|f| !busy.contains(&f.id) && f.system != capital)
-        {
-            cmds.push(Command::MoveFleet {
-                fleet: f.id,
-                system: capital,
-                coordinates: None,
-            });
+    // Gathering point: the own system closest to the front, or the capital.
+    let staging = focus
+        .first()
+        .and_then(|front| {
+            let dist = world.distances_from([*front]);
+            world
+                .empire_systems(empire)
+                .iter()
+                .copied()
+                .filter(|s| dist[s.idx()] != u32::MAX)
+                .min_by_key(|s| (dist[s.idx()], *s))
+        })
+        .or(e.capital);
+    if let Some(to) = staging {
+        for f in gathering {
+            if f.system != to {
+                cmds.push(Command::MoveFleet {
+                    fleet: f.id,
+                    system: to,
+                    coordinates: None,
+                });
+            }
         }
     }
 }

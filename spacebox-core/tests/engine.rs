@@ -168,7 +168,7 @@ fn loads_the_spec_examples() {
     assert_eq!(w.war(war).display_name, "Example War");
     assert_eq!(
         w.war(war).goals,
-        [Some(WarGoal::Claim), Some(WarGoal::Humiliate)]
+        [Some(WarGoal::Humiliate), Some(WarGoal::Claim)]
     );
     assert!(w.war(war).is_active());
     let e = &w.empires[0];
@@ -1799,10 +1799,23 @@ fn warlike_galaxy(militant: f64) -> World {
 fn militant_ai_empires_go_to_war_and_fight() {
     let mut w = warlike_galaxy(0.9);
     let mut kinds = std::collections::HashSet::new();
+    // Fleet-days in wartime, and how many of them were spent idle.
+    let (mut at_war, mut idle) = (0, 0);
     for _ in 0..900 {
         w.tick();
         kinds.extend(w.drain_events().into_iter().map(|e| e.kind));
+        for f in &w.fleets {
+            if w.active_wars(f.owner).next().is_some() {
+                at_war += 1;
+                idle += usize::from(f.is_idle());
+            }
+        }
     }
+    assert!(at_war > 0);
+    assert!(
+        idle * 5 < at_war,
+        "fleets should keep busy in wartime ({idle} of {at_war} fleet-days idle)"
+    );
     for k in [
         EventKind::WarDeclared,
         EventKind::Battle,
@@ -2324,32 +2337,62 @@ fn claim_wars_transfer_occupied_claims() {
     assert!(w.empire(terran).claims.is_empty());
 }
 
-#[test]
-fn allies_join_wars_unless_allied_to_both() {
+/// Four player empires: e0 and e1 in North, e2 and e3 in South, e3 also in North.
+fn alliance_world() -> (World, Vec<spacebox_core::EmpireId>) {
     let mut w = warlike_galaxy(0.0);
     w.empires.iter_mut().for_each(|e| e.ai = None);
     let e: Vec<_> = (0..4).map(spacebox_core::EmpireId::from_idx).collect();
+    let (north, south) = (
+        spacebox_core::AllianceId::from_idx(0),
+        spacebox_core::AllianceId::from_idx(1),
+    );
     w.apply_now(Command::CreateAlliance {
         empire: e[0],
         display_name: "North".into(),
+        invite: vec![e[1]],
+    })
+    .unwrap();
+    // Joining takes an invitation.
+    assert!(
+        w.apply_now(Command::JoinAlliance {
+            empire: e[3],
+            alliance: north,
+        })
+        .unwrap_err()
+        .contains("invited")
+    );
+    w.apply_now(Command::JoinAlliance {
+        empire: e[1],
+        alliance: north,
+    })
+    .unwrap();
+    // Any member may invite.
+    w.apply_now(Command::InviteToAlliance {
+        empire: e[1],
+        alliance: north,
+        invitee: e[3],
     })
     .unwrap();
     w.apply_now(Command::CreateAlliance {
         empire: e[2],
         display_name: "South".into(),
+        invite: vec![e[3]],
     })
     .unwrap();
-    let (north, south) = (
-        spacebox_core::AllianceId::from_idx(0),
-        spacebox_core::AllianceId::from_idx(1),
-    );
-    for (who, a) in [(e[1], north), (e[3], north), (e[3], south)] {
+    for (who, a) in [(e[3], north), (e[3], south)] {
         w.apply_now(Command::JoinAlliance {
             empire: who,
             alliance: a,
         })
         .unwrap();
     }
+    assert!(w.alliances.iter().all(|a| a.invites.is_empty()));
+    (w, e)
+}
+
+#[test]
+fn allies_join_wars_unless_allied_to_both() {
+    let (mut w, e) = alliance_world();
     assert!(w.allied(e[0], e[1]) && w.allied(e[3], e[2]) && !w.allied(e[0], e[2]));
     // Allies cannot fight each other.
     set_stock(&mut w, e[0], "influence", 5000.0);
@@ -2369,4 +2412,106 @@ fn allies_join_wars_unless_allied_to_both() {
     // e[3], allied to both sides, stays out.
     assert!(w.empire(e[3]).wars.is_empty());
     assert!(w.at_war(e[1], e[2]) && !w.at_war(e[3], e[0]));
+}
+
+#[test]
+fn allies_in_a_truce_with_the_opponent_stay_out() {
+    let (mut w, e) = alliance_world();
+    // e1 and e2 are in a truce.
+    let truce = spacebox_core::TruceId::from_idx(w.truces.len());
+    w.truces.push(spacebox_core::world::Truce {
+        name: "t".into(),
+        display_name: "T".into(),
+        valid_until: w.day + 100,
+    });
+    for x in [e[1], e[2]] {
+        w.empires[x.idx()].truces.push(truce);
+    }
+    // The truce doesn't stop e2 attacking e0, but e1 sits it out.
+    declare(&mut w, e[2], e[0], WarGoal::Humiliate);
+    let war = w.empire(e[2]).wars[0].0;
+    assert_eq!(w.members(war, Side::Defense), [e[0]]);
+    assert!(!w.at_war(e[1], e[2]));
+}
+
+#[test]
+fn a_status_quo_returns_every_occupation() {
+    let mut w = quiet_sol();
+    let terran = w.empire_by_name("empire-1").unwrap();
+    let cetian = w.empire_by_name("empire-2").unwrap();
+    let tau = w.system_by_name("tau-ceti").unwrap();
+    set_stock(&mut w, terran, "influence", 5000.0);
+    w.apply_now(Command::Claim {
+        empire: terran,
+        system: tau,
+    })
+    .unwrap();
+    w.apply_now(Command::DeclareWar {
+        empire: terran,
+        target: cetian,
+        goal: WarGoal::Claim,
+    })
+    .unwrap();
+    let war = w.empire(terran).wars[0].0;
+    // The claim backs the war, so it can't be dropped mid-war.
+    assert!(
+        w.apply_now(Command::DropClaim {
+            empire: terran,
+            system: tau,
+        })
+        .is_err()
+    );
+    let held: Vec<_> = w
+        .system(tau)
+        .planet_ids()
+        .filter(|p| w.planet(*p).owner == Some(cetian))
+        .collect();
+    for p in &held {
+        w.set_planet_occupier(*p, Some(terran));
+    }
+    assert_eq!(w.system(tau).occupier, Some(terran));
+    for e in [cetian, terran] {
+        w.apply_now(Command::ProposePeace {
+            empire: e,
+            war,
+            outcome: WarOutcome::StatusQuo,
+        })
+        .unwrap();
+    }
+    assert_eq!(w.system(tau).owner, Some(cetian));
+    assert_eq!(w.system(tau).occupier, None);
+    assert!(held.iter().all(|p| w.planet(*p).occupier.is_none()));
+    // Nobody lost, so the claim stands.
+    assert_eq!(w.empire(terran).claims, [tau]);
+}
+
+#[test]
+fn war_goals_are_checked_on_load() {
+    let dir = temp_dir("war-goals");
+    let body = |goal: &str, extra: &str| {
+        format!(
+            "[game.wars.w]\ndisplay-name = \"W\"\noffensive-goal = \"{goal}\"\nstarting-day = 0\n\n\
+             [empire.a]\ndisplay-name = \"A\"\n{extra}\n[empire.a.diplomacy]\n\
+             wars = [{{ war = \"w\", side = \"offense\" }}]\n\
+             [empire.b]\ndisplay-name = \"B\"\n[empire.b.diplomacy]\n\
+             wars = [{{ war = \"w\", side = \"defense\" }}]\n\
+             [system.s]\ndisplay-name = \"S\"\nstar-type = \"yellow\"\ncoords = [0, 0]\nowner = \"a\"\n\
+             [system.s.planets.p]\ndisplay-name = \"P\"\nsize = \"small\"\nhabitable = false\ncoords = [10, 0]\nowner = \"a\"\n\
+             [system.t]\ndisplay-name = \"T\"\nstar-type = \"yellow\"\ncoords = [5, 0]\nowner = \"b\"\nlinked-systems = [\"s\"]\n\
+             [system.t.planets.q]\ndisplay-name = \"Q\"\nsize = \"small\"\nhabitable = false\ncoords = [10, 0]\nowner = \"b\"\n"
+        )
+    };
+    assert!(load_world(scenario(&dir, &body("humiliate", ""))).is_ok());
+    let err = load_err(&scenario(&dir, &body("claim", "")));
+    assert!(err.contains("claims"), "{err}");
+    assert!(load_world(scenario(&dir, &body("claim", "[empire.a.policy]\n"))).is_err());
+    let err = load_err(&scenario(&dir, &body("total", "")));
+    assert!(err.contains("total-war"), "{err}");
+    assert!(
+        load_world(scenario(
+            &dir,
+            &body("total", "[empire.a.policy]\ntotal-war = true\n")
+        ))
+        .is_ok()
+    );
 }

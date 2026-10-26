@@ -362,6 +362,13 @@ pub enum Cmd {
     CreateAlliance {
         empire: u32,
         display_name: String,
+        #[serde(default)]
+        invite: Vec<u32>,
+    },
+    InviteToAlliance {
+        empire: u32,
+        alliance: u32,
+        invitee: u32,
     },
     JoinAlliance {
         empire: u32,
@@ -645,9 +652,23 @@ fn to_command(w: &World, c: Cmd) -> Result<Command, ApiError> {
         Cmd::CreateAlliance {
             empire: a,
             display_name,
+            invite,
         } => Command::CreateAlliance {
             empire: empire(w, a)?,
             display_name,
+            invite: invite
+                .into_iter()
+                .map(|i| empire(w, i))
+                .collect::<Result<_, _>>()?,
+        },
+        Cmd::InviteToAlliance {
+            empire: a,
+            alliance: x,
+            invitee,
+        } => Command::InviteToAlliance {
+            empire: empire(w, a)?,
+            alliance: alliance(w, x)?,
+            invitee: empire(w, invitee)?,
         },
         Cmd::JoinAlliance {
             empire: a,
@@ -801,6 +822,15 @@ pub async fn patch_empire(
             .dominant_species
             .map(|s| s.map(|s| species(&eng.world, s)).transpose())
             .transpose()?;
+        if p.total_war.is_some() {
+            // Through the command, which refuses to drop a policy a war depends on.
+            eng.world.apply_now(Command::SetPolicy {
+                empire: id,
+                accepts_migrants: None,
+                market_access: None,
+                total_war: p.total_war,
+            })?;
+        }
         let e = &mut eng.world.empires[id.idx()];
         if let Some(v) = dominant {
             e.dominant_species = v;
@@ -820,9 +850,7 @@ pub async fn patch_empire(
         if let Some(v) = p.market_access {
             e.market_access = v;
         }
-        if let Some(v) = p.total_war {
-            e.total_war = v;
-        }
+
         Ok(ok())
     })
     .await

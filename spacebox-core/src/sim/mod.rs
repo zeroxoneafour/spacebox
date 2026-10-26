@@ -17,7 +17,8 @@
 //!    from storage and transient production, research completes, migrations are committed,
 //!    finished ships launched and completed expansion sites claim their planets and systems.
 //!    Wars then update (exhaustion, humiliation, wars left without one side end).
-//! 7. **Governors** (parallel per AI empire) look at the fresh state and queue commands.
+//! 7. **Governors** (parallel per AI empire) look at the fresh state and queue commands,
+//!    every `ai-interval-days`; empires at war also command their fleets every day.
 
 pub mod ai;
 pub mod commands;
@@ -189,8 +190,18 @@ impl World {
         let this = &*self;
         let decided: Vec<_> = (0..self.empires.len())
             .into_par_iter()
-            .filter(|&i| this.empires[i].ai.is_some() && (day + i as u64).is_multiple_of(interval))
-            .flat_map_iter(|i| ai::decide(this, EmpireId::from_idx(i)))
+            .filter(|&i| this.empires[i].ai.is_some())
+            .flat_map_iter(|i| {
+                let id = EmpireId::from_idx(i);
+                if (day + i as u64).is_multiple_of(interval) {
+                    ai::decide(this, id)
+                } else if this.active_wars(id).next().is_some() {
+                    // Fleets are commanded daily in wartime.
+                    ai::fleets(this, id)
+                } else {
+                    Vec::new()
+                }
+            })
             .collect();
         self.queue.extend(decided);
         self.day += 1;

@@ -18,9 +18,10 @@ The client loads three.js from the jsDelivr CDN, so the browser needs internet a
 - **Galaxy view.** Systems are coloured by owner, hyperlanes are tinted inside empires, and
   capitals have a ring. Fleets are cones beside their system, with dashed lines to their
   destination and a red ring while fighting. Click a system to inspect it; double-click to
-  enter it.
-- **System view.** The star(s), planets at their fixed coordinates (with owner bands and a red
-  band while under siege), the hyperjump rim, and fleets (with a dot per ship at its own
+  enter it. The "names" box in the top bar hides or shows system names (remembered by the
+  browser).
+- **System view.** The star(s), planets at their fixed coordinates (with owner bands, an occupier
+  band inside it, and a red band while under siege), the hyperjump rim, and fleets (with a dot per ship at its own
   position) with a line to where their current order takes them and their jump charge.
   Double-click a planet to land on it.
 - **Fleet orders.** Select a fleet, then right-click. On a system in the galaxy view it
@@ -38,8 +39,8 @@ The client loads three.js from the jsDelivr CDN, so the browser needs internet a
   militant/expansionist/scientific sliders, migration, market access and total-war policy, set
   stockpiles, transient output and waste, add or cancel research projects, grant or revoke
   technologies, diplomacy: declare wars with a goal, set the defense's goal, follow both
-  sides' exhaustion, propose, accept or enforce peace, drop claims, found, join or leave
-  alliances; cancel ships under construction, spawn fleets); systems (owner, occupier,
+  sides' exhaustion, propose, accept or enforce peace, drop claims, found alliances, invite
+  into them, join on invitation or leave; cancel ships under construction, spawn fleets); systems (owner, occupier,
   claimants and claiming, capital, hyperlanes, planets with owners, fleets present, add
   planets, delete); planets (owner, occupier, siege progress, ship construction, pops per species, add, remove, set or move pops,
   terraform or cancel it, toggle habitability, delete).
@@ -92,7 +93,7 @@ the queue with a route of jumps plus the move or bombardment),
 `disband_fleet`, `declare_war` (`goal`: `"humiliate"`, `"claim"` or `"total"`),
 `set_war_goal`, `propose_peace` and `enforce_peace` (`outcome`: `"offensive"`, `"defensive"`
 or `"status quo"`), `accept_peace`, `claim`, `drop_claim`, `create_alliance`,
-`join_alliance`, `leave_alliance`. The fields match `spacebox_core::Command`;
+`invite_to_alliance`, `join_alliance` (needs an invitation), `leave_alliance`. The fields match `spacebox_core::Command`;
 fleet ids are the stable `id` of each entry in `state.fleets`.
 
 ### Diffs

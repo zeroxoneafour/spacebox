@@ -152,9 +152,19 @@ chosen with a deterministic roll.
   militancy. A militant empire claims up to `4 × militant` systems next to its borders, and
   declares a claim war on an empire it has claims on, a total war at 0.85 militancy and up
   (with the policy), and a humiliation war otherwise; as a defender it picks its goal the same
-  way. It forces victory once the enemy is exhausted, offers a status quo when losing or once
-  its exhaustion passes `0.4 + 0.5 × militant`, concedes when nearly exhausted and losing, and
-  accepts any offer at least as good.
+  way. It forces (or accepts) victory over an exhausted enemy once the war has got it what it
+  wanted (every claim occupied; in a total war, conquest until its exhaustion passes
+  `0.2 + 0.4 × militant`), offers a status quo when losing or once its exhaustion passes
+  `0.4 + 0.5 × militant`, concedes when nearly exhausted and losing, and accepts any offer at
+  least as good. Empires at war invite those fighting a common enemy into their alliance
+  (founding one if needed), and accept such invitations, or any when they are at peace.
+- **In wartime** fleets are commanded every day rather than every `ai-interval-days`: damaged
+  fleets fall back to repair; invaded systems get enough nearby fleets to match the invaders
+  (or none, rather than feeding them in one by one); idle fleets merge into bigger or
+  attacking ones in the same system; every fleet of attack size (`6 - 4 × militant` slots, at
+  least 2) attacks the nearest enemy-held world it can take on, preferring its own occupied
+  worlds, claimed systems and systems its side already attacks, and avoiding systems held by
+  much stronger fleets; smaller fleets gather at the own system nearest the front.
 - **expansionist**: claims systems up to 1–3 jumps out, keeps less influence in reserve
   (`2 - expansionist` × the cost), and runs up to three claims at once.
 - **scientific**: more technologies in research at once, and a lean towards non-military
@@ -198,17 +208,24 @@ Terraforming makes a planet habitable but does not change its terrain.
   occupied once every planet its owner holds there is. The owner's side takes occupied planets
   back the same way, by bombarding them.
 - Declaring war costs influence by goal; the declarer's and the target's allies join their
-  sides, except those allied to both, who stay out. Allies can't declare war on each other,
-  and nobody can declare war on an empire it has a truce with (or on that empire's allies).
+  sides, except those allied to both or in a truce with someone on the other side, who stay
+  out. Allies can't declare war on each other, and nobody can declare war on an empire it has
+  a truce with. Joining an alliance takes an invitation from a member (invitations are not
+  saved).
+- Goal prerequisites (claims on the other side for a claim war, the `total-war` policy for a
+  total war, unless defending against one) are checked on declaration and when a save loads.
+  A claim that a claim war depends on can't be dropped, nor a `total-war` policy a total war
+  depends on. If a claim war's claims are lost anyway (an ally takes the systems), its goal
+  becomes humiliation.
 - Exhaustion rises each day of the war, with fleet slots lost (`ship-loss-exhaustion` ×
   the share of the side's fleet slots lost that day), planets lost (more for populated
   ones) and resource crises (summed severity, averaged over the side's members). A war ends
   when one side accepts the other's proposal (or both propose the same outcome), when a side
   forces the outcome of its choice on an enemy at exhaustion 1, or as soon as one side has no
   planets left (an empty side loses).
-- At the end of the war, claimed systems a side occupies become its own if it won a claim
-  war, or in a status quo if it fought for claims or total war; all other occupations are
-  lifted. Winners of a humiliation war cut the losers' influence income for
+- At the end of the war, claimed systems the winners of a claim war occupy become theirs; all
+  other occupations are lifted (a status quo returns every occupied system). What changed
+  hands in a total war stays changed, whatever the outcome. Winners of a humiliation war cut the losers' influence income for
   `humiliation-days`. Losers drop their claims on the winners. Every participant enters a
   truce for `truce-days`. Ended wars are kept in the save with their `victory`.
 

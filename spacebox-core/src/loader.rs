@@ -1340,6 +1340,7 @@ fn build_world(
         world.alliances.push(Alliance {
             name,
             display_name: a.display_name,
+            invites: Vec::new(),
         });
     }
     let mut truce_ids = HashMap::new();
@@ -1573,6 +1574,11 @@ fn build_world(
                 remaining,
             });
         }
+    }
+    for w in 0..world.wars.len() {
+        world
+            .check_war_goals(WarId::from_idx(w))
+            .map_err(|m| invalid(format!("[game.wars.{}]: {m}", world.wars[w].name)))?;
     }
     Ok(world)
 }

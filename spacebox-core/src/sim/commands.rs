@@ -206,10 +206,19 @@ pub enum Command {
         empire: EmpireId,
         system: SystemId,
     },
+    /// Found an alliance, inviting `invite` into it.
     CreateAlliance {
         empire: EmpireId,
         display_name: String,
+        invite: Vec<EmpireId>,
     },
+    /// A member invites another empire into its alliance.
+    InviteToAlliance {
+        empire: EmpireId,
+        alliance: AllianceId,
+        invitee: EmpireId,
+    },
+    /// Join an alliance one has been invited into.
     JoinAlliance {
         empire: EmpireId,
         alliance: AllianceId,
@@ -529,9 +538,10 @@ impl World {
                         self.system(at).display_name
                     ));
                 }
-                match p.owner {
+                // Occupied planets are bombarded to take them back from the occupier.
+                match p.controller() {
                     Some(o) if o == f.owner => {
-                        return Err("a fleet cannot bombard its own planet".into());
+                        return Err("a fleet cannot bombard a planet its empire controls".into());
                     }
                     Some(o) if !self.at_war(f.owner, o) => {
                         return Err(format!(
@@ -1328,7 +1338,13 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
         Command::CreateAlliance {
             empire,
             display_name,
-        } => war::create_alliance(world, empire, display_name),
+            invite,
+        } => war::create_alliance(world, empire, display_name, invite),
+        Command::InviteToAlliance {
+            empire,
+            alliance,
+            invitee,
+        } => war::invite_to_alliance(world, empire, alliance, invitee),
         Command::JoinAlliance { empire, alliance } => war::join_alliance(world, empire, alliance),
         Command::LeaveAlliance { empire, alliance } => war::leave_alliance(world, empire, alliance),
         Command::SetPolicy {
@@ -1348,7 +1364,11 @@ pub(crate) fn apply(world: &mut World, cmd: Command) -> CmdResult {
                 e.market_access = v;
             }
             if let Some(v) = total_war {
-                e.total_war = v;
+                let old = std::mem::replace(&mut e.total_war, v);
+                if let Err(err) = world.check_wars_of(empire) {
+                    world.empires[empire.idx()].total_war = old;
+                    return Err(format!("the total-war policy is needed: {err}"));
+                }
             }
             Ok(None)
         }

@@ -334,6 +334,7 @@ pub fn state(w: &World, prev: Option<&Snapshot>) -> Snapshot {
                 "id": i,
                 "name": a.name,
                 "display_name": a.display_name,
+                "invites": a.invites.iter().map(|e| e.0).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
             "truces": w.truces.iter().enumerate().filter(|(_, t)| t.valid_until > w.day).map(|(i, t)| json!({
                 "id": i,
